@@ -1,0 +1,19 @@
+# goneat Assess Configuration
+# See: goneat docs show assess/lint-shell-make-gha
+version: 1
+lint:
+  shell:
+    shfmt:
+      enabled: true
+      fix: false
+    shellcheck:
+      enabled: false
+  github_actions:
+    actionlint:
+      enabled: true
+  make:
+    checkmake:
+      enabled: true
+      config:
+        max_body_length: 140
+        min_phony_targets: ["help", "check", "precommit", "prepush"]

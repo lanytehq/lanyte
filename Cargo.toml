@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lanyte-common",
+    "crates/lanyte-telemetry",
+    "crates/lanyte-gateway",
+    "crates/lanyte-state",
+    "crates/lanyte-llm",
+    "crates/lanyte-executor",
+    "crates/lanyte-orchestrator",
+]
+
+[package]
+name = "lanyte"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ipcprims = { git = "https://github.com/3leaps/ipcprims", tag = "v0.2.0", version = "0.2.0", features = ["schema", "peer", "async"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
+futures-core = "0.3.31"
+futures-util = "0.3.32"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = "0.7"
+tokio-stream = "0.1.17"
+
+[dependencies]
+lanyte-common = { path = "crates/lanyte-common", version = "0.1.0" }
+lanyte-gateway = { path = "crates/lanyte-gateway", version = "0.1.0" }
+lanyte-orchestrator = { path = "crates/lanyte-orchestrator", version = "0.1.0" }
+lanyte-telemetry = { path = "crates/lanyte-telemetry", version = "0.1.0" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[[test]]
+name = "smoke"
+path = "tests/integration/smoke.rs"

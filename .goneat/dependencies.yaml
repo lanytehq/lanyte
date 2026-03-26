@@ -1,0 +1,23 @@
+version: v1
+licenses:
+  # Note: goneat may surface r-efi as LGPL-2.1-or-later because it reports one
+  # SPDX branch from the crate's composite expression. Cargo metadata for
+  # r-efi 5.3.0 is "MIT OR Apache-2.0 OR LGPL-2.1-or-later", and
+  # cargo-deny accepts it under the workspace's permissive-license policy.
+  # Keep this note here so future public-readiness passes do not treat it as an
+  # unexplained forbidden-license regression.
+  forbidden:
+    - GPL-3.0
+    - AGPL-3.0
+    - LGPL-3.0
+    - LGPL-2.1
+    - MPL-2.0
+    - CDDL-1.0
+    - CDDL-1.1
+vulnerabilities:
+  enabled: true
+  fail_on: none
+cooling:
+  enabled: false
+policy_engine:
+  type: embedded

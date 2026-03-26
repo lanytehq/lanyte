@@ -1,0 +1,29 @@
+[package]
+name = "lanyte-gateway"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+ipcprims = { workspace = true }
+lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[[bin]]
+name = "mock_mlvoy"
+path = "src/bin/mock_mlvoy.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "gateway"
+path = "tests/gateway.rs"
+required-features = ["test-support"]

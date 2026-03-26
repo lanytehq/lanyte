@@ -1,0 +1,30 @@
+[package]
+name = "lanyte-orchestrator"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
+lanyte-gateway = { path = "../lanyte-gateway", version = "0.1.0" }
+lanyte-telemetry = { path = "../lanyte-telemetry", version = "0.1.0" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ipcprims = { workspace = true }
+lanyte-gateway = { path = "../lanyte-gateway", version = "0.1.0", features = ["test-support"] }
+
+[[test]]
+name = "orchestrator"
+path = "tests/orchestrator.rs"
+required-features = ["test-support"]
