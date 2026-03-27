@@ -1,4 +1,7 @@
+use std::env;
 use std::fmt;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -7,6 +10,7 @@ use crate::env as common_env;
 use crate::error::{CommonError, Result};
 
 pub const LANYTE_CORE_PEER_ID_ENV: &str = "LANYTE_CORE_PEER_ID";
+pub const LANYTE_CONFIG_PATH_ENV: &str = "LANYTE_CONFIG_PATH";
 pub const LANYTE_GATEWAY_SOCKET_PATH_ENV: &str = "LANYTE_GATEWAY_SOCKET_PATH";
 pub const LANYTE_CRUCIBLE_SCHEMAS_DIR_ENV: &str = "LANYTE_CRUCIBLE_SCHEMAS_DIR";
 pub const LLM_CONFIG: &str = "llm";
@@ -19,12 +23,21 @@ pub const LLM_OPENAI_API_KEY_ENV: &str = "LANYTE_LLM_OPENAI_API_KEY";
 pub const LLM_OPENAI_BASE_URL_ENV: &str = "LANYTE_LLM_OPENAI_BASE_URL";
 
 pub const DEFAULT_CORE_PEER_ID: &str = "lanyte-core";
+pub const DEFAULT_CONFIG_RELATIVE_PATH: &str = ".config/lanytehq/config.toml";
 pub const DEFAULT_GATEWAY_SOCKET_PATH: &str = "/tmp/lanyte.sock";
 pub const DEFAULT_CRUCIBLE_SCHEMAS_DIR: &str = "../lanyte-crucible/schemas/ipc";
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_GROK_MODEL: &str = "grok-4.20-beta-latest-reasoning";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+const CONFIG_GATEWAY_CORE_PEER_ID_FIELD: &str = "gateway.core_peer_id";
+const CONFIG_GATEWAY_SOCKET_PATH_FIELD: &str = "gateway.socket_path";
+const CONFIG_GATEWAY_CRUCIBLE_SCHEMAS_DIR_FIELD: &str = "gateway.crucible_schemas_dir";
+const CONFIG_LLM_CLAUDE_MODEL_FIELD: &str = "llm.claude.model";
+const CONFIG_LLM_GROK_MODEL_FIELD: &str = "llm.grok.model";
+const CONFIG_LLM_OPENAI_MODEL_FIELD: &str = "llm.openai.model";
+const CONFIG_LLM_OPENAI_BASE_URL_FIELD: &str = "llm.openai.base_url";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LanyteConfig {
@@ -33,6 +46,10 @@ pub struct LanyteConfig {
 }
 
 impl LanyteConfig {
+    pub fn load() -> Result<Self> {
+        Self::load_with_lookup(common_env::read_env_var_utf8)
+    }
+
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(common_env::read_env_var_utf8)
     }
@@ -53,6 +70,116 @@ impl LanyteConfig {
         config.validate()?;
         Ok(config)
     }
+
+    fn load_with_lookup<F>(mut lookup: F) -> Result<Self>
+    where
+        F: FnMut(&'static str) -> Result<Option<String>>,
+    {
+        let mut config = Self::default();
+        let config_path = match lookup(LANYTE_CONFIG_PATH_ENV)? {
+            Some(path) => PathBuf::from(common_env::normalize_nonempty(
+                path,
+                LANYTE_CONFIG_PATH_ENV,
+            )?),
+            None => default_config_path()?,
+        };
+        config.apply_config_file(&config_path)?;
+        config.gateway.apply_env(&mut lookup)?;
+        config.llm.apply_env(&mut lookup)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn apply_config_file(&mut self, path: &Path) -> Result<()> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(CommonError::ConfigFileRead {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let file_config = parse_file_config(path, &contents)?;
+
+        if let Some(gateway) = file_config.gateway {
+            self.gateway.apply_file(gateway)?;
+        }
+        if let Some(llm) = file_config.llm {
+            self.llm.apply_file(llm)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    #[serde(default)]
+    gateway: Option<FileGatewayConfig>,
+    #[serde(default)]
+    llm: Option<FileLlmConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGatewayConfig {
+    #[serde(default)]
+    core_peer_id: Option<String>,
+    #[serde(default)]
+    socket_path: Option<String>,
+    #[serde(default)]
+    crucible_schemas_dir: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileLlmConfig {
+    #[serde(default)]
+    claude: Option<FileClaudeConfig>,
+    #[serde(default)]
+    grok: Option<FileGrokConfig>,
+    #[serde(default)]
+    openai: Option<FileOpenAiConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileClaudeConfig {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGrokConfig {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileOpenAiConfig {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+fn default_config_path() -> Result<PathBuf> {
+    let home = env::var_os("HOME").ok_or_else(|| CommonError::ConfigPathUnavailable {
+        reason: "HOME is not set".to_owned(),
+    })?;
+    Ok(PathBuf::from(home).join(DEFAULT_CONFIG_RELATIVE_PATH))
+}
+
+fn parse_file_config(path: &Path, contents: &str) -> Result<FileConfig> {
+    toml::from_str(contents).map_err(|err: toml::de::Error| CommonError::ConfigFileParse {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +200,26 @@ impl Default for GatewayConfig {
 }
 
 impl GatewayConfig {
+    fn apply_file(&mut self, config: FileGatewayConfig) -> Result<()> {
+        if let Some(core_peer_id) = config.core_peer_id {
+            self.core_peer_id =
+                common_env::normalize_nonempty(core_peer_id, CONFIG_GATEWAY_CORE_PEER_ID_FIELD)?;
+        }
+        if let Some(socket_path) = config.socket_path {
+            self.socket_path = PathBuf::from(common_env::normalize_nonempty(
+                socket_path,
+                CONFIG_GATEWAY_SOCKET_PATH_FIELD,
+            )?);
+        }
+        if let Some(crucible_schemas_dir) = config.crucible_schemas_dir {
+            self.crucible_schemas_dir = PathBuf::from(common_env::normalize_nonempty(
+                crucible_schemas_dir,
+                CONFIG_GATEWAY_CRUCIBLE_SCHEMAS_DIR_FIELD,
+            )?);
+        }
+        Ok(())
+    }
+
     fn apply_env<F>(&mut self, lookup: &mut F) -> Result<()>
     where
         F: FnMut(&'static str) -> Result<Option<String>>,
@@ -123,6 +270,19 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
+    fn apply_file(&mut self, config: FileLlmConfig) -> Result<()> {
+        if let Some(claude) = config.claude {
+            self.claude.apply_file(claude)?;
+        }
+        if let Some(grok) = config.grok {
+            self.grok.apply_file(grok)?;
+        }
+        if let Some(openai) = config.openai {
+            self.openai.apply_file(openai)?;
+        }
+        Ok(())
+    }
+
     fn apply_env<F>(&mut self, lookup: &mut F) -> Result<()>
     where
         F: FnMut(&'static str) -> Result<Option<String>>,
@@ -233,6 +393,15 @@ impl fmt::Debug for ClaudeConfig {
     }
 }
 
+impl ClaudeConfig {
+    fn apply_file(&mut self, config: FileClaudeConfig) -> Result<()> {
+        if let Some(model) = config.model {
+            self.model = common_env::normalize_nonempty(model, CONFIG_LLM_CLAUDE_MODEL_FIELD)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrokConfig {
     pub model: String,
@@ -256,6 +425,15 @@ impl fmt::Debug for GrokConfig {
             .field("model", &self.model)
             .field("api_key", &redacted_api_key)
             .finish()
+    }
+}
+
+impl GrokConfig {
+    fn apply_file(&mut self, config: FileGrokConfig) -> Result<()> {
+        if let Some(model) = config.model {
+            self.model = common_env::normalize_nonempty(model, CONFIG_LLM_GROK_MODEL_FIELD)?;
+        }
+        Ok(())
     }
 }
 
@@ -288,16 +466,66 @@ impl fmt::Debug for OpenAiConfig {
     }
 }
 
+impl OpenAiConfig {
+    fn apply_file(&mut self, config: FileOpenAiConfig) -> Result<()> {
+        if let Some(model) = config.model {
+            self.model = common_env::normalize_nonempty(model, CONFIG_LLM_OPENAI_MODEL_FIELD)?;
+        }
+        if let Some(base_url) = config.base_url {
+            self.base_url =
+                common_env::normalize_nonempty(base_url, CONFIG_LLM_OPENAI_BASE_URL_FIELD)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::env;
     use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!(
+                "lanyte-common-config-test-{}-{}",
+                process::id(),
+                NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("temp dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn config_from_pairs(pairs: &[(&str, &str)]) -> Result<LanyteConfig> {
         let map: HashMap<&str, &str> = pairs.iter().copied().collect();
         LanyteConfig::from_lookup(|key| Ok(map.get(key).map(|value| value.to_string())))
+    }
+
+    fn load_config_from_pairs(pairs: &[(&str, &str)]) -> Result<LanyteConfig> {
+        let map: HashMap<&str, &str> = pairs.iter().copied().collect();
+        LanyteConfig::load_with_lookup(|key| Ok(map.get(key).map(|value| value.to_string())))
     }
 
     #[test]
@@ -347,6 +575,155 @@ mod tests {
         assert_eq!(cfg.llm.openai.model, "gpt-4.1");
         assert_eq!(cfg.llm.openai.api_key.as_deref(), Some("openai-key"));
         assert_eq!(cfg.llm.openai.base_url, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn load_uses_defaults_when_config_file_is_missing() {
+        let temp_dir = TestDir::new();
+        let missing_path = temp_dir.path().join("missing.toml");
+
+        let cfg = load_config_from_pairs(&[(
+            LANYTE_CONFIG_PATH_ENV,
+            missing_path.to_str().expect("path should be utf-8"),
+        )])
+        .expect("missing config file should not fail");
+
+        assert_eq!(cfg, LanyteConfig::default());
+    }
+
+    #[test]
+    fn config_file_values_override_defaults() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[gateway]
+core_peer_id = "core-from-file"
+socket_path = "/tmp/file.sock"
+crucible_schemas_dir = "/opt/lanyte/crucible/schemas/ipc"
+
+[llm.claude]
+model = "claude-file"
+
+[llm.grok]
+model = "grok-file"
+
+[llm.openai]
+model = "gpt-file"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .expect("config file should be written");
+
+        let cfg = load_config_from_pairs(&[(
+            LANYTE_CONFIG_PATH_ENV,
+            config_path.to_str().expect("path should be utf-8"),
+        )])
+        .expect("config should load");
+
+        assert_eq!(cfg.gateway.core_peer_id, "core-from-file");
+        assert_eq!(cfg.gateway.socket_path, PathBuf::from("/tmp/file.sock"));
+        assert_eq!(
+            cfg.gateway.crucible_schemas_dir,
+            PathBuf::from("/opt/lanyte/crucible/schemas/ipc")
+        );
+        assert_eq!(cfg.llm.claude.model, "claude-file");
+        assert_eq!(cfg.llm.grok.model, "grok-file");
+        assert_eq!(cfg.llm.openai.model, "gpt-file");
+        assert_eq!(cfg.llm.openai.base_url, "https://example.test/v1");
+    }
+
+    #[test]
+    fn env_values_override_config_file() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[gateway]
+core_peer_id = "core-from-file"
+
+[llm.openai]
+model = "gpt-file"
+base_url = "https://example.test/v1"
+"#,
+        )
+        .expect("config file should be written");
+
+        let cfg = load_config_from_pairs(&[
+            (
+                LANYTE_CONFIG_PATH_ENV,
+                config_path.to_str().expect("path should be utf-8"),
+            ),
+            (LANYTE_CORE_PEER_ID_ENV, "core-from-env"),
+            (LLM_OPENAI_MODEL_ENV, "gpt-from-env"),
+            (LLM_OPENAI_BASE_URL_ENV, "http://127.0.0.1:11434/v1"),
+        ])
+        .expect("config should load");
+
+        assert_eq!(cfg.gateway.core_peer_id, "core-from-env");
+        assert_eq!(cfg.llm.openai.model, "gpt-from-env");
+        assert_eq!(cfg.llm.openai.base_url, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn malformed_config_file_returns_path_and_parse_location() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, "[gateway\ncore_peer_id = \"oops\"\n")
+            .expect("config file should be written");
+
+        let err = load_config_from_pairs(&[(
+            LANYTE_CONFIG_PATH_ENV,
+            config_path.to_str().expect("path should be utf-8"),
+        )])
+        .expect_err("malformed config should fail");
+
+        match err {
+            CommonError::ConfigFileParse { path, reason } => {
+                assert_eq!(path, config_path);
+                assert!(
+                    reason.contains("line"),
+                    "reason did not include location: {reason}"
+                );
+                assert!(
+                    reason.contains("column"),
+                    "reason did not include column: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_file_rejects_unknown_fields_like_api_keys() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[llm.openai]
+api_key = "should-not-be-here"
+"#,
+        )
+        .expect("config file should be written");
+
+        let err = load_config_from_pairs(&[(
+            LANYTE_CONFIG_PATH_ENV,
+            config_path.to_str().expect("path should be utf-8"),
+        )])
+        .expect_err("unknown fields should fail");
+
+        match err {
+            CommonError::ConfigFileParse { reason, .. } => {
+                assert!(
+                    reason.contains("unknown field`api_key`")
+                        || reason.contains("unknown field `api_key`")
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
