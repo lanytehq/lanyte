@@ -54,6 +54,8 @@ pub struct LanyteConfig {
 }
 
 impl LanyteConfig {
+    /// Load layered runtime configuration with the precedence:
+    /// defaults -> config.toml -> secrets.toml -> secrets.age -> env vars.
     pub fn load() -> Result<Self> {
         Self::load_with_lookup(common_env::read_env_var_utf8)
     }
