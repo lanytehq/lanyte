@@ -4,6 +4,8 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(feature = "seclusor-secrets")]
+use seclusor_crypto::{decrypt, load_identity_file};
 use serde::{Deserialize, Serialize};
 
 use crate::env as common_env;
@@ -24,6 +26,9 @@ pub const LLM_OPENAI_BASE_URL_ENV: &str = "LANYTE_LLM_OPENAI_BASE_URL";
 
 pub const DEFAULT_CORE_PEER_ID: &str = "lanyte-core";
 pub const DEFAULT_CONFIG_RELATIVE_PATH: &str = ".config/lanytehq/config.toml";
+pub const DEFAULT_SECRETS_AGE_FILENAME: &str = "secrets.age";
+pub const DEFAULT_SECRETS_TOML_FILENAME: &str = "secrets.toml";
+pub const DEFAULT_SECLUSOR_IDENTITY_RELATIVE_PATH: &str = ".config/seclusor/identity.txt";
 pub const DEFAULT_GATEWAY_SOCKET_PATH: &str = "/tmp/lanyte.sock";
 pub const DEFAULT_CRUCIBLE_SCHEMAS_DIR: &str = "../lanyte-crucible/schemas/ipc";
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
@@ -35,9 +40,12 @@ const CONFIG_GATEWAY_CORE_PEER_ID_FIELD: &str = "gateway.core_peer_id";
 const CONFIG_GATEWAY_SOCKET_PATH_FIELD: &str = "gateway.socket_path";
 const CONFIG_GATEWAY_CRUCIBLE_SCHEMAS_DIR_FIELD: &str = "gateway.crucible_schemas_dir";
 const CONFIG_LLM_CLAUDE_MODEL_FIELD: &str = "llm.claude.model";
+const SECRETS_LLM_CLAUDE_API_KEY_FIELD: &str = "llm.claude.api_key";
 const CONFIG_LLM_GROK_MODEL_FIELD: &str = "llm.grok.model";
+const SECRETS_LLM_GROK_API_KEY_FIELD: &str = "llm.grok.api_key";
 const CONFIG_LLM_OPENAI_MODEL_FIELD: &str = "llm.openai.model";
 const CONFIG_LLM_OPENAI_BASE_URL_FIELD: &str = "llm.openai.base_url";
+const SECRETS_LLM_OPENAI_API_KEY_FIELD: &str = "llm.openai.api_key";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LanyteConfig {
@@ -84,6 +92,15 @@ impl LanyteConfig {
             None => default_config_path()?,
         };
         config.apply_config_file(&config_path)?;
+        let secrets_dir = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        config.apply_secrets_file(&secrets_dir.join(DEFAULT_SECRETS_TOML_FILENAME))?;
+        config.apply_encrypted_secrets_file(
+            &secrets_dir.join(DEFAULT_SECRETS_AGE_FILENAME),
+            &trusted_seclusor_identity_path()?,
+        )?;
         config.gateway.apply_env(&mut lookup)?;
         config.llm.apply_env(&mut lookup)?;
         config.validate()?;
@@ -112,6 +129,84 @@ impl LanyteConfig {
 
         Ok(())
     }
+
+    fn apply_secrets_file(&mut self, path: &Path) -> Result<()> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(CommonError::SecretsFileRead {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+
+        let secrets = parse_secrets_file(path, &contents)?;
+        self.apply_secrets(secrets)
+    }
+
+    fn apply_secrets(&mut self, secrets: FileSecrets) -> Result<()> {
+        if let Some(llm) = secrets.llm {
+            self.llm.apply_secrets(llm)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "seclusor-secrets")]
+    fn apply_encrypted_secrets_file(&mut self, path: &Path, identity_path: &Path) -> Result<()> {
+        let ciphertext = match fs::read(path) {
+            Ok(contents) => contents,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(CommonError::SecretsFileRead {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+
+        let identities =
+            load_identity_file(identity_path).map_err(|err| CommonError::SecretsIdentityLoad {
+                path: identity_path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        let plaintext =
+            decrypt(&ciphertext, &identities).map_err(|err| CommonError::SecretsFileDecrypt {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        let contents =
+            String::from_utf8(plaintext).map_err(|err| CommonError::SecretsFileParse {
+                path: path.to_path_buf(),
+                reason: format!("decrypted secrets are not valid UTF-8: {err}"),
+            })?;
+        let secrets = parse_secrets_file(path, &contents)?;
+        self.apply_secrets(secrets)
+    }
+
+    #[cfg(not(feature = "seclusor-secrets"))]
+    fn apply_encrypted_secrets_file(&mut self, path: &Path, _identity_path: &Path) -> Result<()> {
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                tracing::info!(
+                    path = %path.display(),
+                    "skipping encrypted secrets file because lanyte-common was built without seclusor-secrets"
+                );
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %source,
+                    "unable to inspect encrypted secrets file while seclusor-secrets is disabled"
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -121,6 +216,13 @@ struct FileConfig {
     gateway: Option<FileGatewayConfig>,
     #[serde(default)]
     llm: Option<FileLlmConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSecrets {
+    #[serde(default)]
+    llm: Option<FileSecretsLlm>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -147,9 +249,27 @@ struct FileLlmConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FileSecretsLlm {
+    #[serde(default)]
+    claude: Option<FileSecretsClaudeConfig>,
+    #[serde(default)]
+    grok: Option<FileSecretsGrokConfig>,
+    #[serde(default)]
+    openai: Option<FileSecretsOpenAiConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileClaudeConfig {
     #[serde(default)]
     model: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSecretsClaudeConfig {
+    #[serde(default)]
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -161,11 +281,25 @@ struct FileGrokConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FileSecretsGrokConfig {
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileOpenAiConfig {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     base_url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSecretsOpenAiConfig {
+    #[serde(default)]
+    api_key: Option<String>,
 }
 
 fn default_config_path() -> Result<PathBuf> {
@@ -180,6 +314,20 @@ fn parse_file_config(path: &Path, contents: &str) -> Result<FileConfig> {
         path: path.to_path_buf(),
         reason: err.to_string(),
     })
+}
+
+fn parse_secrets_file(path: &Path, contents: &str) -> Result<FileSecrets> {
+    toml::from_str(contents).map_err(|err: toml::de::Error| CommonError::SecretsFileParse {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    })
+}
+
+fn trusted_seclusor_identity_path() -> Result<PathBuf> {
+    let home = env::var_os("HOME").ok_or_else(|| CommonError::ConfigPathUnavailable {
+        reason: "HOME is not set".to_owned(),
+    })?;
+    Ok(PathBuf::from(home).join(DEFAULT_SECLUSOR_IDENTITY_RELATIVE_PATH))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +469,19 @@ impl LlmConfig {
         Ok(())
     }
 
+    fn apply_secrets(&mut self, config: FileSecretsLlm) -> Result<()> {
+        if let Some(claude) = config.claude {
+            self.claude.apply_secrets(claude)?;
+        }
+        if let Some(grok) = config.grok {
+            self.grok.apply_secrets(grok)?;
+        }
+        if let Some(openai) = config.openai {
+            self.openai.apply_secrets(openai)?;
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.claude.model.trim().is_empty() {
             return Err(CommonError::EmptyConfigValue {
@@ -400,6 +561,16 @@ impl ClaudeConfig {
         }
         Ok(())
     }
+
+    fn apply_secrets(&mut self, config: FileSecretsClaudeConfig) -> Result<()> {
+        if let Some(api_key) = config.api_key {
+            self.api_key = Some(common_env::normalize_nonempty(
+                api_key,
+                SECRETS_LLM_CLAUDE_API_KEY_FIELD,
+            )?);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +603,16 @@ impl GrokConfig {
     fn apply_file(&mut self, config: FileGrokConfig) -> Result<()> {
         if let Some(model) = config.model {
             self.model = common_env::normalize_nonempty(model, CONFIG_LLM_GROK_MODEL_FIELD)?;
+        }
+        Ok(())
+    }
+
+    fn apply_secrets(&mut self, config: FileSecretsGrokConfig) -> Result<()> {
+        if let Some(api_key) = config.api_key {
+            self.api_key = Some(common_env::normalize_nonempty(
+                api_key,
+                SECRETS_LLM_GROK_API_KEY_FIELD,
+            )?);
         }
         Ok(())
     }
@@ -477,15 +658,33 @@ impl OpenAiConfig {
         }
         Ok(())
     }
+
+    fn apply_secrets(&mut self, config: FileSecretsOpenAiConfig) -> Result<()> {
+        if let Some(api_key) = config.api_key {
+            self.api_key = Some(common_env::normalize_nonempty(
+                api_key,
+                SECRETS_LLM_OPENAI_API_KEY_FIELD,
+            )?);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "seclusor-secrets")]
+    use seclusor_crypto::{encrypt, identity_to_string, Identity};
     use std::collections::HashMap;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
+    #[cfg(all(unix, feature = "seclusor-secrets"))]
+    use std::fs::OpenOptions;
+    #[cfg(all(unix, feature = "seclusor-secrets"))]
+    use std::io::Write;
+    #[cfg(all(unix, feature = "seclusor-secrets"))]
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::process;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -668,6 +867,115 @@ base_url = "https://example.test/v1"
     }
 
     #[test]
+    fn secrets_file_populates_api_keys_only() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        let secrets_path = temp_dir.path().join(DEFAULT_SECRETS_TOML_FILENAME);
+        fs::write(&config_path, "").expect("config file should be written");
+        fs::write(
+            &secrets_path,
+            r#"
+[llm.claude]
+api_key = "claude-secret"
+
+[llm.openai]
+api_key = "openai-secret"
+"#,
+        )
+        .expect("secrets file should be written");
+
+        let cfg = load_config_from_pairs(&[(
+            LANYTE_CONFIG_PATH_ENV,
+            config_path.to_str().expect("path should be utf-8"),
+        )])
+        .expect("config should load");
+
+        assert_eq!(cfg.llm.claude.api_key.as_deref(), Some("claude-secret"));
+        assert_eq!(cfg.llm.openai.api_key.as_deref(), Some("openai-secret"));
+        assert!(cfg.llm.grok.api_key.is_none());
+    }
+
+    #[test]
+    fn env_api_keys_override_secrets_files() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        let secrets_path = temp_dir.path().join(DEFAULT_SECRETS_TOML_FILENAME);
+        fs::write(&config_path, "").expect("config file should be written");
+        fs::write(
+            &secrets_path,
+            r#"
+[llm.claude]
+api_key = "file-secret"
+"#,
+        )
+        .expect("secrets file should be written");
+
+        let cfg = load_config_from_pairs(&[
+            (
+                LANYTE_CONFIG_PATH_ENV,
+                config_path.to_str().expect("path should be utf-8"),
+            ),
+            (LLM_CLAUDE_API_KEY_ENV, "env-secret"),
+        ])
+        .expect("config should load");
+
+        assert_eq!(cfg.llm.claude.api_key.as_deref(), Some("env-secret"));
+    }
+
+    #[test]
+    fn secrets_file_rejects_non_secret_fields() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        let secrets_path = temp_dir.path().join(DEFAULT_SECRETS_TOML_FILENAME);
+        fs::write(&config_path, "").expect("config file should be written");
+        fs::write(
+            &secrets_path,
+            r#"
+[llm.openai]
+model = "should-not-be-here"
+"#,
+        )
+        .expect("secrets file should be written");
+
+        let err = load_config_from_pairs(&[(
+            LANYTE_CONFIG_PATH_ENV,
+            config_path.to_str().expect("path should be utf-8"),
+        )])
+        .expect_err("unknown fields should fail");
+
+        match err {
+            CommonError::SecretsFileParse { reason, .. } => {
+                assert!(
+                    reason.contains("unknown field`model`")
+                        || reason.contains("unknown field `model`")
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "seclusor-secrets"))]
+    #[test]
+    fn encrypted_secrets_file_is_ignored_without_feature() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        let secrets_age_path = temp_dir.path().join(DEFAULT_SECRETS_AGE_FILENAME);
+        fs::write(&config_path, "").expect("config file should be written");
+        fs::write(&secrets_age_path, "not-a-real-ciphertext")
+            .expect("encrypted secrets placeholder");
+
+        let cfg = load_config_from_pairs(&[(
+            LANYTE_CONFIG_PATH_ENV,
+            config_path.to_str().expect("path should be utf-8"),
+        )])
+        .expect("encrypted secrets should be ignored when feature is disabled");
+
+        assert!(cfg.llm.claude.api_key.is_none());
+        assert!(cfg.llm.grok.api_key.is_none());
+        assert!(cfg.llm.openai.api_key.is_none());
+    }
+
+    #[test]
     fn malformed_config_file_returns_path_and_parse_location() {
         let temp_dir = TestDir::new();
         let config_path = temp_dir.path().join("config.toml");
@@ -769,5 +1077,78 @@ api_key = "should-not-be-here"
         let serialized = serde_json::to_string(&cfg).expect("serialization should work");
         assert!(!serialized.contains("top-secret-key"));
         assert!(!serialized.contains("api_key"));
+    }
+
+    #[cfg(all(unix, feature = "seclusor-secrets"))]
+    fn write_identity_file(path: &Path, contents: &str) {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .expect("identity file should be created");
+        file.write_all(contents.as_bytes())
+            .expect("identity file should be written");
+    }
+
+    #[cfg(feature = "seclusor-secrets")]
+    fn encrypted_secret_bytes(api_key: &str, identity: &Identity) -> Vec<u8> {
+        let recipients = vec![identity.to_public()];
+        encrypt(
+            format!(
+                r#"
+[llm.grok]
+api_key = "{api_key}"
+"#
+            )
+            .as_bytes(),
+            &recipients,
+        )
+        .expect("secrets should encrypt")
+    }
+
+    #[cfg(feature = "seclusor-secrets")]
+    #[test]
+    fn encrypted_secrets_override_plaintext_secrets_when_feature_enabled() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("config.toml");
+        let secrets_path = temp_dir.path().join(DEFAULT_SECRETS_TOML_FILENAME);
+        let secrets_age_path = temp_dir.path().join(DEFAULT_SECRETS_AGE_FILENAME);
+        let identity_path = temp_dir.path().join("identity.txt");
+        fs::write(&config_path, "").expect("config file should be written");
+        fs::write(
+            &secrets_path,
+            r#"
+[llm.grok]
+api_key = "plaintext-secret"
+"#,
+        )
+        .expect("secrets file should be written");
+
+        let identity = Identity::generate();
+        #[cfg(unix)]
+        write_identity_file(
+            &identity_path,
+            &format!("{}\n", identity_to_string(&identity)),
+        );
+        #[cfg(not(unix))]
+        fs::write(
+            &identity_path,
+            format!("{}\n", identity_to_string(&identity)),
+        )
+        .expect("identity file should be written");
+        fs::write(
+            &secrets_age_path,
+            encrypted_secret_bytes("encrypted-secret", &identity),
+        )
+        .expect("encrypted secrets file should be written");
+
+        let mut cfg = LanyteConfig::default();
+        cfg.apply_secrets_file(&secrets_path)
+            .expect("plaintext secrets should load");
+        cfg.apply_encrypted_secrets_file(&secrets_age_path, &identity_path)
+            .expect("encrypted secrets should load");
+
+        assert_eq!(cfg.llm.grok.api_key.as_deref(), Some("encrypted-secret"));
     }
 }
