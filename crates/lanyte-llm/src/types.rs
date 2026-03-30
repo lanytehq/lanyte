@@ -8,6 +8,7 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
     pub tool_results: Vec<ToolResult>,
     pub max_tokens: Option<u32>,
+    pub thinking_budget_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub parallel_tool_calls: Option<bool>,
 }
@@ -22,6 +23,7 @@ impl CompletionRequest {
             tools: Vec::new(),
             tool_results: Vec::new(),
             max_tokens: Some(max_tokens),
+            thinking_budget_tokens: None,
             temperature: None,
             parallel_tool_calls: None,
         }

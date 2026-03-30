@@ -264,6 +264,12 @@ impl ClaudeBackend {
             model: self.model.clone(),
             max_tokens: request.max_tokens.unwrap_or(1024),
             system: request.system_prompt.clone(),
+            thinking: request
+                .thinking_budget_tokens
+                .map(|budget_tokens| ClaudeThinkingConfig {
+                    kind: "enabled",
+                    budget_tokens,
+                }),
             temperature: request.temperature,
             stream: false,
             tools: request
@@ -393,12 +399,21 @@ struct ClaudeMessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ClaudeThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ClaudeTool>,
     messages: Vec<ClaudeMessage>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ClaudeThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1395,6 +1410,7 @@ mod tests {
             )],
             tool_results: Vec::new(),
             max_tokens: Some(32),
+            thinking_budget_tokens: None,
             temperature: Some(0.25),
             parallel_tool_calls: Some(true),
         };
@@ -1419,6 +1435,28 @@ mod tests {
         assert!(capabilities.supports_streaming);
         assert!(capabilities.supports_tool_use);
         assert!(!capabilities.supports_parallel_tool_calls);
+    }
+
+    #[test]
+    fn serializes_extended_thinking_request_shape() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{ "content": [ { "type": "text", "text": "ok" } ], "stop_reason": "end_turn" }"#,
+        )]);
+
+        let backend = backend_for_server(server.base_url());
+        let mut request = CompletionRequest::single_user_message("Solve 27 * 453", 64);
+        request.thinking_budget_tokens = Some(32);
+
+        let response = backend.complete(request).expect("complete");
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        let requests = server.take_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(&requests[0].body).expect("request json");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 32);
     }
 
     #[test]

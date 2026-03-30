@@ -129,6 +129,7 @@ fn request_with_tool_prompt() -> CompletionRequest {
         tools: vec![single_tool()],
         tool_results: Vec::new(),
         max_tokens: Some(32),
+        thinking_budget_tokens: None,
         temperature: Some(0.0),
         parallel_tool_calls: Some(true),
     }
