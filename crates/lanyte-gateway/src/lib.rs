@@ -12,11 +12,15 @@
 pub mod test_support;
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::io::ErrorKind;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use ipcprims::frame::Frame;
-use ipcprims::peer::{AsyncPeer, AsyncPeerListener, AsyncPeerTx};
+use ipcprims::peer::{AsyncPeer, AsyncPeerListener, AsyncPeerTx, PeerError};
 use ipcprims::schema::{RegistryConfig, SchemaRegistry};
+use ipcprims::transport::TransportError;
 use lanyte_common::{channels, ChannelId, GatewayConfig};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -238,8 +242,37 @@ fn load_registry(cfg: &GatewayConfig) -> Result<SchemaRegistry, GatewayError> {
 }
 
 #[cfg(unix)]
+trait GatewayListener {
+    fn accept_with_id<'a>(
+        &'a self,
+        peer_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<AsyncPeer, PeerError>> + Send + 'a>>;
+}
+
+#[cfg(unix)]
+impl GatewayListener for AsyncPeerListener {
+    fn accept_with_id<'a>(
+        &'a self,
+        peer_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<AsyncPeer, PeerError>> + Send + 'a>> {
+        Box::pin(async move { AsyncPeerListener::accept_with_id(self, peer_id).await })
+    }
+}
+
+#[cfg(unix)]
 async fn accept_loop(
     listener: AsyncPeerListener,
+    core_peer_id: String,
+    cancel: CancellationToken,
+    events_tx: mpsc::Sender<GatewayEvent>,
+    peers: Arc<Mutex<HashMap<String, AsyncPeerTx>>>,
+) -> Result<(), GatewayError> {
+    accept_loop_with_listener(listener, core_peer_id, cancel, events_tx, peers).await
+}
+
+#[cfg(unix)]
+async fn accept_loop_with_listener<L: GatewayListener>(
+    listener: L,
     core_peer_id: String,
     cancel: CancellationToken,
     events_tx: mpsc::Sender<GatewayEvent>,
@@ -254,7 +287,14 @@ async fn accept_loop(
                 return Ok(());
             }
             res = listener.accept_with_id(&core_peer_id) => {
-                let peer = res?;
+                let peer = match res {
+                    Ok(peer) => peer,
+                    Err(err) if is_transient_accept_error(&err) => {
+                        tracing::warn!(error = %err, "transient accept error; continuing");
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
                 // TODO(CRT-009): switch to opaque connection IDs if these escape gateway internals.
                 let connection_id = format!("peer-{next_connection_id}");
                 next_connection_id += 1;
@@ -273,6 +313,21 @@ async fn accept_loop(
                 ));
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn is_transient_accept_error(err: &PeerError) -> bool {
+    match err {
+        PeerError::Transport(TransportError::Accept(io_err)) => matches!(
+            io_err.kind(),
+            ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionReset
+                | ErrorKind::Interrupted
+                | ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+        ),
+        _ => false,
     }
 }
 
@@ -422,5 +477,112 @@ async fn send_to_peer(
                 .remove(&response.peer_id);
             Err(PeerSendError::PeerDisconnected(response.peer_id.clone()))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{
+        accept_loop_with_listener, is_transient_accept_error, GatewayEvent, GatewayListener,
+    };
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use ipcprims::peer::{async_connect, AsyncPeer, AsyncPeerListener, AsyncPeerTx, PeerError};
+    use ipcprims::transport::TransportError;
+    use lanyte_common::channels;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::test_support::TempGatewayDir;
+
+    #[test]
+    fn accept_connection_aborted_is_treated_as_transient() {
+        let err = PeerError::Transport(TransportError::Accept(io::Error::from(
+            io::ErrorKind::ConnectionAborted,
+        )));
+
+        assert!(is_transient_accept_error(&err));
+    }
+
+    #[test]
+    fn handshake_failure_is_not_treated_as_transient() {
+        let err = PeerError::HandshakeFailed("bad hello".to_owned());
+
+        assert!(!is_transient_accept_error(&err));
+    }
+
+    struct TransientThenRealListener {
+        inner: AsyncPeerListener,
+        call_count: AtomicUsize,
+    }
+
+    impl GatewayListener for TransientThenRealListener {
+        fn accept_with_id<'a>(
+            &'a self,
+            peer_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<AsyncPeer, PeerError>> + Send + 'a>> {
+            Box::pin(async move {
+                let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+                if call == 0 {
+                    Err(PeerError::Transport(TransportError::Accept(
+                        io::Error::from(io::ErrorKind::ConnectionAborted),
+                    )))
+                } else {
+                    self.inner.accept_with_id(peer_id).await
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_accept_error_does_not_stop_subsequent_peer_acceptance() {
+        let dir = TempGatewayDir::new("transient-accept");
+        let cancel = CancellationToken::new();
+        let listener = TransientThenRealListener {
+            inner: AsyncPeerListener::bind(dir.socket_path())
+                .expect("listener should bind")
+                .with_channels(&[channels::MAIL]),
+            call_count: AtomicUsize::new(0),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel::<GatewayEvent>(8);
+        let peers = Arc::new(Mutex::new(HashMap::<String, AsyncPeerTx>::new()));
+
+        let accept_task = tokio::spawn(accept_loop_with_listener(
+            listener,
+            "lanyte-core".to_owned(),
+            cancel.clone(),
+            events_tx,
+            Arc::clone(&peers),
+        ));
+
+        let client = async_connect(dir.socket_path(), &[channels::MAIL])
+            .await
+            .expect("client should connect after transient accept failure");
+        let (tx, _rx) = client.into_split();
+        tx.send_json(channels::MAIL, &serde_json::json!({"after":"transient"}))
+            .await
+            .expect("frame should send");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+            .await
+            .expect("event should arrive")
+            .expect("event should exist");
+
+        assert_eq!(event.peer_id, "peer-1");
+        assert_eq!(event.channel, channels::MAIL);
+        assert_eq!(event.payload, br#"{"after":"transient"}"#.to_vec());
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), accept_task)
+            .await
+            .expect("accept loop should exit")
+            .expect("join should succeed")
+            .expect("accept loop should return ok");
     }
 }
