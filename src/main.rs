@@ -23,7 +23,9 @@ async fn main() -> Result<(), MainError> {
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "lanyte starting");
 
-    let cfg = lanyte_common::LanyteConfig::from_env()?;
+    let loaded_cfg = lanyte_common::LanyteConfig::load_with_provenance()?;
+    tracing::debug!(provenance = ?loaded_cfg.provenance, "resolved configuration provenance");
+    let cfg = loaded_cfg.config;
     let sock = cfg.gateway.socket_path.clone();
     let schemas = cfg.gateway.crucible_schemas_dir.clone();
 
