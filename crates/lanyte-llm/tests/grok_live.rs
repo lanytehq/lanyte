@@ -91,9 +91,9 @@ fn live_tool_round_trip_with_previous_response_id() {
         .build()
         .expect("runtime");
     let mut round_trip = None;
-    // Grok tool choice is live-provider behavior, not a deterministic fixture.
-    // Allow a few real attempts before skipping so `make live-llm` stays useful as
-    // a smoke test without turning one non-tool response into a hard failure.
+    // Grok tool choice is still provider behavior, so retry a few times to reduce flake.
+    // Once credentials are present, though, AGI-013 treats failure to emit the tool call as a
+    // real validation failure rather than a soft skip.
     for _ in 0..3 {
         let attempt = runtime.block_on(async {
             let mut request = CompletionRequest::single_user_message(
@@ -156,14 +156,8 @@ fn live_tool_round_trip_with_previous_response_id() {
         }
     }
 
-    let Some((tool_call_id, tool_name, tool_args, previous_response_id)) = round_trip else {
-        eprintln!(
-            // Keep this as a skip, not a failure: the transport/parser path may still be sound
-            // even when the provider declines to invoke the tool on a given live run.
-            "skipping Grok live tool follow-up: provider did not emit a tool call after 3 attempts"
-        );
-        return;
-    };
+    let (tool_call_id, tool_name, tool_args, previous_response_id) =
+        round_trip.expect("Grok should emit a tool call after 3 live attempts");
 
     assert_eq!(tool_name, "get_weather");
     assert!(tool_args.contains("London"));

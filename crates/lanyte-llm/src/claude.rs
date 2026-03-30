@@ -250,11 +250,13 @@ impl ClaudeBackend {
             .map(ClaudeMessage::from_message)
             .collect::<Result<Vec<_>>>()?;
         if !request.tool_results.is_empty() {
-            // Anthropic requires the immediately preceding assistant message to contain the
-            // corresponding tool_use blocks before user tool_result blocks are accepted.
-            // Reconstruct that assistant turn from ToolResult metadata so follow-up requests
-            // remain valid under the shared LlmBackend contract.
-            messages.push(ClaudeMessage::tool_uses(&request.tool_results)?);
+            // Anthropic expects the preceding assistant turn to contain matching tool_use blocks.
+            // Reconstruct them when ToolResult carries call metadata, but keep accepting the
+            // generic ToolResult::new shape so callers can still provide their own prior assistant
+            // turn without the Claude adapter rejecting the request up front.
+            if let Some(tool_uses) = ClaudeMessage::tool_uses(&request.tool_results)? {
+                messages.push(tool_uses);
+            }
             messages.push(ClaudeMessage::tool_results(&request.tool_results));
         }
 
@@ -460,8 +462,15 @@ impl ClaudeMessage {
         }
     }
 
-    fn tool_uses(tool_results: &[crate::ToolResult]) -> Result<Self> {
-        Ok(Self {
+    fn tool_uses(tool_results: &[crate::ToolResult]) -> Result<Option<Self>> {
+        let has_complete_metadata = tool_results
+            .iter()
+            .all(|result| result.tool_name.is_some() && result.arguments.is_some());
+        if !has_complete_metadata {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
             role: "assistant",
             content: ClaudeMessageContent::Blocks(
                 tool_results
@@ -486,7 +495,7 @@ impl ClaudeMessage {
                     })
                     .collect::<Result<Vec<_>>>()?,
             ),
-        })
+        }))
     }
 }
 
@@ -1457,6 +1466,32 @@ mod tests {
             serde_json::from_str(&requests[0].body).expect("request json");
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 32);
+    }
+
+    #[test]
+    fn generic_tool_results_do_not_require_claude_metadata() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{ "content": [ { "type": "text", "text": "ok" } ], "stop_reason": "end_turn" }"#,
+        )]);
+
+        let backend = backend_for_server(server.base_url());
+        let mut request = CompletionRequest::single_user_message("Use tool result", 32);
+        request.tool_results.push(crate::ToolResult::new(
+            "call-1",
+            r#"{"city":"London","forecast":"rain"}"#,
+        ));
+
+        let response = backend.complete(request).expect("complete");
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        let requests = server.take_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(&requests[0].body).expect("request json");
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_result");
     }
 
     #[test]
