@@ -1072,6 +1072,7 @@ mod tests {
                 r#"{"city":"London","forecast":"rain"}"#,
             )],
             max_tokens: Some(32),
+            thinking_budget_tokens: None,
             temperature: Some(0.25),
             parallel_tool_calls: Some(true),
         };

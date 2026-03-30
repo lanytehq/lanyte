@@ -1,13 +1,20 @@
 use lanyte_llm::{
-    CompletionRequest, GrokBackend, LlmBackend, StopReason, StreamEvent, ToolDefinition, ToolResult,
+    CompletionRequest, GrokBackend, LlmBackend, LlmError, StopReason, StreamEvent, ToolDefinition,
+    ToolResult,
 };
 
+const GROK_API_KEY_ENV: &str = "LANYTE_LLM_GROK_API_KEY";
+const GROK_MODEL_ENV: &str = "LANYTE_LLM_GROK_MODEL";
+
 fn live_backend() -> Option<GrokBackend> {
-    let api_key = std::env::var("LANYTE_LLM_GROK_API_KEY").ok()?;
-    let model = std::env::var("LANYTE_LLM_GROK_MODEL")
+    let api_key = std::env::var(GROK_API_KEY_ENV).ok()?;
+    let model = std::env::var(GROK_MODEL_ENV)
         .unwrap_or_else(|_| "grok-4.20-beta-latest-reasoning".to_owned());
     GrokBackend::new(model, api_key).ok()
 }
+
+// Rate-limit validation stays manual-only. Intentionally triggering provider limits would
+// create account-scoped side effects; the conformance harness already covers retry parsing.
 
 #[test]
 fn live_complete_round_trip() {
@@ -84,9 +91,9 @@ fn live_tool_round_trip_with_previous_response_id() {
         .build()
         .expect("runtime");
     let mut round_trip = None;
-    // Grok tool choice is live-provider behavior, not a deterministic fixture.
-    // Allow a few real attempts before skipping so `make live-llm` stays useful as
-    // a smoke test without turning one non-tool response into a hard failure.
+    // Grok tool choice is still provider behavior, so retry a few times to reduce flake.
+    // Once credentials are present, though, AGI-013 treats failure to emit the tool call as a
+    // real validation failure rather than a soft skip.
     for _ in 0..3 {
         let attempt = runtime.block_on(async {
             let mut request = CompletionRequest::single_user_message(
@@ -149,14 +156,8 @@ fn live_tool_round_trip_with_previous_response_id() {
         }
     }
 
-    let Some((tool_call_id, tool_name, tool_args, previous_response_id)) = round_trip else {
-        eprintln!(
-            // Keep this as a skip, not a failure: the transport/parser path may still be sound
-            // even when the provider declines to invoke the tool on a given live run.
-            "skipping Grok live tool follow-up: provider did not emit a tool call after 3 attempts"
-        );
-        return;
-    };
+    let (tool_call_id, tool_name, tool_args, previous_response_id) =
+        round_trip.expect("Grok should emit a tool call after 3 live attempts");
 
     assert_eq!(tool_name, "get_weather");
     assert!(tool_args.contains("London"));
@@ -177,4 +178,52 @@ fn live_tool_round_trip_with_previous_response_id() {
     assert!(text.contains("london"));
     assert!(text.contains("rain"));
     assert!(response.response_id.is_some());
+}
+
+#[test]
+fn live_error_invalid_model() {
+    let Ok(api_key) = std::env::var(GROK_API_KEY_ENV) else {
+        eprintln!("skipping Grok live invalid-model test: LANYTE_LLM_GROK_API_KEY not set");
+        return;
+    };
+
+    let backend = GrokBackend::new("grok-invalid-model-for-live-test".to_owned(), api_key)
+        .expect("backend init");
+    let err = backend
+        .complete(CompletionRequest::single_user_message(
+            "Reply with exactly: live_ok",
+            16,
+        ))
+        .expect_err("invalid model should fail");
+    assert!(
+        matches!(err, LlmError::InvalidModel),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn live_multi_turn() {
+    let Some(backend) = live_backend() else {
+        eprintln!("skipping Grok live test: LANYTE_LLM_GROK_API_KEY not set");
+        return;
+    };
+
+    let first = backend
+        .complete(CompletionRequest::single_user_message(
+            "Remember this exact code word for the next turn: cerulean-fox. Reply with exactly: remembered",
+            32,
+        ))
+        .expect("first completion");
+    assert_eq!(first.text.trim(), "remembered");
+
+    let previous_response_id = first.response_id.expect("previous response id");
+    let mut follow_up = CompletionRequest::single_user_message(
+        "What code word did I ask you to remember? Reply with exactly the code word.",
+        32,
+    );
+    follow_up.previous_response_id = Some(previous_response_id);
+
+    let second = backend.complete(follow_up).expect("follow-up completion");
+    assert_eq!(second.stop_reason, StopReason::EndTurn);
+    assert!(second.text.to_ascii_lowercase().contains("cerulean-fox"));
 }
