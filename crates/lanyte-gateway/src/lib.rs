@@ -12,11 +12,13 @@
 pub mod test_support;
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 
 use ipcprims::frame::Frame;
-use ipcprims::peer::{AsyncPeer, AsyncPeerListener, AsyncPeerTx};
+use ipcprims::peer::{AsyncPeer, AsyncPeerListener, AsyncPeerTx, PeerError};
 use ipcprims::schema::{RegistryConfig, SchemaRegistry};
+use ipcprims::transport::TransportError;
 use lanyte_common::{channels, ChannelId, GatewayConfig};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -254,7 +256,14 @@ async fn accept_loop(
                 return Ok(());
             }
             res = listener.accept_with_id(&core_peer_id) => {
-                let peer = res?;
+                let peer = match res {
+                    Ok(peer) => peer,
+                    Err(err) if is_transient_accept_error(&err) => {
+                        tracing::warn!(error = %err, "transient accept error; continuing");
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
                 // TODO(CRT-009): switch to opaque connection IDs if these escape gateway internals.
                 let connection_id = format!("peer-{next_connection_id}");
                 next_connection_id += 1;
@@ -273,6 +282,21 @@ async fn accept_loop(
                 ));
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn is_transient_accept_error(err: &PeerError) -> bool {
+    match err {
+        PeerError::Transport(TransportError::Accept(io_err)) => matches!(
+            io_err.kind(),
+            ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionReset
+                | ErrorKind::Interrupted
+                | ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+        ),
+        _ => false,
     }
 }
 
@@ -422,5 +446,30 @@ async fn send_to_peer(
                 .remove(&response.peer_id);
             Err(PeerSendError::PeerDisconnected(response.peer_id.clone()))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::is_transient_accept_error;
+    use std::io;
+
+    use ipcprims::peer::PeerError;
+    use ipcprims::transport::TransportError;
+
+    #[test]
+    fn accept_connection_aborted_is_treated_as_transient() {
+        let err = PeerError::Transport(TransportError::Accept(io::Error::from(
+            io::ErrorKind::ConnectionAborted,
+        )));
+
+        assert!(is_transient_accept_error(&err));
+    }
+
+    #[test]
+    fn handshake_failure_is_not_treated_as_transient() {
+        let err = PeerError::HandshakeFailed("bad hello".to_owned());
+
+        assert!(!is_transient_accept_error(&err));
     }
 }

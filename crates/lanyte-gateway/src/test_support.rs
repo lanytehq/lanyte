@@ -50,9 +50,13 @@ impl Drop for TempGatewayDir {
 }
 
 pub fn write_test_schema(dir: &Path, channel: u16) {
+    write_schema(dir, channel, PERMISSIVE_TEST_SCHEMA);
+}
+
+pub fn write_schema(dir: &Path, channel: u16, schema: &str) {
     std::fs::create_dir_all(dir).expect("schema dir should be creatable");
     let path = dir.join(format!("channel_{channel}.schema.json"));
-    std::fs::write(path, PERMISSIVE_TEST_SCHEMA).expect("schema should be writable");
+    std::fs::write(path, schema).expect("schema should be writable");
 }
 
 pub fn write_all_peer_schemas(dir: &Path) {
