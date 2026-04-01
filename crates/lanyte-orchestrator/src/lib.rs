@@ -214,12 +214,19 @@ impl Orchestrator {
             }
         };
         let OrchestratorEffect::RequestCompletion {
-            envelope,
+            envelope: completion_envelope,
             request: completion_request,
             ..
         } = completion_effect
         else {
             unreachable!("request_completion_effect always returns RequestCompletion");
+        };
+        let OrchestratorEvent::IngressMessage {
+            envelope: ingress_envelope,
+            ..
+        } = &ingress
+        else {
+            unreachable!("llm_complete_ingress_event always returns IngressMessage");
         };
 
         let Some(backend) = self.llm.clone() else {
@@ -275,7 +282,12 @@ impl Orchestrator {
                 }
             };
 
-        let reply_effect = Self::emit_message_effect(&envelope, backend_name, &completion);
+        let reply_effect = Self::emit_message_effect(
+            ingress_envelope,
+            &completion_envelope,
+            backend_name,
+            &completion,
+        );
         self.send_command_result(
             &event.peer_id,
             CommandInvokeResult {
@@ -506,7 +518,8 @@ impl Orchestrator {
     }
 
     fn emit_message_effect(
-        request_envelope: &Envelope,
+        ingress_envelope: &Envelope,
+        completion_envelope: &Envelope,
         backend_name: &str,
         completion: &CompletionResponse,
     ) -> OrchestratorEffect {
@@ -514,21 +527,21 @@ impl Orchestrator {
             envelope: Envelope {
                 id: Uuid::new_v4(),
                 occurred_at: Utc::now(),
-                conversation_id: request_envelope.conversation_id,
-                turn_id: request_envelope.turn_id,
-                action_id: request_envelope.action_id,
-                causation_id: Some(request_envelope.id),
-                correlation_id: request_envelope.correlation_id.clone(),
+                conversation_id: ingress_envelope.conversation_id,
+                turn_id: ingress_envelope.turn_id,
+                action_id: ingress_envelope.action_id,
+                causation_id: Some(completion_envelope.id),
+                correlation_id: ingress_envelope.correlation_id.clone(),
                 external_ref: completion
                     .response_id
                     .clone()
-                    .or_else(|| request_envelope.external_ref.clone()),
+                    .or_else(|| ingress_envelope.external_ref.clone()),
                 source: EntityRef::System {
                     component: "orchestrator".to_owned(),
                 },
-                target: Some(request_envelope.source.clone()),
-                trust_ref: request_envelope.trust_ref.clone(),
-                gate_ref: request_envelope.gate_ref.clone(),
+                target: Some(ingress_envelope.source.clone()),
+                trust_ref: ingress_envelope.trust_ref.clone(),
+                gate_ref: ingress_envelope.gate_ref.clone(),
             },
             message: EntityMessage {
                 intent: MessageIntent::DeliverResult,
@@ -1018,6 +1031,24 @@ mod tests {
             trust_ref: None,
             gate_ref: None,
         };
+        let completion_envelope = Envelope {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            conversation_id: None,
+            turn_id: None,
+            action_id: None,
+            causation_id: Some(request_envelope.id),
+            correlation_id: Some("550e8400-e29b-41d4-a716-446655440000".to_owned()),
+            external_ref: Some("550e8400-e29b-41d4-a716-446655440000".to_owned()),
+            source: EntityRef::System {
+                component: "orchestrator".to_owned(),
+            },
+            target: Some(EntityRef::System {
+                component: "llm".to_owned(),
+            }),
+            trust_ref: None,
+            gate_ref: None,
+        };
         let response = CompletionResponse {
             response_id: Some("resp-1".to_owned()),
             text: "hello back".to_owned(),
@@ -1029,8 +1060,12 @@ mod tests {
             }),
         };
 
-        let effect =
-            Orchestrator::emit_message_effect(&request_envelope, "test-backend", &response);
+        let effect = Orchestrator::emit_message_effect(
+            &request_envelope,
+            &completion_envelope,
+            "test-backend",
+            &response,
+        );
         let OrchestratorEffect::EmitMessage { envelope, message } = effect else {
             panic!("expected EmitMessage effect");
         };
@@ -1038,6 +1073,14 @@ mod tests {
         assert_eq!(
             envelope.correlation_id.as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(envelope.causation_id, Some(completion_envelope.id));
+        assert_eq!(
+            envelope.target,
+            Some(EntityRef::Peer {
+                peer_id: "peer-1".to_owned(),
+                channel: channels::COMMAND,
+            })
         );
         assert_eq!(message.intent, MessageIntent::DeliverResult);
         assert_eq!(extract_text(&message), "hello back");
