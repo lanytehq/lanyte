@@ -193,7 +193,26 @@ impl Orchestrator {
             &command_request,
             &args,
         );
-        let completion_effect = Self::request_completion_effect(&ingress, &args);
+        let completion_effect = match Self::request_completion_effect(&ingress) {
+            Ok(effect) => effect,
+            Err(err) => {
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id,
+                        command: command_request.command,
+                        error_code: "internal_error",
+                        message: format!(
+                            "failed to derive completion request from ingress event: {err}"
+                        ),
+                        retryable: false,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
         let OrchestratorEffect::RequestCompletion {
             envelope,
             request: completion_request,
@@ -440,22 +459,30 @@ impl Orchestrator {
             },
             message: EntityMessage {
                 intent: MessageIntent::Ask,
-                parts: vec![ContentPart::Text {
-                    text: args.prompt.clone(),
-                }],
+                parts: vec![
+                    ContentPart::Text {
+                        text: args.prompt.clone(),
+                    },
+                    ContentPart::Structured {
+                        value: serde_json::json!({
+                            "system_prompt": args.system_prompt,
+                            "max_tokens": args.max_tokens,
+                        }),
+                    },
+                ],
             },
         }
     }
 
     fn request_completion_effect(
         event: &OrchestratorEvent,
-        args: &LlmCompleteArgs,
-    ) -> OrchestratorEffect {
+    ) -> Result<OrchestratorEffect, &'static str> {
         let OrchestratorEvent::IngressMessage { envelope, message } = event else {
             unreachable!("AGI-005 only derives completion requests from ingress messages");
         };
+        let request = completion_request_from_message(message)?;
 
-        OrchestratorEffect::RequestCompletion {
+        Ok(OrchestratorEffect::RequestCompletion {
             envelope: Envelope {
                 id: Uuid::new_v4(),
                 occurred_at: Utc::now(),
@@ -474,18 +501,8 @@ impl Orchestrator {
                 trust_ref: envelope.trust_ref.clone(),
                 gate_ref: envelope.gate_ref.clone(),
             },
-            request: CompletionRequest {
-                system_prompt: args.system_prompt.clone(),
-                previous_response_id: None,
-                messages: vec![lanyte_llm::Message::user(extract_text(message))],
-                tools: Vec::new(),
-                tool_results: Vec::new(),
-                max_tokens: Some(args.max_tokens),
-                thinking_budget_tokens: None,
-                temperature: None,
-                parallel_tool_calls: None,
-            },
-        }
+            request,
+        })
     }
 
     fn emit_message_effect(
@@ -636,6 +653,38 @@ fn extract_text(message: &EntityMessage) -> String {
         .join("\n")
 }
 
+fn completion_request_from_message(
+    message: &EntityMessage,
+) -> Result<CompletionRequest, &'static str> {
+    let prompt = extract_text(message);
+    if prompt.trim().is_empty() {
+        return Err("ingress message is missing prompt text");
+    }
+
+    let options = message
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::Structured { value } => Some(value.clone()),
+            _ => None,
+        })
+        .ok_or("ingress message is missing llm.complete options")?;
+    let options = serde_json::from_value::<LlmCompleteMessageOptions>(options)
+        .map_err(|_| "ingress message has invalid llm.complete options")?;
+
+    Ok(CompletionRequest {
+        system_prompt: options.system_prompt,
+        previous_response_id: None,
+        messages: vec![lanyte_llm::Message::user(prompt)],
+        tools: Vec::new(),
+        tool_results: Vec::new(),
+        max_tokens: Some(options.max_tokens),
+        thinking_budget_tokens: None,
+        temperature: None,
+        parallel_tool_calls: None,
+    })
+}
+
 fn map_llm_error(err: &LlmError) -> (&'static str, bool) {
     match err {
         LlmError::RateLimited { .. } => ("rate_limited", true),
@@ -716,6 +765,14 @@ struct LlmCompleteArgs {
     #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default = "default_llm_max_tokens")]
+    max_tokens: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LlmCompleteMessageOptions {
+    #[serde(default)]
+    system_prompt: Option<String>,
     max_tokens: u32,
 }
 
@@ -900,7 +957,29 @@ mod tests {
             &command_request,
             &args,
         );
-        let effect = Orchestrator::request_completion_effect(&ingress, &args);
+        let OrchestratorEvent::IngressMessage { message, .. } = &ingress else {
+            panic!("expected ingress message event");
+        };
+        assert_eq!(extract_text(message), "Summarize this");
+        let options = message
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                ContentPart::Structured { value } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("structured llm options should be present");
+        assert_eq!(
+            serde_json::from_value::<LlmCompleteMessageOptions>(options)
+                .expect("llm options should deserialize"),
+            LlmCompleteMessageOptions {
+                system_prompt: Some("You are concise".to_owned()),
+                max_tokens: 48,
+            }
+        );
+
+        let effect = Orchestrator::request_completion_effect(&ingress)
+            .expect("completion request should derive from ingress event");
 
         let OrchestratorEffect::RequestCompletion { envelope, request } = effect else {
             panic!("expected RequestCompletion effect");
