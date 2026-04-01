@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 futures-core = { workspace = true }
 futures-util = { workspace = true }
-lanyte-common = { path = "../lanyte-common" }
+lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

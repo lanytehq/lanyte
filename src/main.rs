@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -7,6 +9,8 @@ enum MainError {
     Telemetry(#[from] lanyte_telemetry::TelemetryError),
     #[error(transparent)]
     Common(#[from] lanyte_common::CommonError),
+    #[error(transparent)]
+    Llm(#[from] lanyte_llm::LlmError),
     #[error(transparent)]
     Gateway(#[from] lanyte_gateway::GatewayError),
     #[error(transparent)]
@@ -35,12 +39,23 @@ async fn main() -> Result<(), MainError> {
         "starting gateway"
     );
 
+    let llm = build_llm_backend(&cfg.llm)?;
+    if let Some(backend) = &llm {
+        tracing::info!(
+            backend = backend.name(),
+            "configured orchestrator LLM backend"
+        );
+    } else {
+        tracing::warn!("no LLM backend configured; llm.complete command will return invoke_error");
+    }
+
     let (gateway, events) = lanyte_gateway::spawn(cfg.gateway)?;
     let orchestrator_cancel = CancellationToken::new();
     let orchestrator = lanyte_orchestrator::Orchestrator::new(
         events,
         orchestrator_cancel.clone(),
         gateway.responder(),
+        llm,
     );
     let mut gateway = Some(gateway);
     let orchestrator_task = tokio::spawn(orchestrator.run());
@@ -79,4 +94,25 @@ async fn main() -> Result<(), MainError> {
     }
 
     Ok(())
+}
+
+fn build_llm_backend(
+    cfg: &lanyte_common::LlmConfig,
+) -> Result<Option<Arc<dyn lanyte_llm::LlmBackend>>, lanyte_llm::LlmError> {
+    if cfg.claude.api_key.is_some() {
+        return Ok(Some(Arc::new(lanyte_llm::ClaudeBackend::from_config(
+            &cfg.claude,
+        )?)));
+    }
+    if cfg.openai.api_key.is_some() {
+        return Ok(Some(Arc::new(lanyte_llm::OpenAiBackend::from_config(
+            &cfg.openai,
+        )?)));
+    }
+    if cfg.grok.api_key.is_some() {
+        return Ok(Some(Arc::new(lanyte_llm::GrokBackend::from_config(
+            &cfg.grok,
+        )?)));
+    }
+    Ok(None)
 }
