@@ -10,8 +10,10 @@ default = []
 test-support = []
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
 lanyte-gateway = { path = "../lanyte-gateway", version = "0.1.0" }
+lanyte-llm = { path = "../lanyte-llm", version = "0.1.0" }
 lanyte-telemetry = { path = "../lanyte-telemetry", version = "0.1.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -19,6 +21,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 ipcprims = { workspace = true }

@@ -1,14 +1,54 @@
 #![cfg(unix)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ipcprims::peer::async_connect;
 use lanyte_common::channels;
 use lanyte_gateway::test_support::{spawn_test_gateway, TempGatewayDir};
 use lanyte_gateway::{PeerResponse, PeerSendError};
+use lanyte_llm::{
+    BackendCapabilities, CompletionRequest, CompletionResponse, HealthStatus, LlmBackend, LlmError,
+    LlmStream, Usage,
+};
 use lanyte_orchestrator::Orchestrator;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+struct FixedBackend {
+    response: CompletionResponse,
+}
+
+impl LlmBackend for FixedBackend {
+    fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        Ok(self.response.clone())
+    }
+
+    fn stream(&self, _request: CompletionRequest) -> Result<LlmStream, LlmError> {
+        unimplemented!("AGI-005 tests exercise the synchronous completion path only")
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            supports_streaming: true,
+            supports_tool_use: false,
+            supports_system_prompt: true,
+            supports_parallel_tool_calls: false,
+            supports_web_search: false,
+            supports_image_generation: false,
+            max_context_tokens: 200_000,
+        }
+    }
+
+    fn health(&self) -> HealthStatus {
+        HealthStatus::Healthy
+    }
+
+    fn name(&self) -> &'static str {
+        "test-backend"
+    }
+}
 
 #[tokio::test]
 async fn mail_event_reaches_mail_handler() {
@@ -17,8 +57,8 @@ async fn mail_event_reaches_mail_handler() {
         spawn_test_gateway(&dir, &[channels::MAIL]).expect("gateway should spawn");
     let (obs_tx, mut obs_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
-    let orchestrator =
-        Orchestrator::new(events, cancel.clone(), gateway.responder()).with_test_observer(obs_tx);
+    let orchestrator = Orchestrator::new(events, cancel.clone(), gateway.responder(), None)
+        .with_test_observer(obs_tx);
     let orchestrator_task = tokio::spawn(orchestrator.run());
 
     let client = async_connect(dir.socket_path(), &[channels::MAIL])
@@ -60,7 +100,7 @@ async fn admin_status_request_round_trip_returns_expected_fields() {
     let (gateway, events) =
         spawn_test_gateway(&dir, &[channels::ADMIN]).expect("gateway should spawn");
     let cancel = CancellationToken::new();
-    let orchestrator = Orchestrator::new(events, cancel.clone(), gateway.responder());
+    let orchestrator = Orchestrator::new(events, cancel.clone(), gateway.responder(), None);
     let orchestrator_task = tokio::spawn(orchestrator.run());
 
     let client = async_connect(dir.socket_path(), &[channels::ADMIN])
@@ -135,5 +175,139 @@ async fn sending_to_unknown_peer_returns_typed_error() {
     assert_eq!(err, PeerSendError::UnknownPeer("missing-peer".to_owned()));
 
     gateway.cancel();
+    gateway.wait().await.expect("gateway should exit");
+}
+
+#[tokio::test]
+async fn llm_complete_command_round_trip_returns_expected_fields() {
+    let dir = TempGatewayDir::new("orchestrator-command-llm");
+    let (gateway, events) =
+        spawn_test_gateway(&dir, &[channels::COMMAND]).expect("gateway should spawn");
+    let cancel = CancellationToken::new();
+    let backend = FixedBackend {
+        response: CompletionResponse {
+            response_id: Some("resp-test-1".to_owned()),
+            text: "hello from llm".to_owned(),
+            stop_reason: lanyte_llm::StopReason::EndTurn,
+            usage: Some(Usage {
+                input_tokens: 14,
+                output_tokens: 4,
+                reasoning_tokens: None,
+            }),
+        },
+    };
+    let orchestrator = Orchestrator::new(
+        events,
+        cancel.clone(),
+        gateway.responder(),
+        Some(Arc::new(backend)),
+    );
+    let orchestrator_task = tokio::spawn(orchestrator.run());
+
+    let client = async_connect(dir.socket_path(), &[channels::COMMAND])
+        .await
+        .expect("client should connect");
+    let (tx, mut rx) = client.into_split();
+    tx.send_json(
+        channels::COMMAND,
+        &serde_json::json!({
+            "type": "invoke",
+            "request_id": "11111111-1111-4111-8111-111111111111",
+            "command": "llm.complete",
+            "args": {
+                "prompt": "Say hello",
+                "system_prompt": "You are terse",
+                "max_tokens": 32
+            }
+        }),
+    )
+    .await
+    .expect("command frame should send");
+
+    let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("command response should arrive")
+        .expect("command response frame should be valid");
+    let payload: serde_json::Value =
+        serde_json::from_slice(frame.payload.as_ref()).expect("response payload should be JSON");
+
+    assert_eq!(frame.channel, channels::COMMAND);
+    assert_eq!(payload["type"], "invoke_result");
+    assert_eq!(
+        payload["request_id"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+    assert_eq!(payload["command"], "llm.complete");
+    assert_eq!(payload["result"]["backend"], "test-backend");
+    assert_eq!(payload["result"]["intent"], "deliver_result");
+    assert_eq!(payload["result"]["text"], "hello from llm");
+    assert_eq!(payload["result"]["stop_reason"], "end_turn");
+    assert_eq!(payload["result"]["response_id"], "resp-test-1");
+    assert_eq!(payload["result"]["usage"]["input_tokens"], 14);
+    assert_eq!(payload["result"]["usage"]["output_tokens"], 4);
+
+    cancel.cancel();
+    gateway.cancel();
+    orchestrator_task
+        .await
+        .expect("orchestrator task should join")
+        .expect("orchestrator should exit cleanly");
+    gateway.wait().await.expect("gateway should exit");
+}
+
+#[tokio::test]
+async fn llm_complete_command_returns_invoke_error_when_backend_unconfigured() {
+    let dir = TempGatewayDir::new("orchestrator-command-no-llm");
+    let (gateway, events) =
+        spawn_test_gateway(&dir, &[channels::COMMAND]).expect("gateway should spawn");
+    let cancel = CancellationToken::new();
+    let orchestrator = Orchestrator::new(events, cancel.clone(), gateway.responder(), None);
+    let orchestrator_task = tokio::spawn(orchestrator.run());
+
+    let client = async_connect(dir.socket_path(), &[channels::COMMAND])
+        .await
+        .expect("client should connect");
+    let (tx, mut rx) = client.into_split();
+    tx.send_json(
+        channels::COMMAND,
+        &serde_json::json!({
+            "type": "invoke",
+            "request_id": "22222222-2222-4222-8222-222222222222",
+            "command": "llm.complete",
+            "args": {
+                "prompt": "Say hello"
+            }
+        }),
+    )
+    .await
+    .expect("command frame should send");
+
+    let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("command error should arrive")
+        .expect("command error frame should be valid");
+    let payload: serde_json::Value =
+        serde_json::from_slice(frame.payload.as_ref()).expect("response payload should be JSON");
+
+    assert_eq!(frame.channel, channels::COMMAND);
+    assert_eq!(payload["type"], "invoke_error");
+    assert_eq!(
+        payload["request_id"],
+        "22222222-2222-4222-8222-222222222222"
+    );
+    assert_eq!(payload["command"], "llm.complete");
+    assert_eq!(payload["error_code"], "internal_error");
+    assert_eq!(payload["retryable"], false);
+    assert!(payload["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not configured"));
+
+    cancel.cancel();
+    gateway.cancel();
+    orchestrator_task
+        .await
+        .expect("orchestrator task should join")
+        .expect("orchestrator should exit cleanly");
     gateway.wait().await.expect("gateway should exit");
 }
