@@ -14,6 +14,8 @@ enum MainError {
     #[error(transparent)]
     Gateway(#[from] lanyte_gateway::GatewayError),
     #[error(transparent)]
+    State(#[from] lanyte_state::StateError),
+    #[error(transparent)]
     Orchestrator(#[from] lanyte_orchestrator::OrchestratorError),
     #[error("failed waiting for Ctrl-C: {0}")]
     CtrlC(#[from] std::io::Error),
@@ -40,6 +42,9 @@ async fn main() -> Result<(), MainError> {
     );
 
     let llm = build_llm_backend(&cfg.llm)?;
+    let audit_store = Arc::new(std::sync::Mutex::new(
+        lanyte_state::StateStore::open_default()?,
+    ));
     if let Some(backend) = &llm {
         tracing::info!(
             backend = backend.name(),
@@ -56,7 +61,8 @@ async fn main() -> Result<(), MainError> {
         orchestrator_cancel.clone(),
         gateway.responder(),
         llm,
-    );
+    )
+    .with_audit_store(audit_store);
     let mut gateway = Some(gateway);
     let orchestrator_task = tokio::spawn(orchestrator.run());
     tokio::pin!(orchestrator_task);

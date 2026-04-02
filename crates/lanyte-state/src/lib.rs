@@ -11,7 +11,7 @@ use lanyte_telemetry::{
     genesis_prev_hash, AuditEnvelopeRef, AuditRecord, AuditRecordKind, AuditSeverity,
     NewAuditRecord,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
 pub const LANYTE_STATE_ROOT_ENV: &str = "LANYTE_STATE_ROOT";
@@ -155,7 +155,9 @@ impl StateStore {
     }
 
     pub fn append_audit_record(&mut self, record: NewAuditRecord) -> Result<AuditRecord> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let latest: Option<(i64, String)> = tx
             .query_row(
                 "SELECT chain_index, entry_hash FROM audit_records WHERE session_id = ?1 ORDER BY chain_index DESC LIMIT 1",
@@ -249,8 +251,11 @@ impl StateStore {
             })
         })?;
 
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(StateError::from)
+        let records = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StateError::from)?;
+        validate_audit_chain(session_id, &records)?;
+        Ok(records)
     }
 
     pub fn export_audit_jsonl(&self, session_id: &str) -> Result<String> {
@@ -320,6 +325,29 @@ fn parse_json_value(input: &str) -> rusqlite::Result<serde_json::Value> {
     serde_json::from_str(input).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
     })
+}
+
+fn validate_audit_chain(session_id: &str, records: &[AuditRecord]) -> Result<()> {
+    let mut expected_prev_hash = genesis_prev_hash(session_id);
+    for record in records {
+        if record.session_id != session_id {
+            return Err(StateError::InvalidAuditRecord(format!(
+                "record session mismatch: expected {session_id}, got {}",
+                record.session_id
+            )));
+        }
+        record
+            .validate()
+            .map_err(|err| StateError::InvalidAuditRecord(err.to_owned()))?;
+        if record.prev_hash != expected_prev_hash {
+            return Err(StateError::InvalidAuditRecord(format!(
+                "broken audit chain for session {session_id}: expected prev_hash {expected_prev_hash}, got {}",
+                record.prev_hash
+            )));
+        }
+        expected_prev_hash = record.entry_hash.clone();
+    }
+    Ok(())
 }
 
 fn configure_sqlite(connection: &Connection) -> Result<()> {
@@ -705,6 +733,91 @@ mod tests {
         assert!(
             delete_result.is_err(),
             "audit record delete should be blocked by trigger"
+        );
+    }
+
+    #[test]
+    fn audit_records_reject_broken_prev_hash_linkage() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+
+        let first = store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_A.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-04-01T19:24:00.000Z".to_owned(),
+                kind: AuditRecordKind::Effect,
+                action: "orchestrator.request_completion".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"backend":"claude"}),
+                verification: None,
+            })
+            .expect("first audit record should append");
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO audit_records(entry_id, session_id, chain_index, timestamp, record_kind, action, severity, payload_json, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (
+                    TEST_ENTRY_ID_B,
+                    TEST_SESSION_ID,
+                    1_i64,
+                    "2026-04-01T19:25:00.000Z",
+                    "outcome",
+                    "orchestrator.request_completion.outcome",
+                    "info",
+                    "{\"status\":\"succeeded\"}",
+                    TEST_ZERO_HASH,
+                    first.entry_hash.as_str(),
+                ),
+            )
+            .expect("tampered insert should succeed at sqlite layer");
+
+        let err = store
+            .audit_records(TEST_SESSION_ID)
+            .expect_err("broken chain should fail closed");
+        assert!(
+            err.to_string().contains("broken audit chain")
+                || err
+                    .to_string()
+                    .contains("entry_hash does not match canonical hash surface")
+        );
+    }
+
+    #[test]
+    fn audit_records_reject_invalid_genesis_anchor() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let store = StateStore::open(paths).expect("state store should open");
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO audit_records(entry_id, session_id, chain_index, timestamp, record_kind, action, severity, payload_json, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (
+                    TEST_ENTRY_ID_A,
+                    TEST_SESSION_ID,
+                    0_i64,
+                    "2026-04-01T19:24:00.000Z",
+                    "effect",
+                    "orchestrator.request_completion",
+                    "info",
+                    "{\"backend\":\"claude\"}",
+                    TEST_ZERO_HASH,
+                    TEST_ZERO_HASH,
+                ),
+            )
+            .expect("tampered insert should succeed at sqlite layer");
+
+        let err = store
+            .audit_records(TEST_SESSION_ID)
+            .expect_err("invalid genesis anchor should fail closed");
+        assert!(
+            err.to_string()
+                .contains("entry_hash does not match canonical hash surface")
+                || err.to_string().contains("broken audit chain")
         );
     }
 }

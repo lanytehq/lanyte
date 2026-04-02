@@ -1,7 +1,9 @@
 #![cfg(unix)]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
+use std::{env, fs};
 
 use ipcprims::peer::async_connect;
 use lanyte_common::channels;
@@ -12,12 +14,25 @@ use lanyte_llm::{
     LlmStream, Usage,
 };
 use lanyte_orchestrator::Orchestrator;
+use lanyte_state::{StatePaths, StateStore};
+use lanyte_telemetry::AuditRecordKind;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct FixedBackend {
     response: CompletionResponse,
+}
+
+fn temp_state_root(label: &str) -> std::path::PathBuf {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time should advance")
+        .as_nanos();
+    env::temp_dir().join(format!(
+        "lanyte-orchestrator-{label}-{}-{now}",
+        std::process::id()
+    ))
 }
 
 impl LlmBackend for FixedBackend {
@@ -310,4 +325,79 @@ async fn llm_complete_command_returns_invoke_error_when_backend_unconfigured() {
         .expect("orchestrator task should join")
         .expect("orchestrator should exit cleanly");
     gateway.wait().await.expect("gateway should exit");
+}
+
+#[tokio::test]
+async fn llm_complete_command_appends_runtime_audit_records() {
+    let dir = TempGatewayDir::new("orchestrator-command-llm-audit");
+    let (gateway, events) =
+        spawn_test_gateway(&dir, &[channels::COMMAND]).expect("gateway should spawn");
+    let state_root = temp_state_root("audit");
+    let audit_store = Arc::new(Mutex::new(
+        StateStore::open(StatePaths::new(&state_root)).expect("state store should open"),
+    ));
+    let cancel = CancellationToken::new();
+    let backend = FixedBackend {
+        response: CompletionResponse {
+            response_id: Some("resp-test-2".to_owned()),
+            text: "audited hello".to_owned(),
+            stop_reason: lanyte_llm::StopReason::EndTurn,
+            usage: Some(Usage {
+                input_tokens: 8,
+                output_tokens: 2,
+                reasoning_tokens: None,
+            }),
+        },
+    };
+    let orchestrator = Orchestrator::new(
+        events,
+        cancel.clone(),
+        gateway.responder(),
+        Some(Arc::new(backend)),
+    )
+    .with_audit_store(audit_store.clone());
+    let orchestrator_task = tokio::spawn(orchestrator.run());
+
+    let client = async_connect(dir.socket_path(), &[channels::COMMAND])
+        .await
+        .expect("client should connect");
+    let (tx, mut rx) = client.into_split();
+    tx.send_json(
+        channels::COMMAND,
+        &serde_json::json!({
+            "type": "invoke",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "command": "llm.complete",
+            "args": {
+                "prompt": "Say hello",
+                "max_tokens": 32
+            }
+        }),
+    )
+    .await
+    .expect("command frame should send");
+
+    let _frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("command response should arrive")
+        .expect("command response frame should be valid");
+
+    let records = audit_store
+        .lock()
+        .expect("audit store lock should succeed")
+        .audit_records("33333333-3333-4333-8333-333333333333")
+        .expect("audit records should load");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].kind, AuditRecordKind::Effect);
+    assert_eq!(records[1].kind, AuditRecordKind::Outcome);
+    assert_eq!(records[1].prev_hash, records[0].entry_hash);
+
+    cancel.cancel();
+    gateway.cancel();
+    orchestrator_task
+        .await
+        .expect("orchestrator task should join")
+        .expect("orchestrator should exit cleanly");
+    gateway.wait().await.expect("gateway should exit");
+    let _ = fs::remove_dir_all(&state_root);
 }

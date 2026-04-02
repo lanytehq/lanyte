@@ -3,13 +3,17 @@
 mod model;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use chrono::Utc;
 use lanyte_common::{channels, ChannelId};
 use lanyte_gateway::{GatewayEvent, PeerResponder, PeerResponse};
 use lanyte_llm::{CompletionRequest, CompletionResponse, LlmBackend, LlmError, StopReason};
-use lanyte_telemetry::AuditEvent;
+use lanyte_state::StateStore;
+use lanyte_telemetry::{
+    emit_audit_record, AuditEnvelopeRef, AuditEvent, AuditRecordKind, AuditSeverity, NewAuditRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -37,6 +41,7 @@ pub struct Orchestrator {
     cancel: CancellationToken,
     responder: PeerResponder,
     llm: Option<Arc<dyn LlmBackend>>,
+    audit_store: Option<Arc<Mutex<StateStore>>>,
     started_at: Instant,
     #[cfg(any(test, feature = "test-support"))]
     observer: Option<mpsc::UnboundedSender<test_support::HandlerObservation>>,
@@ -55,6 +60,7 @@ impl Orchestrator {
             cancel,
             responder,
             llm,
+            audit_store: None,
             started_at: Instant::now(),
             #[cfg(any(test, feature = "test-support"))]
             observer: None,
@@ -68,6 +74,12 @@ impl Orchestrator {
         observer: mpsc::UnboundedSender<test_support::HandlerObservation>,
     ) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_audit_store(mut self, audit_store: Arc<Mutex<StateStore>>) -> Self {
+        self.audit_store = Some(audit_store);
         self
     }
 
@@ -213,14 +225,6 @@ impl Orchestrator {
                 return;
             }
         };
-        let OrchestratorEffect::RequestCompletion {
-            envelope: completion_envelope,
-            request: completion_request,
-            ..
-        } = completion_effect
-        else {
-            unreachable!("request_completion_effect always returns RequestCompletion");
-        };
         let OrchestratorEvent::IngressMessage {
             envelope: ingress_envelope,
             ..
@@ -229,7 +233,44 @@ impl Orchestrator {
             unreachable!("llm_complete_ingress_event always returns IngressMessage");
         };
 
+        if let Err(err) = self.append_effect_audit(ingress_envelope, &completion_effect) {
+            self.send_command_error(
+                &event.peer_id,
+                CommandInvokeError {
+                    kind: "invoke_error",
+                    request_id: command_request.request_id,
+                    command: command_request.command,
+                    error_code: "internal_error",
+                    message: format!("failed to append audit effect: {err}"),
+                    retryable: true,
+                },
+            )
+            .await;
+            return;
+        }
+
+        let OrchestratorEffect::RequestCompletion {
+            envelope: completion_envelope,
+            request: completion_request,
+            ..
+        } = completion_effect
+        else {
+            unreachable!("request_completion_effect always returns RequestCompletion");
+        };
+
         let Some(backend) = self.llm.clone() else {
+            let _ = self.append_outcome_audit(
+                ingress_envelope,
+                ActionOutcome {
+                    status: ActionStatus::Failed,
+                    result: None,
+                    error: Some(ActionError {
+                        code: "llm_backend_unconfigured".to_owned(),
+                        message: "LLM backend is not configured".to_owned(),
+                        retryable: false,
+                    }),
+                },
+            );
             self.send_command_error(
                 &event.peer_id,
                 CommandInvokeError {
@@ -251,6 +292,18 @@ impl Orchestrator {
                 Ok(Ok(response)) => response,
                 Ok(Err(err)) => {
                     let (error_code, retryable) = map_llm_error(&err);
+                    let _ = self.append_outcome_audit(
+                        ingress_envelope,
+                        ActionOutcome {
+                            status: ActionStatus::Failed,
+                            result: None,
+                            error: Some(ActionError {
+                                code: "llm_completion_failed".to_owned(),
+                                message: err.to_string(),
+                                retryable,
+                            }),
+                        },
+                    );
                     self.send_command_error(
                         &event.peer_id,
                         CommandInvokeError {
@@ -266,6 +319,18 @@ impl Orchestrator {
                     return;
                 }
                 Err(err) => {
+                    let _ = self.append_outcome_audit(
+                        ingress_envelope,
+                        ActionOutcome {
+                            status: ActionStatus::Failed,
+                            result: None,
+                            error: Some(ActionError {
+                                code: "llm_join_failed".to_owned(),
+                                message: err.to_string(),
+                                retryable: true,
+                            }),
+                        },
+                    );
                     self.send_command_error(
                         &event.peer_id,
                         CommandInvokeError {
@@ -281,6 +346,35 @@ impl Orchestrator {
                     return;
                 }
             };
+
+        if let Err(err) = self.append_outcome_audit(
+            ingress_envelope,
+            ActionOutcome {
+                status: ActionStatus::Succeeded,
+                result: Some(serde_json::json!({
+                    "backend": backend_name,
+                    "response_id": completion.response_id.clone(),
+                    "stop_reason": stop_reason_value(completion.stop_reason),
+                    "usage": completion.usage.clone(),
+                    "text": completion.text.clone(),
+                })),
+                error: None,
+            },
+        ) {
+            self.send_command_error(
+                &event.peer_id,
+                CommandInvokeError {
+                    kind: "invoke_error",
+                    request_id: command_request.request_id,
+                    command: command_request.command,
+                    error_code: "internal_error",
+                    message: format!("failed to append audit outcome: {err}"),
+                    retryable: true,
+                },
+            )
+            .await;
+            return;
+        }
 
         let reply_effect = Self::emit_message_effect(
             ingress_envelope,
@@ -298,6 +392,68 @@ impl Orchestrator {
             },
         )
         .await;
+    }
+
+    fn append_effect_audit(
+        &self,
+        ingress_envelope: &Envelope,
+        effect: &OrchestratorEffect,
+    ) -> std::result::Result<(), String> {
+        let Some(audit_store) = &self.audit_store else {
+            return Ok(());
+        };
+        let record = NewAuditRecord {
+            entry_id: Uuid::new_v4().to_string(),
+            session_id: audit_session_id(ingress_envelope),
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            kind: AuditRecordKind::Effect,
+            action: audit_action_name_for_effect(effect).to_owned(),
+            severity: AuditSeverity::Info,
+            envelope: audit_envelope_ref(ingress_envelope),
+            payload: serde_json::to_value(effect).map_err(|err| err.to_string())?,
+            verification: None,
+        };
+        let mut store = audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let stored = store
+            .append_audit_record(record)
+            .map_err(|err| err.to_string())?;
+        emit_audit_record(&stored);
+        Ok(())
+    }
+
+    fn append_outcome_audit(
+        &self,
+        ingress_envelope: &Envelope,
+        outcome: ActionOutcome,
+    ) -> std::result::Result<(), String> {
+        let Some(audit_store) = &self.audit_store else {
+            return Ok(());
+        };
+        let record = NewAuditRecord {
+            entry_id: Uuid::new_v4().to_string(),
+            session_id: audit_session_id(ingress_envelope),
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            kind: AuditRecordKind::Outcome,
+            action: "orchestrator.request_completion.outcome".to_owned(),
+            severity: match outcome.status {
+                ActionStatus::Succeeded => AuditSeverity::Info,
+                ActionStatus::Failed => AuditSeverity::Warning,
+                _ => AuditSeverity::Notice,
+            },
+            envelope: audit_envelope_ref(ingress_envelope),
+            payload: serde_json::to_value(&outcome).map_err(|err| err.to_string())?,
+            verification: None,
+        };
+        let mut store = audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let stored = store
+            .append_audit_record(record)
+            .map_err(|err| err.to_string())?;
+        emit_audit_record(&stored);
+        Ok(())
     }
 
     async fn handle_telemetry(&self, event: &GatewayEvent) {
@@ -696,6 +852,50 @@ fn completion_request_from_message(
         temperature: None,
         parallel_tool_calls: None,
     })
+}
+
+fn audit_envelope_ref(envelope: &Envelope) -> AuditEnvelopeRef {
+    AuditEnvelopeRef {
+        conversation_id: envelope.conversation_id.map(|id| id.to_string()),
+        turn_id: envelope.turn_id.map(|id| id.to_string()),
+        action_id: envelope.action_id.map(|id| id.to_string()),
+        causation_id: envelope.causation_id.map(|id| id.to_string()),
+        correlation_id: envelope.correlation_id.clone(),
+        external_ref: envelope.external_ref.clone(),
+        trust_ref: envelope.trust_ref.clone(),
+        gate_ref: envelope.gate_ref.clone(),
+    }
+}
+
+fn audit_action_name_for_effect(effect: &OrchestratorEffect) -> &'static str {
+    match effect {
+        OrchestratorEffect::RequestCompletion { .. } => "orchestrator.request_completion",
+        OrchestratorEffect::EmitMessage { .. } => "orchestrator.emit_message",
+        OrchestratorEffect::InvokeSkill { .. } => "orchestrator.invoke_skill",
+        OrchestratorEffect::SendPeerRequest { .. } => "orchestrator.send_peer_request",
+        OrchestratorEffect::PersistState { .. } => "orchestrator.persist_state",
+        OrchestratorEffect::AppendMemory { .. } => "orchestrator.append_memory",
+        OrchestratorEffect::OpenGate { .. } => "orchestrator.open_gate",
+        OrchestratorEffect::ScheduleTimer { .. } => "orchestrator.schedule_timer",
+        OrchestratorEffect::EmitTelemetry { .. } => "orchestrator.emit_telemetry",
+    }
+}
+
+fn audit_session_id(envelope: &Envelope) -> String {
+    extract_uuid_candidate(envelope.trust_ref.as_deref())
+        .or_else(|| extract_uuid_candidate(envelope.correlation_id.as_deref()))
+        .or_else(|| extract_uuid_candidate(envelope.external_ref.as_deref()))
+        .unwrap_or_else(|| envelope.id.to_string())
+}
+
+fn extract_uuid_candidate(input: Option<&str>) -> Option<String> {
+    let input = input?;
+    input
+        .rsplit_once(':')
+        .map(|(_, candidate)| candidate)
+        .or(Some(input))
+        .and_then(|candidate| uuid::Uuid::parse_str(candidate).ok())
+        .map(|id| id.to_string())
 }
 
 fn map_llm_error(err: &LlmError) -> (&'static str, bool) {
