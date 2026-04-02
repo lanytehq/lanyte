@@ -6,8 +6,10 @@ rust-version = "1.85.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
 lanyte-telemetry = { path = "../lanyte-telemetry", version = "0.1.0" }
 rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

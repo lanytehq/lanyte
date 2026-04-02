@@ -3,9 +3,12 @@
 //! This crate owns SQLite setup (paths, WAL mode, schema, append-only guards)
 //! and is the boundary through which core accesses memory state.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use lanyte_common::env as common_env;
 use lanyte_telemetry::{
     genesis_prev_hash, AuditEnvelopeRef, AuditRecord, AuditRecordKind, AuditSeverity,
@@ -25,12 +28,19 @@ const MIGRATION_002: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/002_audit_records.sql"
 ));
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_001), (2, MIGRATION_002)];
+const MIGRATION_003: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/003_warm_exports.sql"
+));
+const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_001), (2, MIGRATION_002), (3, MIGRATION_003)];
 
 const HOT_TIER_DIR: &str = "hot";
 const WARM_TIER_DIR: &str = "warm";
 const COLD_TIER_DIR: &str = "cold";
 const HOT_TIER_DB_FILE: &str = "memory.sqlite3";
+const WARM_EXPORT_FORMAT_VERSION: &str = "1.0";
+const AUDIT_RECORDS_NO_DELETE_TRIGGER_SQL: &str = "CREATE TRIGGER IF NOT EXISTS audit_records_no_delete\nBEFORE DELETE ON audit_records\nWHEN COALESCE((SELECT value FROM state_metadata WHERE key = 'allow_audit_delete'), '0') != '1'\nBEGIN\n    SELECT RAISE(FAIL, 'audit_records is append-only');\nEND;";
+pub const DEFAULT_HOT_RETENTION_DAYS: u64 = 30;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -48,6 +58,18 @@ pub enum StateError {
 
     #[error("failed to encode audit JSON: {0}")]
     AuditJson(#[from] serde_json::Error),
+
+    #[error("invalid warm export: {0}")]
+    InvalidWarmExport(String),
+
+    #[error("session not found in hot tier: {0}")]
+    SessionNotFound(String),
+
+    #[error("invalid eviction policy: {0}")]
+    InvalidEvictionPolicy(String),
+
+    #[error("timestamp parse error: {0}")]
+    TimestampParse(#[from] chrono::ParseError),
 }
 
 pub type Result<T> = std::result::Result<T, StateError>;
@@ -117,6 +139,71 @@ impl StatePaths {
     pub fn hot_db_path(&self) -> &Path {
         &self.hot_db_path
     }
+
+    #[must_use]
+    pub fn warm_export_path(&self, session_id: &str) -> PathBuf {
+        self.warm_dir
+            .join(format!("audit-session-{session_id}.jsonl"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgeBasedEvictionPolicy {
+    pub max_age: Duration,
+}
+
+impl Default for AgeBasedEvictionPolicy {
+    fn default() -> Self {
+        Self {
+            max_age: Duration::from_secs(DEFAULT_HOT_RETENTION_DAYS * 24 * 60 * 60),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmExportMetadata {
+    pub session_id: String,
+    pub archive_path: PathBuf,
+    pub format_version: String,
+    pub genesis_prev_hash: String,
+    pub record_count: usize,
+    pub terminal_entry_hash: String,
+    pub latest_record_timestamp: String,
+    pub exported_at: String,
+    pub hot_deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedSession {
+    pub export: WarmExportMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WarmChainHeader {
+    #[serde(rename = "_type")]
+    pub line_type: String,
+    pub session_id: String,
+    pub genesis_prev_hash: String,
+    pub record_count: usize,
+    pub terminal_entry_hash: String,
+    pub exported_at: String,
+    pub format_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WarmAuditRecordLine {
+    #[serde(rename = "_type")]
+    line_type: String,
+    #[serde(flatten)]
+    record: AuditRecord,
+}
+
+pub struct SessionExporter<'a> {
+    store: &'a StateStore,
+}
+
+pub struct SessionEvictor<'a> {
+    store: &'a mut StateStore,
 }
 
 /// Store boundary for the hot-tier memory DB.
@@ -143,6 +230,16 @@ impl StateStore {
     #[must_use]
     pub fn paths(&self) -> &StatePaths {
         &self.paths
+    }
+
+    #[must_use]
+    pub fn session_exporter(&self) -> SessionExporter<'_> {
+        SessionExporter { store: self }
+    }
+
+    #[must_use]
+    pub fn session_evictor(&mut self) -> SessionEvictor<'_> {
+        SessionEvictor { store: self }
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -259,11 +356,161 @@ impl StateStore {
     }
 
     pub fn export_audit_jsonl(&self, session_id: &str) -> Result<String> {
-        Ok(self
-            .audit_records(session_id)?
-            .into_iter()
-            .map(|record| record.to_jsonl_line())
-            .collect())
+        let records = self.audit_records(session_id)?;
+        let export = build_warm_export(session_id, &records, Utc::now());
+        render_warm_export(&export.header, &export.records)
+    }
+
+    pub fn warm_export_metadata(&self, session_id: &str) -> Result<Option<WarmExportMetadata>> {
+        self.connection
+            .query_row(
+                "SELECT session_id, archive_path, format_version, genesis_prev_hash, record_count, terminal_entry_hash, latest_record_timestamp, exported_at, hot_deleted_at FROM warm_exports WHERE session_id = ?1 LIMIT 1",
+                (session_id,),
+                |row| {
+                    Ok(WarmExportMetadata {
+                        session_id: row.get(0)?,
+                        archive_path: PathBuf::from(row.get::<_, String>(1)?),
+                        format_version: row.get(2)?,
+                        genesis_prev_hash: row.get(3)?,
+                        record_count: row.get::<_, i64>(4)? as usize,
+                        terminal_entry_hash: row.get(5)?,
+                        latest_record_timestamp: row.get(6)?,
+                        exported_at: row.get(7)?,
+                        hot_deleted_at: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    fn upsert_warm_export_metadata(&self, metadata: &WarmExportMetadata) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO warm_exports(session_id, archive_path, format_version, genesis_prev_hash, record_count, terminal_entry_hash, latest_record_timestamp, exported_at, hot_deleted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(session_id) DO UPDATE SET archive_path = excluded.archive_path, format_version = excluded.format_version, genesis_prev_hash = excluded.genesis_prev_hash, record_count = excluded.record_count, terminal_entry_hash = excluded.terminal_entry_hash, latest_record_timestamp = excluded.latest_record_timestamp, exported_at = excluded.exported_at, hot_deleted_at = excluded.hot_deleted_at",
+            params![
+                &metadata.session_id,
+                metadata.archive_path.to_string_lossy().to_string(),
+                &metadata.format_version,
+                &metadata.genesis_prev_hash,
+                metadata.record_count as i64,
+                &metadata.terminal_entry_hash,
+                &metadata.latest_record_timestamp,
+                &metadata.exported_at,
+                &metadata.hot_deleted_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn eviction_candidates(&self, cutoff: &str) -> Result<Vec<String>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT session_id FROM audit_records GROUP BY session_id HAVING MAX(timestamp) < ?1 ORDER BY MAX(timestamp) ASC",
+        )?;
+        let rows = stmt.query_map((cutoff,), |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    fn delete_hot_session(
+        &mut self,
+        session_id: &str,
+        metadata: &WarmExportMetadata,
+        deleted_at: &str,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("DROP TRIGGER IF EXISTS audit_records_no_delete")?;
+        tx.execute(
+            "DELETE FROM audit_records WHERE session_id = ?1",
+            (session_id,),
+        )?;
+        tx.execute(
+            "INSERT INTO warm_exports(session_id, archive_path, format_version, genesis_prev_hash, record_count, terminal_entry_hash, latest_record_timestamp, exported_at, hot_deleted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(session_id) DO UPDATE SET archive_path = excluded.archive_path, format_version = excluded.format_version, genesis_prev_hash = excluded.genesis_prev_hash, record_count = excluded.record_count, terminal_entry_hash = excluded.terminal_entry_hash, latest_record_timestamp = excluded.latest_record_timestamp, exported_at = excluded.exported_at, hot_deleted_at = excluded.hot_deleted_at",
+            params![
+                session_id,
+                metadata.archive_path.to_string_lossy().to_string(),
+                &metadata.format_version,
+                &metadata.genesis_prev_hash,
+                metadata.record_count as i64,
+                &metadata.terminal_entry_hash,
+                &metadata.latest_record_timestamp,
+                &metadata.exported_at,
+                deleted_at,
+            ],
+        )?;
+        tx.execute_batch(AUDIT_RECORDS_NO_DELETE_TRIGGER_SQL)?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+impl<'a> SessionExporter<'a> {
+    pub fn export_to_warm(&self, session_id: &str) -> Result<WarmExportMetadata> {
+        let records = self.store.audit_records(session_id)?;
+        if records.is_empty() {
+            return Err(StateError::SessionNotFound(session_id.to_owned()));
+        }
+
+        let export = build_warm_export(session_id, &records, Utc::now());
+        let final_path = self.store.paths.warm_export_path(session_id);
+        let temp_path = self.store.paths.warm_dir().join(format!(
+            ".audit-session-{session_id}-{}.tmp",
+            std::process::id()
+        ));
+        let rendered = render_warm_export(&export.header, &export.records)?;
+        write_temp_export(&temp_path, &rendered)?;
+
+        let mut metadata = verify_warm_export_file(&temp_path)?;
+        if let Err(err) = fs::rename(&temp_path, &final_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(StateError::Io(err));
+        }
+
+        metadata.archive_path = final_path.clone();
+        self.store.upsert_warm_export_metadata(&metadata)?;
+        self.store.warm_export_metadata(session_id)?.ok_or_else(|| {
+            StateError::InvalidWarmExport("warm export metadata missing after write".to_owned())
+        })
+    }
+
+    pub fn verify_warm_export(&self, path: &Path) -> Result<WarmExportMetadata> {
+        verify_warm_export_file(path)
+    }
+}
+
+impl<'a> SessionEvictor<'a> {
+    pub fn evict_older_than(
+        &mut self,
+        now: DateTime<Utc>,
+        policy: &AgeBasedEvictionPolicy,
+    ) -> Result<Vec<EvictedSession>> {
+        let cutoff = retention_cutoff(now, policy)?;
+        let candidates = self.store.eviction_candidates(&cutoff)?;
+        let mut evicted = Vec::new();
+
+        for session_id in candidates {
+            let export = self.store.session_exporter().export_to_warm(&session_id)?;
+            let verified = self
+                .store
+                .session_exporter()
+                .verify_warm_export(&export.archive_path)?;
+            let deleted_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+            self.store
+                .delete_hot_session(&session_id, &verified, &deleted_at)?;
+
+            let export = self
+                .store
+                .warm_export_metadata(&session_id)?
+                .ok_or_else(|| {
+                    StateError::InvalidWarmExport(
+                        "warm export metadata missing after eviction".to_owned(),
+                    )
+                })?;
+            evicted.push(EvictedSession { export });
+        }
+
+        Ok(evicted)
     }
 }
 
@@ -350,6 +597,144 @@ fn validate_audit_chain(session_id: &str, records: &[AuditRecord]) -> Result<()>
     Ok(())
 }
 
+fn retention_cutoff(now: DateTime<Utc>, policy: &AgeBasedEvictionPolicy) -> Result<String> {
+    let max_age = chrono::Duration::from_std(policy.max_age).map_err(|_| {
+        StateError::InvalidEvictionPolicy("max_age is too large to convert".to_owned())
+    })?;
+    Ok((now - max_age).to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+struct WarmExportBuild {
+    header: WarmChainHeader,
+    records: Vec<AuditRecord>,
+}
+
+fn build_warm_export(
+    session_id: &str,
+    records: &[AuditRecord],
+    exported_at: DateTime<Utc>,
+) -> WarmExportBuild {
+    let terminal_entry_hash = records
+        .last()
+        .expect("warm export requires at least one record")
+        .entry_hash
+        .clone();
+    WarmExportBuild {
+        header: WarmChainHeader {
+            line_type: "chain_header".to_owned(),
+            session_id: session_id.to_owned(),
+            genesis_prev_hash: genesis_prev_hash(session_id),
+            record_count: records.len(),
+            terminal_entry_hash,
+            exported_at: exported_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            format_version: WARM_EXPORT_FORMAT_VERSION.to_owned(),
+        },
+        records: records.to_vec(),
+    }
+}
+
+fn render_warm_export(header: &WarmChainHeader, records: &[AuditRecord]) -> Result<String> {
+    let mut rendered = String::new();
+    rendered.push_str(&serde_json::to_string(header)?);
+    rendered.push('\n');
+    for record in records {
+        rendered.push_str(&serde_json::to_string(&WarmAuditRecordLine {
+            line_type: "audit_record".to_owned(),
+            record: record.clone(),
+        })?);
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
+fn write_temp_export(path: &Path, rendered: &str) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(rendered.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn verify_warm_export_file(path: &Path) -> Result<WarmExportMetadata> {
+    let file = File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+    let Some(header_line) = lines.next() else {
+        return Err(StateError::InvalidWarmExport(
+            "warm export is missing chain header".to_owned(),
+        ));
+    };
+    let header: WarmChainHeader = serde_json::from_str(&header_line?)?;
+    if header.line_type != "chain_header" {
+        return Err(StateError::InvalidWarmExport(
+            "first JSONL line must be chain_header".to_owned(),
+        ));
+    }
+    if header.format_version != WARM_EXPORT_FORMAT_VERSION {
+        return Err(StateError::InvalidWarmExport(format!(
+            "unsupported warm export format version: {}",
+            header.format_version
+        )));
+    }
+    if header.genesis_prev_hash != genesis_prev_hash(&header.session_id) {
+        return Err(StateError::InvalidWarmExport(
+            "header genesis_prev_hash does not match session".to_owned(),
+        ));
+    }
+
+    let mut records = Vec::new();
+    for line in lines {
+        let line = line?;
+        let record_line: WarmAuditRecordLine = serde_json::from_str(&line)?;
+        if record_line.line_type != "audit_record" {
+            return Err(StateError::InvalidWarmExport(
+                "all non-header JSONL lines must be audit_record".to_owned(),
+            ));
+        }
+        records.push(record_line.record);
+    }
+    if records.is_empty() {
+        return Err(StateError::InvalidWarmExport(
+            "warm export must contain at least one audit record".to_owned(),
+        ));
+    }
+    validate_audit_chain(&header.session_id, &records)?;
+    if header.record_count != records.len() {
+        return Err(StateError::InvalidWarmExport(format!(
+            "header record_count {} does not match actual {}",
+            header.record_count,
+            records.len()
+        )));
+    }
+    let terminal_entry_hash = records
+        .last()
+        .expect("verified warm export has records")
+        .entry_hash
+        .clone();
+    if header.terminal_entry_hash != terminal_entry_hash {
+        return Err(StateError::InvalidWarmExport(
+            "header terminal_entry_hash does not match chain tip".to_owned(),
+        ));
+    }
+    let latest_record_timestamp = records
+        .iter()
+        .map(|record| record.timestamp.as_str())
+        .max()
+        .expect("verified warm export has records")
+        .to_owned();
+
+    Ok(WarmExportMetadata {
+        session_id: header.session_id,
+        archive_path: path.to_path_buf(),
+        format_version: header.format_version,
+        genesis_prev_hash: header.genesis_prev_hash,
+        record_count: header.record_count,
+        terminal_entry_hash: header.terminal_entry_hash,
+        latest_record_timestamp,
+        exported_at: header.exported_at,
+        hot_deleted_at: None,
+    })
+}
+
 fn configure_sqlite(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -409,6 +794,7 @@ fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use std::env;
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -469,7 +855,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store should open");
 
         assert!(paths.hot_db_path().exists());
-        assert_eq!(store.schema_version().expect("schema version query"), 2);
+        assert_eq!(store.schema_version().expect("schema version query"), 3);
     }
 
     #[test]
@@ -478,10 +864,10 @@ mod tests {
         let paths = StatePaths::new(&root);
 
         let store_a = StateStore::open(paths.clone()).expect("state store should open");
-        assert_eq!(store_a.schema_version().expect("schema version query"), 2);
+        assert_eq!(store_a.schema_version().expect("schema version query"), 3);
 
         let store_b = StateStore::open(paths).expect("state store should open again");
-        assert_eq!(store_b.schema_version().expect("schema version query"), 2);
+        assert_eq!(store_b.schema_version().expect("schema version query"), 3);
     }
 
     #[test]
@@ -692,9 +1078,186 @@ mod tests {
         let jsonl = store
             .export_audit_jsonl(TEST_SESSION_ID)
             .expect("jsonl export should succeed");
-        let exported: AuditRecord = serde_json::from_str(jsonl.trim_end())
-            .expect("jsonl line should decode to audit record");
-        assert_eq!(exported, appended);
+        let mut lines = jsonl.lines();
+        let header: WarmChainHeader =
+            serde_json::from_str(lines.next().expect("header line")).expect("header should decode");
+        assert_eq!(header.line_type, "chain_header");
+        assert_eq!(header.session_id, TEST_SESSION_ID);
+        assert_eq!(header.record_count, 1);
+        let record_line: WarmAuditRecordLine =
+            serde_json::from_str(lines.next().expect("record line")).expect("record should decode");
+        assert_eq!(record_line.line_type, "audit_record");
+        assert_eq!(record_line.record, appended);
+        assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn session_exporter_writes_standalone_verified_jsonl() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths.clone()).expect("state store should open");
+
+        store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_A.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-03-01T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Effect,
+                action: "orchestrator.request_completion".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"backend":"claude"}),
+                verification: None,
+            })
+            .expect("first audit record should append");
+        let second = store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_B.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-03-02T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Outcome,
+                action: "orchestrator.request_completion.outcome".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"status":"succeeded"}),
+                verification: None,
+            })
+            .expect("second audit record should append");
+
+        let export = store
+            .session_exporter()
+            .export_to_warm(TEST_SESSION_ID)
+            .expect("warm export should succeed");
+        let verified = store
+            .session_exporter()
+            .verify_warm_export(&export.archive_path)
+            .expect("warm export should verify");
+
+        assert_eq!(verified.session_id, TEST_SESSION_ID);
+        assert_eq!(verified.record_count, 2);
+        assert_eq!(verified.terminal_entry_hash, second.entry_hash);
+        assert_eq!(
+            verified.genesis_prev_hash,
+            genesis_prev_hash(TEST_SESSION_ID)
+        );
+        assert_eq!(
+            store
+                .warm_export_metadata(TEST_SESSION_ID)
+                .expect("warm export metadata should load"),
+            Some(verified.clone())
+        );
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("hot records should remain")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn session_evictor_moves_only_old_sessions_by_latest_timestamp() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+
+        store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_A.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-03-01T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Effect,
+                action: "orchestrator.request_completion".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"backend":"claude"}),
+                verification: None,
+            })
+            .expect("old session record should append");
+        store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_B.to_owned(),
+                session_id: "550e8400-e29b-41d4-a716-446655440099".to_owned(),
+                timestamp: "2026-05-10T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Effect,
+                action: "orchestrator.request_completion".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"backend":"grok"}),
+                verification: None,
+            })
+            .expect("recent session record should append");
+
+        let evicted = store
+            .session_evictor()
+            .evict_older_than(
+                DateTime::parse_from_rfc3339("2026-05-15T00:00:00.000Z")
+                    .expect("timestamp should parse")
+                    .with_timezone(&Utc),
+                &AgeBasedEvictionPolicy::default(),
+            )
+            .expect("eviction should succeed");
+
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].export.session_id, TEST_SESSION_ID);
+        assert!(evicted[0].export.hot_deleted_at.is_some());
+        assert!(store
+            .audit_records(TEST_SESSION_ID)
+            .expect("old session should load")
+            .is_empty());
+        assert_eq!(
+            store
+                .audit_records("550e8400-e29b-41d4-a716-446655440099")
+                .expect("recent session should remain")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn eviction_failure_does_not_delete_hot_session() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths.clone()).expect("state store should open");
+
+        store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_A.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-03-01T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Effect,
+                action: "orchestrator.request_completion".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"backend":"claude"}),
+                verification: None,
+            })
+            .expect("session record should append");
+
+        fs::create_dir_all(paths.warm_export_path(TEST_SESSION_ID))
+            .expect("conflicting warm export path directory should be created");
+        let err = store
+            .session_evictor()
+            .evict_older_than(
+                DateTime::parse_from_rfc3339("2026-05-15T00:00:00.000Z")
+                    .expect("timestamp should parse")
+                    .with_timezone(&Utc),
+                &AgeBasedEvictionPolicy::default(),
+            )
+            .expect_err("eviction should fail when archive path is invalid");
+
+        assert!(matches!(err, StateError::Io(_)));
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("hot records should remain after failed eviction")
+                .len(),
+            1
+        );
+        assert!(store
+            .warm_export_metadata(TEST_SESSION_ID)
+            .expect("warm export metadata should load")
+            .is_none());
     }
 
     #[test]
