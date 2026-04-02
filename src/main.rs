@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{env, path::PathBuf};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,10 @@ enum MainError {
     Llm(#[from] lanyte_llm::LlmError),
     #[error(transparent)]
     Gateway(#[from] lanyte_gateway::GatewayError),
+    #[error(transparent)]
+    State(#[from] lanyte_state::StateError),
+    #[error("failed to resolve local audit state root: {0}")]
+    StateBootstrap(String),
     #[error(transparent)]
     Orchestrator(#[from] lanyte_orchestrator::OrchestratorError),
     #[error("failed waiting for Ctrl-C: {0}")]
@@ -40,6 +45,7 @@ async fn main() -> Result<(), MainError> {
     );
 
     let llm = build_llm_backend(&cfg.llm)?;
+    let audit_store = Arc::new(std::sync::Mutex::new(open_audit_store()?));
     if let Some(backend) = &llm {
         tracing::info!(
             backend = backend.name(),
@@ -56,7 +62,8 @@ async fn main() -> Result<(), MainError> {
         orchestrator_cancel.clone(),
         gateway.responder(),
         llm,
-    );
+    )
+    .with_audit_store(audit_store);
     let mut gateway = Some(gateway);
     let orchestrator_task = tokio::spawn(orchestrator.run());
     tokio::pin!(orchestrator_task);
@@ -115,4 +122,57 @@ fn build_llm_backend(
         )?)));
     }
     Ok(None)
+}
+
+fn open_audit_store() -> Result<lanyte_state::StateStore, MainError> {
+    let explicit_root = env::var_os(lanyte_state::LANYTE_STATE_ROOT_ENV).is_some();
+    if explicit_root {
+        return Ok(lanyte_state::StateStore::open_default()?);
+    }
+
+    match lanyte_state::StateStore::open_default() {
+        Ok(store) => Ok(store),
+        Err(lanyte_state::StateError::Io(err))
+            if err.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            let fallback_root = fallback_audit_state_root(env::var_os("HOME"))?;
+            tracing::warn!(
+                default_root = lanyte_state::DEFAULT_STATE_ROOT,
+                fallback_root = %fallback_root.display(),
+                "default audit state root is not writable; using local fallback"
+            );
+            Ok(lanyte_state::StateStore::open(
+                lanyte_state::StatePaths::new(fallback_root),
+            )?)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn fallback_audit_state_root(home: Option<std::ffi::OsString>) -> Result<PathBuf, MainError> {
+    let home = home.ok_or_else(|| {
+        MainError::StateBootstrap(
+            "HOME is not set and default audit state root is unavailable".to_owned(),
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".local/state/lanyte"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn fallback_audit_state_root_uses_home_local_state() {
+        let path = fallback_audit_state_root(Some(OsString::from("/Users/tester")))
+            .expect("fallback path should resolve");
+        assert_eq!(path, PathBuf::from("/Users/tester/.local/state/lanyte"));
+    }
+
+    #[test]
+    fn fallback_audit_state_root_requires_home() {
+        let err = fallback_audit_state_root(None).expect_err("missing HOME should fail");
+        assert!(err.to_string().contains("HOME is not set"));
+    }
 }

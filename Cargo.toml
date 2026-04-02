@@ -37,6 +37,7 @@ lanyte-common = { path = "crates/lanyte-common", version = "0.1.0" }
 lanyte-gateway = { path = "crates/lanyte-gateway", version = "0.1.0" }
 lanyte-llm = { path = "crates/lanyte-llm", version = "0.1.0" }
 lanyte-orchestrator = { path = "crates/lanyte-orchestrator", version = "0.1.0" }
+lanyte-state = { path = "crates/lanyte-state", version = "0.1.0" }
 lanyte-telemetry = { path = "crates/lanyte-telemetry", version = "0.1.0" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

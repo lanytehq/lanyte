@@ -1314,6 +1314,7 @@ dependencies = [
  "lanyte-gateway",
  "lanyte-llm",
  "lanyte-orchestrator",
+ "lanyte-state",
  "lanyte-telemetry",
  "thiserror 2.0.18",
  "tokio",
@@ -1377,6 +1378,7 @@ dependencies = [
  "lanyte-common",
  "lanyte-gateway",
  "lanyte-llm",
+ "lanyte-state",
  "lanyte-telemetry",
  "serde",
  "serde_json",
@@ -1392,7 +1394,9 @@ name = "lanyte-state"
 version = "0.1.0"
 dependencies = [
  "lanyte-common",
+ "lanyte-telemetry",
  "rusqlite",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -1402,6 +1406,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

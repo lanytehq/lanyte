@@ -14,6 +14,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
 lanyte-gateway = { path = "../lanyte-gateway", version = "0.1.0" }
 lanyte-llm = { path = "../lanyte-llm", version = "0.1.0" }
+lanyte-state = { path = "../lanyte-state", version = "0.1.0" }
 lanyte-telemetry = { path = "../lanyte-telemetry", version = "0.1.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
