@@ -599,7 +599,13 @@ fn load_session_chain_summary_tx(
     session_id: &str,
 ) -> Result<Option<SessionChainSummary>> {
     tx.query_row(
-        "SELECT COUNT(*), MAX(timestamp), entry_hash FROM audit_records WHERE session_id = ?1 AND chain_index = (SELECT MAX(chain_index) FROM audit_records WHERE session_id = ?1)",
+        "SELECT 
+            (SELECT COUNT(*) FROM audit_records WHERE session_id = ?1),
+            tip.timestamp,
+            tip.entry_hash
+         FROM audit_records AS tip
+         WHERE tip.session_id = ?1
+           AND tip.chain_index = (SELECT MAX(chain_index) FROM audit_records WHERE session_id = ?1)",
         (session_id,),
         |row| {
             Ok(SessionChainSummary {
@@ -1216,6 +1222,19 @@ mod tests {
         store
             .append_audit_record(NewAuditRecord {
                 entry_id: TEST_ENTRY_ID_B.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-03-02T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Outcome,
+                action: "orchestrator.request_completion.outcome".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"status":"succeeded"}),
+                verification: None,
+            })
+            .expect("old session tip should append");
+        store
+            .append_audit_record(NewAuditRecord {
+                entry_id: "550e8400-e29b-41d4-a716-446655440099".to_owned(),
                 session_id: "550e8400-e29b-41d4-a716-446655440099".to_owned(),
                 timestamp: "2026-05-10T00:00:00.000Z".to_owned(),
                 kind: AuditRecordKind::Effect,
@@ -1239,6 +1258,7 @@ mod tests {
 
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].export.session_id, TEST_SESSION_ID);
+        assert_eq!(evicted[0].export.record_count, 2);
         assert!(evicted[0].export.hot_deleted_at.is_some());
         assert!(store
             .audit_records(TEST_SESSION_ID)
