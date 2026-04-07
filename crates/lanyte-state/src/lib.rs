@@ -65,6 +65,9 @@ pub enum StateError {
     #[error("session not found in hot tier: {0}")]
     SessionNotFound(String),
 
+    #[error("eviction race detected for session {session_id}: hot tier advanced after export")]
+    EvictionConflict { session_id: String },
+
     #[error("invalid eviction policy: {0}")]
     InvalidEvictionPolicy(String),
 
@@ -420,6 +423,16 @@ impl StateStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let hot_summary = load_session_chain_summary_tx(&tx, session_id)?
+            .ok_or_else(|| StateError::SessionNotFound(session_id.to_owned()))?;
+        if hot_summary.record_count != metadata.record_count
+            || hot_summary.terminal_entry_hash != metadata.terminal_entry_hash
+            || hot_summary.latest_record_timestamp != metadata.latest_record_timestamp
+        {
+            return Err(StateError::EvictionConflict {
+                session_id: session_id.to_owned(),
+            });
+        }
         tx.execute_batch("DROP TRIGGER IF EXISTS audit_records_no_delete")?;
         tx.execute(
             "DELETE FROM audit_records WHERE session_id = ?1",
@@ -443,6 +456,13 @@ impl StateStore {
         tx.commit()?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionChainSummary {
+    record_count: usize,
+    terminal_entry_hash: String,
+    latest_record_timestamp: String,
 }
 
 impl<'a> SessionExporter<'a> {
@@ -572,6 +592,25 @@ fn parse_json_value(input: &str) -> rusqlite::Result<serde_json::Value> {
     serde_json::from_str(input).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
     })
+}
+
+fn load_session_chain_summary_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<Option<SessionChainSummary>> {
+    tx.query_row(
+        "SELECT COUNT(*), MAX(timestamp), entry_hash FROM audit_records WHERE session_id = ?1 AND chain_index = (SELECT MAX(chain_index) FROM audit_records WHERE session_id = ?1)",
+        (session_id,),
+        |row| {
+            Ok(SessionChainSummary {
+                record_count: row.get::<_, i64>(0)? as usize,
+                latest_record_timestamp: row.get(1)?,
+                terminal_entry_hash: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StateError::from)
 }
 
 fn validate_audit_chain(session_id: &str, records: &[AuditRecord]) -> Result<()> {
@@ -1257,6 +1296,67 @@ mod tests {
         assert!(store
             .warm_export_metadata(TEST_SESSION_ID)
             .expect("warm export metadata should load")
+            .is_none());
+    }
+
+    #[test]
+    fn eviction_aborts_if_session_advances_after_export() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+
+        store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_A.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-03-01T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Effect,
+                action: "orchestrator.request_completion".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"backend":"claude"}),
+                verification: None,
+            })
+            .expect("initial record should append");
+
+        let export = store
+            .session_exporter()
+            .export_to_warm(TEST_SESSION_ID)
+            .expect("warm export should succeed");
+
+        store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_B.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-03-02T00:00:00.000Z".to_owned(),
+                kind: AuditRecordKind::Outcome,
+                action: "orchestrator.request_completion.outcome".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"status":"succeeded"}),
+                verification: None,
+            })
+            .expect("concurrent append should succeed");
+
+        let err = store
+            .delete_hot_session(TEST_SESSION_ID, &export, "2026-05-15T00:00:00.000Z")
+            .expect_err("stale export metadata should fail deletion");
+
+        assert!(matches!(
+            err,
+            StateError::EvictionConflict { ref session_id } if session_id == TEST_SESSION_ID
+        ));
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("hot records should remain after conflict")
+                .len(),
+            2
+        );
+        assert!(store
+            .warm_export_metadata(TEST_SESSION_ID)
+            .expect("warm export metadata should load")
+            .and_then(|metadata| metadata.hot_deleted_at)
             .is_none());
     }
 
