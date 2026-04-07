@@ -465,7 +465,7 @@ struct SessionChainSummary {
     latest_record_timestamp: String,
 }
 
-impl<'a> SessionExporter<'a> {
+impl SessionExporter<'_> {
     pub fn export_to_warm(&self, session_id: &str) -> Result<WarmExportMetadata> {
         let records = self.store.audit_records(session_id)?;
         if records.is_empty() {
@@ -499,7 +499,7 @@ impl<'a> SessionExporter<'a> {
     }
 }
 
-impl<'a> SessionEvictor<'a> {
+impl SessionEvictor<'_> {
     pub fn evict_older_than(
         &mut self,
         now: DateTime<Utc>,
