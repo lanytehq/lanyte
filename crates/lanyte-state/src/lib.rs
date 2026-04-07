@@ -1383,4 +1383,29 @@ mod tests {
                 || err.to_string().contains("broken audit chain")
         );
     }
+
+    #[test]
+    fn append_audit_record_rejects_noncanonical_timestamp() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+
+        let err = store
+            .append_audit_record(NewAuditRecord {
+                entry_id: TEST_ENTRY_ID_A.to_owned(),
+                session_id: TEST_SESSION_ID.to_owned(),
+                timestamp: "2026-04-02 12:00:00".to_owned(),
+                kind: AuditRecordKind::Effect,
+                action: "orchestrator.request_completion".to_owned(),
+                severity: AuditSeverity::Info,
+                envelope: AuditEnvelopeRef::default(),
+                payload: serde_json::json!({"backend":"claude"}),
+                verification: None,
+            })
+            .expect_err("noncanonical timestamp should be rejected");
+
+        assert!(err
+            .to_string()
+            .contains("timestamp must be RFC3339 UTC with millisecond precision"));
+    }
 }

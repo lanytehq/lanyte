@@ -1,3 +1,4 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -53,9 +54,7 @@ impl AuditEvent {
         if self.peer_id.trim().is_empty() {
             return Err("peer_id must not be empty");
         }
-        if self.timestamp.trim().is_empty() {
-            return Err("timestamp must not be empty");
-        }
+        validate_canonical_timestamp(&self.timestamp)?;
         if self.action.trim().is_empty() {
             return Err("action must not be empty");
         }
@@ -173,9 +172,7 @@ impl AuditRecord {
         if !is_uuid_v4(&self.session_id) {
             return Err("session_id must be UUID v4 lowercase hex");
         }
-        if self.timestamp.trim().is_empty() {
-            return Err("timestamp must not be empty");
-        }
+        validate_canonical_timestamp(&self.timestamp)?;
         if self.action.trim().is_empty() {
             return Err("action must not be empty");
         }
@@ -310,6 +307,22 @@ fn is_uuid_v4(input: &str) -> bool {
     true
 }
 
+fn validate_canonical_timestamp(input: &str) -> Result<(), &'static str> {
+    if input.trim().is_empty() {
+        return Err("timestamp must not be empty");
+    }
+
+    let parsed = DateTime::parse_from_rfc3339(input)
+        .map_err(|_| "timestamp must be RFC3339 UTC with millisecond precision")?;
+    let canonical = parsed
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    if parsed.offset().local_minus_utc() != 0 || canonical != input {
+        return Err("timestamp must be RFC3339 UTC with millisecond precision");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +390,22 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_noncanonical_timestamp() {
+        let event = AuditEvent::new(
+            ENTRY_ID,
+            "lanyte-core",
+            "2026-04-02 12:00:00",
+            "gateway.peer_connected",
+            ZERO_HASH,
+        );
+
+        assert_eq!(
+            event.validate(),
+            Err("timestamp must be RFC3339 UTC with millisecond precision")
+        );
+    }
+
+    #[test]
     fn genesis_hash_is_session_scoped() {
         let first = genesis_prev_hash(SESSION_ID);
         let second = genesis_prev_hash(SESSION_ID);
@@ -438,6 +467,27 @@ mod tests {
         assert_eq!(
             record.validate(),
             Err("entry_hash does not match canonical hash surface")
+        );
+    }
+
+    #[test]
+    fn audit_record_validate_rejects_noncanonical_timestamp() {
+        let record = NewAuditRecord {
+            entry_id: ENTRY_ID.to_owned(),
+            session_id: SESSION_ID.to_owned(),
+            timestamp: "2026-04-02 12:00:00".to_owned(),
+            kind: AuditRecordKind::Effect,
+            action: "orchestrator.request_completion".to_owned(),
+            severity: AuditSeverity::Info,
+            envelope: AuditEnvelopeRef::default(),
+            payload: serde_json::json!({"backend":"claude"}),
+            verification: None,
+        }
+        .finalize(genesis_prev_hash(SESSION_ID));
+
+        assert_eq!(
+            record.validate(),
+            Err("timestamp must be RFC3339 UTC with millisecond precision")
         );
     }
 
