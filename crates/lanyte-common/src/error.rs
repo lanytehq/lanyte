@@ -8,6 +8,9 @@ pub enum CommonError {
     #[error("configuration value for `{field}` must not be empty")]
     EmptyConfigValue { field: &'static str },
 
+    #[error("invalid configuration value for `{field}`: {reason}")]
+    InvalidConfigValue { field: &'static str, reason: String },
+
     #[error("failed to resolve configuration file path: {reason}")]
     ConfigPathUnavailable { reason: String },
 

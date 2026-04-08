@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::{env, path::PathBuf};
 
@@ -44,12 +45,13 @@ async fn main() -> Result<(), MainError> {
         "starting gateway"
     );
 
-    let llm = build_llm_backend(&cfg.llm)?;
+    let llm = build_llm_backends(&cfg.llm)?;
     let audit_store = Arc::new(std::sync::Mutex::new(open_audit_store()?));
-    if let Some(backend) = &llm {
+    if let Some(backends) = &llm {
         tracing::info!(
-            backend = backend.name(),
-            "configured orchestrator LLM backend"
+            default_provider = %backends.default_provider(),
+            configured_providers = ?backends.configured_providers(),
+            "configured orchestrator LLM backends"
         );
     } else {
         tracing::warn!("no LLM backend configured; llm.complete command will return invoke_error");
@@ -103,25 +105,33 @@ async fn main() -> Result<(), MainError> {
     Ok(())
 }
 
-fn build_llm_backend(
+fn build_llm_backends(
     cfg: &lanyte_common::LlmConfig,
-) -> Result<Option<Arc<dyn lanyte_llm::LlmBackend>>, lanyte_llm::LlmError> {
-    if cfg.claude.api_key.is_some() {
-        return Ok(Some(Arc::new(lanyte_llm::ClaudeBackend::from_config(
-            &cfg.claude,
-        )?)));
+) -> Result<Option<lanyte_orchestrator::ConfiguredBackends>, lanyte_llm::LlmError> {
+    let Some(default_provider) = cfg.resolved_default_provider() else {
+        return Ok(None);
+    };
+
+    let mut backends = BTreeMap::new();
+    for provider in cfg.configured_providers() {
+        let backend: Arc<dyn lanyte_llm::LlmBackend> = match provider {
+            lanyte_common::ProviderKind::Claude => {
+                Arc::new(lanyte_llm::ClaudeBackend::from_config(&cfg.claude)?)
+            }
+            lanyte_common::ProviderKind::OpenAi => {
+                Arc::new(lanyte_llm::OpenAiBackend::from_config(&cfg.openai)?)
+            }
+            lanyte_common::ProviderKind::Grok => {
+                Arc::new(lanyte_llm::GrokBackend::from_config(&cfg.grok)?)
+            }
+        };
+        backends.insert(provider, backend);
     }
-    if cfg.openai.api_key.is_some() {
-        return Ok(Some(Arc::new(lanyte_llm::OpenAiBackend::from_config(
-            &cfg.openai,
-        )?)));
-    }
-    if cfg.grok.api_key.is_some() {
-        return Ok(Some(Arc::new(lanyte_llm::GrokBackend::from_config(
-            &cfg.grok,
-        )?)));
-    }
-    Ok(None)
+
+    Ok(Some(
+        lanyte_orchestrator::ConfiguredBackends::new(default_provider, backends)
+            .expect("resolved default provider must be configured"),
+    ))
 }
 
 fn open_audit_store() -> Result<lanyte_state::StateStore, MainError> {
@@ -162,6 +172,53 @@ fn fallback_audit_state_root(home: Option<std::ffi::OsString>) -> Result<PathBuf
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn build_llm_backends_uses_compatibility_order_when_default_is_unset() {
+        let mut cfg = lanyte_common::LanyteConfig::default();
+        cfg.llm.openai.api_key = Some("openai-key".to_owned());
+        cfg.llm.grok.api_key = Some("grok-key".to_owned());
+
+        let backends = build_llm_backends(&cfg.llm)
+            .expect("backends should build")
+            .expect("backends should exist");
+
+        assert_eq!(
+            backends.default_provider(),
+            lanyte_common::ProviderKind::OpenAi
+        );
+        assert_eq!(
+            backends.configured_providers(),
+            vec![
+                lanyte_common::ProviderKind::OpenAi,
+                lanyte_common::ProviderKind::Grok,
+            ]
+        );
+    }
+
+    #[test]
+    fn build_llm_backends_honors_explicit_default_provider() {
+        let mut cfg = lanyte_common::LanyteConfig::default();
+        cfg.llm.default_provider = Some(lanyte_common::ProviderKind::OpenAi);
+        cfg.llm.claude.api_key = Some("claude-key".to_owned());
+        cfg.llm.openai.api_key = Some("openai-key".to_owned());
+
+        let backends = build_llm_backends(&cfg.llm)
+            .expect("backends should build")
+            .expect("backends should exist");
+
+        assert_eq!(
+            backends.default_provider(),
+            lanyte_common::ProviderKind::OpenAi
+        );
+        assert_eq!(
+            backends.configured_providers(),
+            vec![
+                lanyte_common::ProviderKind::Claude,
+                lanyte_common::ProviderKind::OpenAi,
+            ]
+        );
+    }
 
     #[test]
     fn fallback_audit_state_root_uses_home_local_state() {

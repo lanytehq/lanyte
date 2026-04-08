@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use lanyte_common::ChannelId;
+use lanyte_common::{ChannelId, ProviderKind};
 use lanyte_llm::{CompletionRequest, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -140,6 +140,7 @@ pub enum OrchestratorEffect {
     },
     RequestCompletion {
         envelope: Envelope,
+        provider: Option<ProviderKind>,
         request: CompletionRequest,
     },
     InvokeSkill {

@@ -2,12 +2,13 @@
 
 mod model;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
 use chrono::Utc;
-use lanyte_common::{channels, ChannelId};
+use lanyte_common::{channels, ChannelId, ProviderKind};
 use lanyte_gateway::{GatewayEvent, PeerResponder, PeerResponse};
 use lanyte_llm::{CompletionRequest, CompletionResponse, LlmBackend, LlmError, StopReason};
 use lanyte_state::StateStore;
@@ -36,11 +37,62 @@ pub enum OrchestratorError {
     InvalidAuditEvent(&'static str),
 }
 
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ConfiguredBackendsError {
+    #[error("LLM provider `{0}` is not configured")]
+    ProviderUnconfigured(ProviderKind),
+}
+
+#[derive(Clone)]
+pub struct ConfiguredBackends {
+    default_provider: ProviderKind,
+    backends: BTreeMap<ProviderKind, Arc<dyn LlmBackend>>,
+}
+
+impl ConfiguredBackends {
+    pub fn new(
+        default_provider: ProviderKind,
+        backends: BTreeMap<ProviderKind, Arc<dyn LlmBackend>>,
+    ) -> Result<Self, ConfiguredBackendsError> {
+        if !backends.contains_key(&default_provider) {
+            return Err(ConfiguredBackendsError::ProviderUnconfigured(
+                default_provider,
+            ));
+        }
+
+        Ok(Self {
+            default_provider,
+            backends,
+        })
+    }
+
+    #[must_use]
+    pub fn default_provider(&self) -> ProviderKind {
+        self.default_provider
+    }
+
+    #[must_use]
+    pub fn configured_providers(&self) -> Vec<ProviderKind> {
+        self.backends.keys().copied().collect()
+    }
+
+    fn select(
+        &self,
+        provider: Option<ProviderKind>,
+    ) -> Result<Arc<dyn LlmBackend>, ConfiguredBackendsError> {
+        let provider = provider.unwrap_or(self.default_provider);
+        self.backends
+            .get(&provider)
+            .cloned()
+            .ok_or(ConfiguredBackendsError::ProviderUnconfigured(provider))
+    }
+}
+
 pub struct Orchestrator {
     events: mpsc::Receiver<GatewayEvent>,
     cancel: CancellationToken,
     responder: PeerResponder,
-    llm: Option<Arc<dyn LlmBackend>>,
+    llm: Option<ConfiguredBackends>,
     audit_store: Option<Arc<Mutex<StateStore>>>,
     started_at: Instant,
     #[cfg(any(test, feature = "test-support"))]
@@ -53,7 +105,7 @@ impl Orchestrator {
         events: mpsc::Receiver<GatewayEvent>,
         cancel: CancellationToken,
         responder: PeerResponder,
-        llm: Option<Arc<dyn LlmBackend>>,
+        llm: Option<ConfiguredBackends>,
     ) -> Self {
         Self {
             events,
@@ -162,42 +214,41 @@ impl Orchestrator {
             return;
         }
 
-        let args: LlmCompleteArgs =
-            match serde_json::from_value::<LlmCompleteArgs>(command_request.args.clone()) {
-                Ok(args) if !args.prompt.trim().is_empty() && args.max_tokens > 0 => args,
-                Ok(_) => {
-                    self.send_command_error(
-                        &event.peer_id,
-                        CommandInvokeError {
-                            kind: "invoke_error",
-                            request_id: command_request.request_id,
-                            command: command_request.command,
-                            error_code: "invalid_args",
-                            message:
-                                "prompt must be non-empty and max_tokens must be greater than zero"
-                                    .to_owned(),
-                            retryable: false,
-                        },
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    self.send_command_error(
-                        &event.peer_id,
-                        CommandInvokeError {
-                            kind: "invoke_error",
-                            request_id: command_request.request_id,
-                            command: command_request.command,
-                            error_code: "invalid_args",
-                            message: format!("invalid llm.complete args: {err}"),
-                            retryable: false,
-                        },
-                    )
-                    .await;
-                    return;
-                }
-            };
+        let args: LlmCompleteArgs = match parse_llm_complete_args(&command_request.args) {
+            Ok(args) if !args.prompt.trim().is_empty() && args.max_tokens > 0 => args,
+            Ok(_) => {
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id,
+                        command: command_request.command,
+                        error_code: "invalid_args",
+                        message:
+                            "prompt must be non-empty and max_tokens must be greater than zero"
+                                .to_owned(),
+                        retryable: false,
+                    },
+                )
+                .await;
+                return;
+            }
+            Err(message) => {
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id,
+                        command: command_request.command,
+                        error_code: "invalid_args",
+                        message,
+                        retryable: false,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
 
         let ingress = Self::llm_complete_ingress_event(
             event.peer_id.clone(),
@@ -251,6 +302,7 @@ impl Orchestrator {
 
         let OrchestratorEffect::RequestCompletion {
             envelope: completion_envelope,
+            provider,
             request: completion_request,
             ..
         } = completion_effect
@@ -258,7 +310,7 @@ impl Orchestrator {
             unreachable!("request_completion_effect always returns RequestCompletion");
         };
 
-        let Some(backend) = self.llm.clone() else {
+        let Some(backends) = self.llm.as_ref() else {
             let _ = self.append_outcome_audit(
                 ingress_envelope,
                 ActionOutcome {
@@ -284,6 +336,37 @@ impl Orchestrator {
             )
             .await;
             return;
+        };
+
+        let backend = match backends.select(provider) {
+            Ok(backend) => backend,
+            Err(ConfiguredBackendsError::ProviderUnconfigured(provider)) => {
+                let _ = self.append_outcome_audit(
+                    ingress_envelope,
+                    ActionOutcome {
+                        status: ActionStatus::Failed,
+                        result: None,
+                        error: Some(ActionError {
+                            code: "llm_provider_unconfigured".to_owned(),
+                            message: format!("LLM provider `{provider}` is not configured"),
+                            retryable: false,
+                        }),
+                    },
+                );
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id.clone(),
+                        command: command_request.command.clone(),
+                        error_code: "invalid_args",
+                        message: format!("LLM provider `{provider}` is not configured"),
+                        retryable: false,
+                    },
+                )
+                .await;
+                return;
+            }
         };
 
         let backend_name = backend.name();
@@ -635,6 +718,7 @@ impl Orchestrator {
                         value: serde_json::json!({
                             "system_prompt": args.system_prompt,
                             "max_tokens": args.max_tokens,
+                            "provider": args.provider,
                         }),
                     },
                 ],
@@ -648,6 +732,7 @@ impl Orchestrator {
         let OrchestratorEvent::IngressMessage { envelope, message } = event else {
             unreachable!("AGI-005 only derives completion requests from ingress messages");
         };
+        let options = llm_complete_options_from_message(message)?;
         let request = completion_request_from_message(message)?;
 
         Ok(OrchestratorEffect::RequestCompletion {
@@ -669,6 +754,7 @@ impl Orchestrator {
                 trust_ref: envelope.trust_ref.clone(),
                 gate_ref: envelope.gate_ref.clone(),
             },
+            provider: options.provider,
             request,
         })
     }
@@ -830,16 +916,7 @@ fn completion_request_from_message(
         return Err("ingress message is missing prompt text");
     }
 
-    let options = message
-        .parts
-        .iter()
-        .find_map(|part| match part {
-            ContentPart::Structured { value } => Some(value.clone()),
-            _ => None,
-        })
-        .ok_or("ingress message is missing llm.complete options")?;
-    let options = serde_json::from_value::<LlmCompleteMessageOptions>(options)
-        .map_err(|_| "ingress message has invalid llm.complete options")?;
+    let options = llm_complete_options_from_message(message)?;
 
     Ok(CompletionRequest {
         system_prompt: options.system_prompt,
@@ -851,6 +928,33 @@ fn completion_request_from_message(
         thinking_budget_tokens: None,
         temperature: None,
         parallel_tool_calls: None,
+    })
+}
+
+fn llm_complete_options_from_message(
+    message: &EntityMessage,
+) -> Result<LlmCompleteMessageOptions, &'static str> {
+    let options = message
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::Structured { value } => Some(value.clone()),
+            _ => None,
+        })
+        .ok_or("ingress message is missing llm.complete options")?;
+    serde_json::from_value::<LlmCompleteMessageOptions>(options)
+        .map_err(|_| "ingress message has invalid llm.complete options")
+}
+
+fn parse_llm_complete_args(value: &Value) -> std::result::Result<LlmCompleteArgs, String> {
+    serde_json::from_value::<LlmCompleteArgs>(value.clone()).map_err(|err| {
+        if let Some(provider) = value.get("provider").and_then(Value::as_str) {
+            if let Err(reason) = provider.parse::<ProviderKind>() {
+                return format!("invalid provider `{provider}`: {reason}");
+            }
+        }
+
+        format!("invalid llm.complete args: {err}")
     })
 }
 
@@ -977,6 +1081,8 @@ struct LlmCompleteArgs {
     prompt: String,
     #[serde(default)]
     system_prompt: Option<String>,
+    #[serde(default)]
+    provider: Option<ProviderKind>,
     #[serde(default = "default_llm_max_tokens")]
     max_tokens: u32,
 }
@@ -986,6 +1092,8 @@ struct LlmCompleteArgs {
 struct LlmCompleteMessageOptions {
     #[serde(default)]
     system_prompt: Option<String>,
+    #[serde(default)]
+    provider: Option<ProviderKind>,
     max_tokens: u32,
 }
 
@@ -1161,6 +1269,7 @@ mod tests {
         let args = LlmCompleteArgs {
             prompt: "Summarize this".to_owned(),
             system_prompt: Some("You are concise".to_owned()),
+            provider: Some(ProviderKind::OpenAi),
             max_tokens: 48,
         };
 
@@ -1187,6 +1296,7 @@ mod tests {
                 .expect("llm options should deserialize"),
             LlmCompleteMessageOptions {
                 system_prompt: Some("You are concise".to_owned()),
+                provider: Some(ProviderKind::OpenAi),
                 max_tokens: 48,
             }
         );
@@ -1194,7 +1304,12 @@ mod tests {
         let effect = Orchestrator::request_completion_effect(&ingress)
             .expect("completion request should derive from ingress event");
 
-        let OrchestratorEffect::RequestCompletion { envelope, request } = effect else {
+        let OrchestratorEffect::RequestCompletion {
+            envelope,
+            provider,
+            request,
+        } = effect
+        else {
             panic!("expected RequestCompletion effect");
         };
 
@@ -1202,6 +1317,7 @@ mod tests {
             envelope.correlation_id.as_deref(),
             Some(command_request.request_id.as_str())
         );
+        assert_eq!(provider, Some(ProviderKind::OpenAi));
         assert_eq!(request.system_prompt.as_deref(), Some("You are concise"));
         assert_eq!(request.max_tokens, Some(48));
         assert_eq!(

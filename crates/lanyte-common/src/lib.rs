@@ -6,11 +6,11 @@ mod error;
 pub mod naming;
 
 pub use config::{
-    ClaudeConfig, GatewayConfig, GrokConfig, LanyteConfig, LlmConfig, OpenAiConfig,
+    ClaudeConfig, GatewayConfig, GrokConfig, LanyteConfig, LlmConfig, OpenAiConfig, ProviderKind,
     LANYTE_CONFIG_PATH_ENV, LANYTE_CORE_PEER_ID_ENV, LANYTE_CRUCIBLE_SCHEMAS_DIR_ENV,
     LANYTE_GATEWAY_SOCKET_PATH_ENV, LLM_CLAUDE_API_KEY_ENV, LLM_CLAUDE_MODEL_ENV, LLM_CONFIG,
-    LLM_GROK_API_KEY_ENV, LLM_GROK_MODEL_ENV, LLM_OPENAI_API_KEY_ENV, LLM_OPENAI_BASE_URL_ENV,
-    LLM_OPENAI_MODEL_ENV,
+    LLM_DEFAULT_PROVIDER_ENV, LLM_GROK_API_KEY_ENV, LLM_GROK_MODEL_ENV, LLM_OPENAI_API_KEY_ENV,
+    LLM_OPENAI_BASE_URL_ENV, LLM_OPENAI_MODEL_ENV,
 };
 pub use error::{CommonError, Result};
 pub use naming::{
