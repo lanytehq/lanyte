@@ -17,6 +17,7 @@ pub const LANYTE_CONFIG_PATH_ENV: &str = "LANYTE_CONFIG_PATH";
 pub const LANYTE_GATEWAY_SOCKET_PATH_ENV: &str = "LANYTE_GATEWAY_SOCKET_PATH";
 pub const LANYTE_CRUCIBLE_SCHEMAS_DIR_ENV: &str = "LANYTE_CRUCIBLE_SCHEMAS_DIR";
 pub const LLM_CONFIG: &str = "llm";
+pub const LLM_DEFAULT_PROVIDER_ENV: &str = "LANYTE_LLM_DEFAULT_PROVIDER";
 pub const LLM_CLAUDE_MODEL_ENV: &str = "LANYTE_LLM_CLAUDE_MODEL";
 pub const LLM_CLAUDE_API_KEY_ENV: &str = "LANYTE_LLM_CLAUDE_API_KEY";
 pub const LLM_GROK_MODEL_ENV: &str = "LANYTE_LLM_GROK_MODEL";
@@ -40,6 +41,7 @@ pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const CONFIG_GATEWAY_CORE_PEER_ID_FIELD: &str = "gateway.core_peer_id";
 const CONFIG_GATEWAY_SOCKET_PATH_FIELD: &str = "gateway.socket_path";
 const CONFIG_GATEWAY_CRUCIBLE_SCHEMAS_DIR_FIELD: &str = "gateway.crucible_schemas_dir";
+const CONFIG_LLM_DEFAULT_PROVIDER_FIELD: &str = "llm.default_provider";
 const CONFIG_LLM_CLAUDE_MODEL_FIELD: &str = "llm.claude.model";
 const SECRETS_LLM_CLAUDE_API_KEY_FIELD: &str = "llm.claude.api_key";
 const CONFIG_LLM_GROK_MODEL_FIELD: &str = "llm.grok.model";
@@ -47,6 +49,53 @@ const SECRETS_LLM_GROK_API_KEY_FIELD: &str = "llm.grok.api_key";
 const CONFIG_LLM_OPENAI_MODEL_FIELD: &str = "llm.openai.model";
 const CONFIG_LLM_OPENAI_BASE_URL_FIELD: &str = "llm.openai.base_url";
 const SECRETS_LLM_OPENAI_API_KEY_FIELD: &str = "llm.openai.api_key";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProviderKind {
+    #[serde(rename = "claude")]
+    Claude,
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "grok")]
+    Grok,
+}
+
+impl ProviderKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::OpenAi => "openai",
+            Self::Grok => "grok",
+        }
+    }
+
+    #[must_use]
+    pub const fn compatibility_order() -> [Self; 3] {
+        [Self::Claude, Self::OpenAi, Self::Grok]
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProviderKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "openai" => Ok(Self::OpenAi),
+            "grok" => Ok(Self::Grok),
+            _ => Err(format!(
+                "unsupported provider `{value}`; expected one of: claude, openai, grok"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWithProvenance {
@@ -289,6 +338,8 @@ struct FileGatewayConfig {
 #[serde(deny_unknown_fields)]
 struct FileLlmConfig {
     #[serde(default)]
+    default_provider: Option<ProviderKind>,
+    #[serde(default)]
     claude: Option<FileClaudeConfig>,
     #[serde(default)]
     grok: Option<FileGrokConfig>,
@@ -372,6 +423,13 @@ fn parse_secrets_file(path: &Path, contents: &str) -> Result<FileSecrets> {
     })
 }
 
+fn parse_provider_kind_env(value: String, key: &'static str) -> Result<ProviderKind> {
+    let normalized = common_env::normalize_nonempty(value, key)?;
+    normalized
+        .parse()
+        .map_err(|reason| CommonError::InvalidEnvironment { key, reason })
+}
+
 fn trusted_seclusor_identity_path() -> Result<PathBuf> {
     let home = env::var_os("HOME").ok_or_else(|| CommonError::ConfigPathUnavailable {
         reason: "HOME is not set".to_owned(),
@@ -391,6 +449,10 @@ fn default_provenance() -> BTreeMap<String, ConfigSource> {
         ),
         (
             CONFIG_GATEWAY_CRUCIBLE_SCHEMAS_DIR_FIELD.to_owned(),
+            ConfigSource::Default,
+        ),
+        (
+            CONFIG_LLM_DEFAULT_PROVIDER_FIELD.to_owned(),
             ConfigSource::Default,
         ),
         (
@@ -538,17 +600,56 @@ impl GatewayConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LlmConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<ProviderKind>,
     pub claude: ClaudeConfig,
     pub grok: GrokConfig,
     pub openai: OpenAiConfig,
 }
 
 impl LlmConfig {
+    #[must_use]
+    pub fn configured_providers(&self) -> Vec<ProviderKind> {
+        ProviderKind::compatibility_order()
+            .into_iter()
+            .filter(|provider| self.is_provider_configured(*provider))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn is_provider_configured(&self, provider: ProviderKind) -> bool {
+        match provider {
+            ProviderKind::Claude => self.claude.api_key.is_some(),
+            ProviderKind::OpenAi => self.openai.api_key.is_some(),
+            ProviderKind::Grok => self.grok.api_key.is_some(),
+        }
+    }
+
+    #[must_use]
+    pub fn resolved_default_provider(&self) -> Option<ProviderKind> {
+        if let Some(default_provider) = self.default_provider {
+            return Some(default_provider);
+        }
+
+        match self.configured_providers().as_slice() {
+            [] => None,
+            [provider] => Some(*provider),
+            providers => providers.first().copied(),
+        }
+    }
+
     fn apply_file(
         &mut self,
         config: FileLlmConfig,
         provenance: &mut BTreeMap<String, ConfigSource>,
     ) -> Result<()> {
+        if let Some(default_provider) = config.default_provider {
+            self.default_provider = Some(default_provider);
+            provenance.insert(
+                CONFIG_LLM_DEFAULT_PROVIDER_FIELD.to_owned(),
+                ConfigSource::ConfigFile,
+            );
+        }
         if let Some(claude) = config.claude {
             self.claude.apply_file(claude, provenance)?;
         }
@@ -569,6 +670,16 @@ impl LlmConfig {
     where
         F: FnMut(&'static str) -> Result<Option<String>>,
     {
+        if let Some(default_provider) = lookup(LLM_DEFAULT_PROVIDER_ENV)? {
+            self.default_provider = Some(parse_provider_kind_env(
+                default_provider,
+                LLM_DEFAULT_PROVIDER_ENV,
+            )?);
+            provenance.insert(
+                CONFIG_LLM_DEFAULT_PROVIDER_FIELD.to_owned(),
+                ConfigSource::EnvVar(LLM_DEFAULT_PROVIDER_ENV.to_owned()),
+            );
+        }
         if let Some(model) = lookup(LLM_CLAUDE_MODEL_ENV)? {
             self.claude.model = common_env::normalize_nonempty(model, LLM_CLAUDE_MODEL_ENV)?;
             provenance.insert(
@@ -689,6 +800,14 @@ impl LlmConfig {
             return Err(CommonError::EmptyConfigValue {
                 field: LLM_OPENAI_BASE_URL_ENV,
             });
+        }
+        if let Some(default_provider) = self.default_provider {
+            if !self.is_provider_configured(default_provider) {
+                return Err(CommonError::InvalidConfigValue {
+                    field: CONFIG_LLM_DEFAULT_PROVIDER_FIELD,
+                    reason: format!("default provider `{default_provider}` is not configured"),
+                });
+            }
         }
         Ok(())
     }
@@ -963,6 +1082,7 @@ mod tests {
             PathBuf::from("../lanyte-crucible/schemas/ipc")
         );
         assert_eq!(cfg.llm.claude.model, "claude-sonnet-4-6");
+        assert_eq!(cfg.llm.default_provider, None);
         assert!(cfg.llm.claude.api_key.is_none());
         assert_eq!(cfg.llm.grok.model, "grok-4.20-beta-latest-reasoning");
         assert!(cfg.llm.grok.api_key.is_none());
@@ -984,6 +1104,7 @@ mod tests {
             (LLM_OPENAI_MODEL_ENV, "gpt-4.1"),
             (LLM_OPENAI_API_KEY_ENV, "openai-key"),
             (LLM_OPENAI_BASE_URL_ENV, "http://127.0.0.1:11434/v1"),
+            (LLM_DEFAULT_PROVIDER_ENV, "openai"),
         ])
         .expect("config should parse");
 
@@ -1000,6 +1121,7 @@ mod tests {
         assert_eq!(cfg.llm.openai.model, "gpt-4.1");
         assert_eq!(cfg.llm.openai.api_key.as_deref(), Some("openai-key"));
         assert_eq!(cfg.llm.openai.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(cfg.llm.default_provider, Some(ProviderKind::OpenAi));
     }
 
     #[test]
@@ -1153,6 +1275,10 @@ api_key = "file-secret"
         let loaded = load_config_with_provenance_from_pairs(&[]).expect("config should load");
 
         assert_eq!(
+            loaded.provenance.get(CONFIG_LLM_DEFAULT_PROVIDER_FIELD),
+            Some(&ConfigSource::Default)
+        );
+        assert_eq!(
             loaded.provenance.get(CONFIG_GATEWAY_CORE_PEER_ID_FIELD),
             Some(&ConfigSource::Default)
         );
@@ -1176,6 +1302,9 @@ api_key = "file-secret"
             r#"
 [gateway]
 core_peer_id = "core-from-file"
+
+[llm]
+default_provider = "claude"
 
 [llm.openai]
 base_url = "https://file.example/v1"
@@ -1201,6 +1330,10 @@ api_key = "claude-secret"
         ])
         .expect("config should load");
 
+        assert_eq!(
+            loaded.provenance.get(CONFIG_LLM_DEFAULT_PROVIDER_FIELD),
+            Some(&ConfigSource::ConfigFile)
+        );
         assert_eq!(
             loaded.provenance.get(CONFIG_GATEWAY_CORE_PEER_ID_FIELD),
             Some(&ConfigSource::ConfigFile)
@@ -1340,6 +1473,50 @@ api_key = "should-not-be-here"
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_default_provider_env_value_is_rejected() {
+        let err =
+            config_from_pairs(&[(LLM_DEFAULT_PROVIDER_ENV, "gemini")]).expect_err("must fail");
+        match err {
+            CommonError::InvalidEnvironment { key, reason } => {
+                assert_eq!(key, LLM_DEFAULT_PROVIDER_ENV);
+                assert!(reason.contains("unsupported provider"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_provider_must_reference_a_configured_backend() {
+        let err =
+            config_from_pairs(&[(LLM_DEFAULT_PROVIDER_ENV, "openai")]).expect_err("must fail");
+        match err {
+            CommonError::InvalidConfigValue { field, reason } => {
+                assert_eq!(field, CONFIG_LLM_DEFAULT_PROVIDER_FIELD);
+                assert!(reason.contains("not configured"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_default_provider_uses_compatibility_order() {
+        let cfg = config_from_pairs(&[
+            (LLM_OPENAI_API_KEY_ENV, "openai-key"),
+            (LLM_GROK_API_KEY_ENV, "grok-key"),
+        ])
+        .expect("config should parse");
+
+        assert_eq!(
+            cfg.llm.resolved_default_provider(),
+            Some(ProviderKind::OpenAi)
+        );
+        assert_eq!(
+            cfg.llm.configured_providers(),
+            vec![ProviderKind::OpenAi, ProviderKind::Grok]
+        );
     }
 
     #[test]
