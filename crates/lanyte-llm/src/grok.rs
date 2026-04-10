@@ -63,6 +63,8 @@ pub struct GrokBackend {
     model: String,
     api_key: String,
     responses_url: String,
+    images_generations_url: String,
+    images_edits_url: String,
     max_attempts: u32,
     base_delay: Duration,
     base_delay_500: Duration,
@@ -125,6 +127,8 @@ impl GrokBackend {
             model,
             api_key,
             responses_url: format!("{base_url}/v1/responses"),
+            images_generations_url: format!("{base_url}/v1/images/generations"),
+            images_edits_url: format!("{base_url}/v1/images/edits"),
             max_attempts: options.max_attempts,
             base_delay: options.base_delay,
             base_delay_500: options.base_delay_500,
@@ -146,15 +150,84 @@ impl GrokBackend {
         Ok(headers)
     }
 
-    fn do_complete_once(&self, request: &CompletionRequest) -> Result<CompletionResponse> {
-        let headers = self.headers()?;
-        let grok_req = self.build_request(request, false)?;
+    pub fn generate_image(
+        &self,
+        request: GrokImageGenerationRequest,
+    ) -> Result<GrokImageGenerationResponse> {
+        let body = GrokImageGenerationBody::from_request(request, self.model.clone());
+        self.retry_json_request(&self.images_generations_url, &body)
+    }
 
+    pub fn edit_image(&self, request: GrokImageEditRequest) -> Result<GrokImageEditResponse> {
+        let body = GrokImageEditBody::from_request(request, self.model.clone())?;
+        self.retry_json_request(&self.images_edits_url, &body)
+    }
+
+    fn retry_json_request<TRequest, TResponse>(
+        &self,
+        url: &str,
+        request: &TRequest,
+    ) -> Result<TResponse>
+    where
+        TRequest: serde::Serialize,
+        TResponse: serde::de::DeserializeOwned,
+    {
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+            match self.do_json_request_once(url, request) {
+                Ok(resp) => return Ok(resp),
+                Err(LlmError::RateLimited { retry_after }) => {
+                    if attempt >= self.max_attempts {
+                        return Err(LlmError::RateLimited { retry_after });
+                    }
+                    let delay = retry_after.unwrap_or_else(|| self.backoff_for(429, attempt));
+                    let sleep_for = delay.saturating_add(self.jitter_for_attempt(attempt));
+                    if !sleep_for.is_zero() {
+                        thread::sleep(sleep_for);
+                    }
+                }
+                Err(LlmError::ServiceUnavailable) => {
+                    if attempt >= self.max_attempts {
+                        return Err(LlmError::ServiceUnavailable);
+                    }
+                    let delay = self.backoff_for(503, attempt);
+                    let sleep_for = delay.saturating_add(self.jitter_for_attempt(attempt));
+                    if !sleep_for.is_zero() {
+                        thread::sleep(sleep_for);
+                    }
+                }
+                Err(LlmError::Upstream { status, message }) => {
+                    if attempt >= self.max_attempts || !Self::should_retry_status(status) {
+                        return Err(LlmError::Upstream { status, message });
+                    }
+                    let delay = self.backoff_for(status, attempt);
+                    let sleep_for = delay.saturating_add(self.jitter_for_attempt(attempt));
+                    if !sleep_for.is_zero() {
+                        thread::sleep(sleep_for);
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    fn do_json_request_once<TRequest, TResponse>(
+        &self,
+        url: &str,
+        request: &TRequest,
+    ) -> Result<TResponse>
+    where
+        TRequest: serde::Serialize,
+        TResponse: serde::de::DeserializeOwned,
+    {
+        let headers = self.headers()?;
         let resp = self
             .blocking_client
-            .post(&self.responses_url)
+            .post(url)
             .headers(headers)
-            .json(&grok_req)
+            .json(request)
             .send()?;
 
         let status = resp.status();
@@ -165,7 +238,12 @@ impl GrokBackend {
             return Err(classify_error(status.as_u16(), retry_after, &body));
         }
 
-        let parsed: GrokResponse = serde_json::from_str(&body)?;
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    fn do_complete_once(&self, request: &CompletionRequest) -> Result<CompletionResponse> {
+        let grok_req = self.build_request(request, false)?;
+        let parsed: GrokResponse = self.do_json_request_once(&self.responses_url, &grok_req)?;
         let text = parsed.output_text().ok_or(LlmError::InvalidResponse(
             "missing assistant text output items",
         ))?;
@@ -254,6 +332,67 @@ impl GrokBackend {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokImageResponseFormat {
+    Url,
+    B64Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokImageGenerationRequest {
+    pub prompt: String,
+    pub model: Option<String>,
+    pub n: Option<u32>,
+    pub response_format: Option<GrokImageResponseFormat>,
+    pub quality: Option<String>,
+    pub resolution: Option<String>,
+    pub aspect_ratio: Option<String>,
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokImageEditRequest {
+    pub prompt: String,
+    pub image_url: Option<String>,
+    pub image_urls: Vec<String>,
+    pub mask_url: Option<String>,
+    pub model: Option<String>,
+    pub n: Option<u32>,
+    pub response_format: Option<GrokImageResponseFormat>,
+    pub quality: Option<String>,
+    pub resolution: Option<String>,
+    pub aspect_ratio: Option<String>,
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GrokImageArtifact {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub b64_json: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    pub revised_prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GrokImageUsage {
+    #[serde(default)]
+    pub cost_in_usd_ticks: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GrokImageGenerationResponse {
+    #[serde(default)]
+    pub data: Vec<GrokImageArtifact>,
+    #[serde(default)]
+    pub usage: Option<GrokImageUsage>,
+}
+
+pub type GrokImageEditResponse = GrokImageGenerationResponse;
 
 impl fmt::Debug for GrokBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -377,6 +516,109 @@ struct GrokRequest {
     tools: Vec<GrokTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GrokImageGenerationBody {
+    model: String,
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<GrokImageResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+}
+
+impl GrokImageGenerationBody {
+    fn from_request(request: GrokImageGenerationRequest, default_model: String) -> Self {
+        Self {
+            model: request.model.unwrap_or(default_model),
+            prompt: request.prompt,
+            n: request.n,
+            response_format: request.response_format,
+            quality: request.quality,
+            resolution: request.resolution,
+            aspect_ratio: request.aspect_ratio,
+            user: request.user,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GrokImageInputRef {
+    url: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GrokImageEditBody {
+    model: String,
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<GrokImageInputRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<GrokImageInputRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mask: Option<GrokImageInputRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<GrokImageResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+}
+
+impl GrokImageEditBody {
+    fn from_request(request: GrokImageEditRequest, default_model: String) -> Result<Self> {
+        let has_single = request.image_url.is_some();
+        let has_multiple = !request.image_urls.is_empty();
+        if has_single == has_multiple {
+            return Err(LlmError::Unsupported(
+                "image edit requests must specify exactly one of image_url or image_urls",
+            ));
+        }
+
+        Ok(Self {
+            model: request.model.unwrap_or(default_model),
+            prompt: request.prompt,
+            image: request.image_url.map(|url| GrokImageInputRef {
+                url,
+                kind: "image_url",
+            }),
+            images: request
+                .image_urls
+                .into_iter()
+                .map(|url| GrokImageInputRef {
+                    url,
+                    kind: "image_url",
+                })
+                .collect(),
+            mask: request.mask_url.map(|url| GrokImageInputRef {
+                url,
+                kind: "image_url",
+            }),
+            n: request.n,
+            response_format: request.response_format,
+            quality: request.quality,
+            resolution: request.resolution,
+            aspect_ratio: request.aspect_ratio,
+            user: request.user,
+        })
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1163,6 +1405,160 @@ mod tests {
             serde_json::Value::String("blocked.example".to_owned())
         );
         assert_eq!(body["tools"][1]["type"], "image_generation");
+    }
+
+    #[test]
+    fn serializes_image_generation_request_shape() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{
+                "data": [
+                    {
+                        "url": "https://example.com/logo.png",
+                        "mime_type": "image/png",
+                        "revised_prompt": ""
+                    }
+                ],
+                "usage": { "cost_in_usd_ticks": 42 }
+            }"#,
+        )]);
+
+        let backend = backend_for_server(server.base_url());
+        let response = backend
+            .generate_image(GrokImageGenerationRequest {
+                prompt: "Create a geometric logo".to_owned(),
+                model: Some("grok-imagine-image".to_owned()),
+                n: Some(2),
+                response_format: Some(GrokImageResponseFormat::Url),
+                quality: Some("high".to_owned()),
+                resolution: Some("2k".to_owned()),
+                aspect_ratio: Some("1:1".to_owned()),
+                user: Some("user-123".to_owned()),
+            })
+            .expect("generate image");
+
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(
+            response.data[0].url.as_deref(),
+            Some("https://example.com/logo.png")
+        );
+        assert_eq!(
+            response.usage.and_then(|usage| usage.cost_in_usd_ticks),
+            Some(42)
+        );
+
+        let requests = server.take_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(&requests[0].body).expect("request json");
+        assert_eq!(body["model"], "grok-imagine-image");
+        assert_eq!(body["prompt"], "Create a geometric logo");
+        assert_eq!(body["n"], 2);
+        assert_eq!(body["response_format"], "url");
+        assert_eq!(body["quality"], "high");
+        assert_eq!(body["resolution"], "2k");
+        assert_eq!(body["aspect_ratio"], "1:1");
+        assert_eq!(body["user"], "user-123");
+    }
+
+    #[test]
+    fn serializes_image_edit_request_shape() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{
+                "data": [
+                    {
+                        "b64_json": "abcd",
+                        "mime_type": "image/png",
+                        "revised_prompt": ""
+                    }
+                ]
+            }"#,
+        )]);
+
+        let backend = backend_for_server(server.base_url());
+        let response = backend
+            .edit_image(GrokImageEditRequest {
+                prompt: "Make the blue darker".to_owned(),
+                image_url: Some("https://example.com/original.png".to_owned()),
+                image_urls: Vec::new(),
+                mask_url: Some("https://example.com/mask.png".to_owned()),
+                model: Some("grok-imagine-image".to_owned()),
+                n: Some(1),
+                response_format: Some(GrokImageResponseFormat::B64Json),
+                quality: Some("medium".to_owned()),
+                resolution: Some("1k".to_owned()),
+                aspect_ratio: Some("1:1".to_owned()),
+                user: None,
+            })
+            .expect("edit image");
+
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].b64_json.as_deref(), Some("abcd"));
+
+        let requests = server.take_requests();
+        let body: serde_json::Value =
+            serde_json::from_str(&requests[0].body).expect("request json");
+        assert_eq!(body["prompt"], "Make the blue darker");
+        assert_eq!(body["image"]["url"], "https://example.com/original.png");
+        assert_eq!(body["image"]["type"], "image_url");
+        assert_eq!(body["mask"]["url"], "https://example.com/mask.png");
+        assert_eq!(body["response_format"], "b64_json");
+    }
+
+    #[test]
+    fn rejects_ambiguous_image_edit_sources() {
+        let backend = backend_for_server("http://example.invalid".to_owned());
+        let error = backend
+            .edit_image(GrokImageEditRequest {
+                prompt: "Edit this".to_owned(),
+                image_url: Some("https://example.com/one.png".to_owned()),
+                image_urls: vec!["https://example.com/two.png".to_owned()],
+                mask_url: None,
+                model: None,
+                n: None,
+                response_format: None,
+                quality: None,
+                resolution: None,
+                aspect_ratio: None,
+                user: None,
+            })
+            .expect_err("should reject ambiguous edit source");
+
+        assert!(matches!(error, LlmError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_plural_image_artifacts_from_response() {
+        let parsed: GrokImageGenerationResponse = serde_json::from_str(
+            r#"{
+                "data": [
+                    {
+                        "url": "https://example.com/one.png",
+                        "mime_type": "image/png",
+                        "revised_prompt": ""
+                    },
+                    {
+                        "b64_json": "xyz",
+                        "mime_type": "image/webp",
+                        "revised_prompt": ""
+                    }
+                ],
+                "usage": { "cost_in_usd_ticks": 99 }
+            }"#,
+        )
+        .expect("parse image response");
+
+        assert_eq!(parsed.data.len(), 2);
+        assert_eq!(
+            parsed.data[0].url.as_deref(),
+            Some("https://example.com/one.png")
+        );
+        assert_eq!(parsed.data[1].b64_json.as_deref(), Some("xyz"));
+        assert_eq!(
+            parsed.usage.and_then(|usage| usage.cost_in_usd_ticks),
+            Some(99)
+        );
     }
 
     #[test]

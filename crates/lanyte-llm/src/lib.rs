@@ -13,7 +13,11 @@ use std::pin::Pin;
 
 pub use claude::ClaudeBackend;
 pub use error::{LlmError, Result};
-pub use grok::GrokBackend;
+pub use grok::{
+    GrokBackend, GrokImageArtifact, GrokImageEditRequest, GrokImageEditResponse,
+    GrokImageGenerationRequest, GrokImageGenerationResponse, GrokImageResponseFormat,
+    GrokImageUsage,
+};
 pub use openai::OpenAiBackend;
 pub use types::{
     BackendCapabilities, CompletionRequest, CompletionResponse, HealthStatus, Message, MessageRole,
