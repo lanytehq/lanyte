@@ -6,4 +6,11 @@ rust-version = "1.85.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+wasmtime = { version = "31", default-features = false, features = ["cranelift", "runtime"] }
+
+[dev-dependencies]
+wat = "1"
