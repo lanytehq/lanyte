@@ -746,6 +746,37 @@ mod tests {
     }
 
     #[test]
+    fn describe_manifest_frees_last_error_once_on_describe_failure() {
+        let executor = Executor::new().expect("executor should build");
+        let module = compile_module(
+            &executor.engine,
+            &fixture_wasm(FixtureSpec {
+                describe_packed: 0,
+                last_error_bytes: Some(skill_error_bytes(
+                    "input_invalid",
+                    "manifest generation failed",
+                    false,
+                )),
+                ..FixtureSpec::valid()
+            }),
+        )
+        .expect("module compiles");
+        let mut instance =
+            instantiate_module(&executor.engine, &module).expect("instance should build");
+
+        let err = describe_manifest(&mut instance, SUPPORTED_ABI_VERSION)
+            .expect_err("describe failure must surface last_error");
+
+        match err {
+            ExecutorError::DescribeFailed(message) => {
+                assert!(message.contains("input_invalid"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(free_count(&mut instance), 1);
+    }
+
+    #[test]
     fn executor_rejects_duplicate_skill_ids() {
         let mut executor = Executor::new().expect("executor should build");
         executor
