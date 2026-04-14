@@ -1,0 +1,21 @@
+[package]
+name = "lanyte-skill-echo-fixture"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
