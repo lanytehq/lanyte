@@ -5,10 +5,10 @@
 //! the function. `GrantedCapabilities` records what the manifest declared
 //! versus what the executor actually granted (v1: always nothing).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use wasmtime::{Caller, Engine, ExternType, FuncType, Linker, Module, Val};
+use wasmtime::{Caller, Engine, ExternType, FuncType, Linker, Module, Val, ValType};
 
 use crate::{ExecutorError, SkillManifest};
 
@@ -63,11 +63,12 @@ pub(crate) fn build_grant(
     manifest: &SkillManifest,
 ) -> Result<Grant, ExecutorError> {
     let mut linker = Linker::<()>::new(engine);
-    // Wasm allows a module to declare the same (module, name) import more
-    // than once. The linker resolves by (module, name), so a single deny
-    // stub covers every alias — registering twice would fail with a
-    // duplicate-definition error. Dedupe by qualified key.
-    let mut defined: HashSet<(String, String)> = HashSet::new();
+    // WASM allows repeated (module, name) imports. A single deny stub
+    // covers every alias iff all aliases share the FuncType — otherwise
+    // the linker is not actually linkable and instantiation fails later.
+    // Reject mismatched signatures here so grant only returns linkable
+    // artifacts.
+    let mut defined: HashMap<(String, String), FuncType> = HashMap::new();
 
     for import in module.imports() {
         let module_name = import.module().to_owned();
@@ -76,10 +77,23 @@ pub(crate) fn build_grant(
 
         match import.ty() {
             ExternType::Func(func_ty) => {
-                if !defined.insert((module_name.clone(), field_name.clone())) {
+                let key = (module_name.clone(), field_name.clone());
+                if let Some(existing) = defined.get(&key) {
+                    if !func_types_match(existing, &func_ty) {
+                        return Err(ExecutorError::LinkerError(format!(
+                            "import `{qualified}` reused with incompatible function signatures"
+                        )));
+                    }
                     continue;
                 }
-                define_deny_stub(&mut linker, &module_name, &field_name, func_ty, qualified)?;
+                define_deny_stub(
+                    &mut linker,
+                    &module_name,
+                    &field_name,
+                    func_ty.clone(),
+                    qualified,
+                )?;
+                defined.insert(key, func_ty);
             }
             _ => {
                 return Err(ExecutorError::LinkerError(format!(
@@ -93,6 +107,21 @@ pub(crate) fn build_grant(
         capabilities: GrantedCapabilities::deny_all(manifest.capabilities.clone()),
         linker,
     })
+}
+
+fn func_types_match(a: &FuncType, b: &FuncType) -> bool {
+    val_type_lists_match(a.params(), b.params()) && val_type_lists_match(a.results(), b.results())
+}
+
+fn val_type_lists_match(
+    a: impl ExactSizeIterator<Item = ValType>,
+    b: impl ExactSizeIterator<Item = ValType>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.zip(b)
+        .all(|(x, y)| std::mem::discriminant(&x) == std::mem::discriminant(&y))
 }
 
 fn define_deny_stub(
@@ -189,6 +218,17 @@ mod tests {
     call $second
     i32.const 0
   )
+)"#,
+        )
+    }
+
+    fn module_with_incompatible_duplicate_imports(engine: &Engine) -> Module {
+        compile_wat(
+            engine,
+            r#"(module
+  (import "env" "ambiguous" (func (param i32)))
+  (import "env" "ambiguous" (func (param i64)))
+  (memory (export "memory") 1)
 )"#,
         )
     }
@@ -330,6 +370,30 @@ mod tests {
                 rendered.contains("env::forbidden_fn"),
                 "{export} trap message must identify the function: {rendered}"
             );
+        }
+    }
+
+    #[test]
+    fn build_grant_rejects_duplicate_host_imports_with_incompatible_signatures() {
+        let engine = engine();
+        let module = module_with_incompatible_duplicate_imports(&engine);
+        let manifest = manifest_with_caps(&[]);
+
+        let err = build_grant(&engine, &module, &manifest)
+            .expect_err("duplicate imports with conflicting signatures must hard-fail grant");
+
+        match err {
+            ExecutorError::LinkerError(message) => {
+                assert!(
+                    message.contains("env::ambiguous"),
+                    "err must name the conflicting import: {message}"
+                );
+                assert!(
+                    message.contains("incompatible"),
+                    "err must flag the signature conflict: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }
