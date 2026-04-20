@@ -5,6 +5,8 @@
 //! the function. `GrantedCapabilities` records what the manifest declared
 //! versus what the executor actually granted (v1: always nothing).
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use wasmtime::{Caller, Engine, ExternType, FuncType, Linker, Module, Val};
 
@@ -61,6 +63,11 @@ pub(crate) fn build_grant(
     manifest: &SkillManifest,
 ) -> Result<Grant, ExecutorError> {
     let mut linker = Linker::<()>::new(engine);
+    // Wasm allows a module to declare the same (module, name) import more
+    // than once. The linker resolves by (module, name), so a single deny
+    // stub covers every alias — registering twice would fail with a
+    // duplicate-definition error. Dedupe by qualified key.
+    let mut defined: HashSet<(String, String)> = HashSet::new();
 
     for import in module.imports() {
         let module_name = import.module().to_owned();
@@ -69,6 +76,9 @@ pub(crate) fn build_grant(
 
         match import.ty() {
             ExternType::Func(func_ty) => {
+                if !defined.insert((module_name.clone(), field_name.clone())) {
+                    continue;
+                }
                 define_deny_stub(&mut linker, &module_name, &field_name, func_ty, qualified)?;
             }
             _ => {
@@ -162,6 +172,25 @@ mod tests {
 
     fn module_with_memory_import(engine: &Engine) -> Module {
         compile_wat(engine, r#"(module (import "env" "mem" (memory 1)))"#)
+    }
+
+    fn module_with_duplicate_host_imports(engine: &Engine) -> Module {
+        compile_wat(
+            engine,
+            r#"(module
+  (import "env" "forbidden_fn" (func $first))
+  (import "env" "forbidden_fn" (func $second))
+  (memory (export "memory") 1)
+  (func (export "call_first") (result i32)
+    call $first
+    i32.const 0
+  )
+  (func (export "call_second") (result i32)
+    call $second
+    i32.const 0
+  )
+)"#,
+        )
     }
 
     #[test]
@@ -267,5 +296,40 @@ mod tests {
             rendered.contains("is not granted to this skill"),
             "trap message must describe the gate: {rendered}"
         );
+    }
+
+    #[test]
+    fn build_grant_tolerates_duplicate_host_imports_and_stub_traps_both_aliases() {
+        let engine = engine();
+        let module = module_with_duplicate_host_imports(&engine);
+        let manifest = manifest_with_caps(&[]);
+
+        let grant = build_grant(&engine, &module, &manifest)
+            .expect("duplicate imports must not fail grant");
+
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(1_000_000).expect("fuel set");
+        let instance = grant
+            .linker
+            .instantiate(&mut store, &module)
+            .expect("module instantiates through deduped deny-stub linker");
+
+        for export in ["call_first", "call_second"] {
+            let call = instance
+                .get_typed_func::<(), i32>(&mut store, export)
+                .unwrap_or_else(|err| panic!("{export} export missing: {err}"));
+            let err = call
+                .call(&mut store, ())
+                .expect_err(&format!("calling {export} must trap through the deny stub"));
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("permission_denied"),
+                "{export} trap message missing `permission_denied`: {rendered}"
+            );
+            assert!(
+                rendered.contains("env::forbidden_fn"),
+                "{export} trap message must identify the function: {rendered}"
+            );
+        }
     }
 }
