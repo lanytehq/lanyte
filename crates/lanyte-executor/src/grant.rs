@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use wasmtime::{Caller, Engine, ExternType, FuncType, Linker, Module, Val, ValType};
+use wasmtime::{Caller, Engine, ExternType, FuncType, Linker, Module, Val};
 
 use crate::{ExecutorError, SkillManifest};
 
@@ -79,7 +79,10 @@ pub(crate) fn build_grant(
             ExternType::Func(func_ty) => {
                 let key = (module_name.clone(), field_name.clone());
                 if let Some(existing) = defined.get(&key) {
-                    if !func_types_match(existing, &func_ty) {
+                    // Exact structural equality. Discriminant-only matching
+                    // is insufficient for reference types, where different
+                    // heap types share the `ValType::Ref` variant.
+                    if !FuncType::eq(existing, &func_ty) {
                         return Err(ExecutorError::LinkerError(format!(
                             "import `{qualified}` reused with incompatible function signatures"
                         )));
@@ -107,21 +110,6 @@ pub(crate) fn build_grant(
         capabilities: GrantedCapabilities::deny_all(manifest.capabilities.clone()),
         linker,
     })
-}
-
-fn func_types_match(a: &FuncType, b: &FuncType) -> bool {
-    val_type_lists_match(a.params(), b.params()) && val_type_lists_match(a.results(), b.results())
-}
-
-fn val_type_lists_match(
-    a: impl ExactSizeIterator<Item = ValType>,
-    b: impl ExactSizeIterator<Item = ValType>,
-) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.zip(b)
-        .all(|(x, y)| std::mem::discriminant(&x) == std::mem::discriminant(&y))
 }
 
 fn define_deny_stub(
