@@ -1,4 +1,6 @@
-//! WASM skill executor load/describe foundation.
+//! WASM skill executor load/describe/grant foundation.
+
+mod grant;
 
 use std::collections::BTreeMap;
 
@@ -9,6 +11,9 @@ use wasmtime::{
     Config, Engine, ExternType, FuncType, Instance, Linker, Memory, Module, Store, TypedFunc,
     ValType,
 };
+
+pub use grant::GrantedCapabilities;
+use grant::{build_grant, Grant};
 
 const SUPPORTED_ABI_VERSION: i32 = 1;
 const DESCRIBE_FUEL: u64 = 1_000_000;
@@ -50,6 +55,7 @@ impl Executor {
             LoadedSkill {
                 module,
                 manifest: manifest.clone(),
+                grant: None,
             },
         );
 
@@ -72,13 +78,38 @@ impl Executor {
     pub fn unload(&mut self, skill_id: &str) -> bool {
         self.skills.remove(skill_id).is_some()
     }
+
+    /// Builds (or returns the cached) grant for a loaded skill.
+    ///
+    /// The grant phase constructs a capability-aware `wasmtime::Linker` in
+    /// which every function import the module declares is backed by a deny
+    /// stub. In v1 no real host functions exist, so the `granted` list is
+    /// always empty and `denied` always equals `declared`.
+    pub fn grant(&mut self, skill_id: &str) -> Result<GrantedCapabilities, ExecutorError> {
+        let skill = self
+            .skills
+            .get_mut(skill_id)
+            .ok_or_else(|| ExecutorError::SkillNotFound(skill_id.to_owned()))?;
+
+        if skill.grant.is_none() {
+            skill.grant = Some(build_grant(&self.engine, &skill.module, &skill.manifest)?);
+        }
+
+        Ok(skill
+            .grant
+            .as_ref()
+            .expect("grant cached above")
+            .capabilities
+            .clone())
+    }
 }
 
-/// A compiled, validated skill and its cached manifest.
+/// A compiled, validated skill and its cached manifest and grant artifact.
 #[derive(Debug)]
 pub struct LoadedSkill {
     module: Module,
     manifest: SkillManifest,
+    grant: Option<Grant>,
 }
 
 impl LoadedSkill {
@@ -90,6 +121,12 @@ impl LoadedSkill {
     #[must_use]
     pub fn manifest(&self) -> &SkillManifest {
         &self.manifest
+    }
+
+    /// Returns the capability grant summary if the grant phase has run.
+    #[must_use]
+    pub fn granted_capabilities(&self) -> Option<&GrantedCapabilities> {
+        self.grant.as_ref().map(|grant| &grant.capabilities)
     }
 }
 
@@ -154,6 +191,18 @@ pub enum ExecutorError {
 
     #[error("skill `{0}` was not found")]
     SkillNotFound(String),
+
+    #[error(
+        "capability denied: skill `{skill_id}` capability `{capability}` function `{function}`"
+    )]
+    CapabilityDenied {
+        skill_id: String,
+        capability: String,
+        function: String,
+    },
+
+    #[error("linker error: {0}")]
+    LinkerError(String),
 
     #[error("wasm runtime error: {0}")]
     Runtime(String),
