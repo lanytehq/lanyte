@@ -101,6 +101,7 @@ pub enum AuditRecordKind {
     GateDecision,
     Verification,
     SessionAttestation,
+    MissionEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

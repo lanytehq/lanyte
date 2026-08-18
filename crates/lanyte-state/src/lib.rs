@@ -10,11 +10,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use lanyte_common::env as common_env;
+use lanyte_mission::{
+    validate_history, EventSourceKind, LifecycleEvent, LifecyclePayload, MissionPhase,
+    MissionRecord, Validate,
+};
 use lanyte_telemetry::{
     genesis_prev_hash, AuditEnvelopeRef, AuditRecord, AuditRecordKind, AuditSeverity,
     NewAuditRecord,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use thiserror::Error;
 
 pub const LANYTE_STATE_ROOT_ENV: &str = "LANYTE_STATE_ROOT";
@@ -32,7 +36,16 @@ const MIGRATION_003: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/003_warm_exports.sql"
 ));
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_001), (2, MIGRATION_002), (3, MIGRATION_003)];
+const MIGRATION_004: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/004_missions.sql"
+));
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, MIGRATION_001),
+    (2, MIGRATION_002),
+    (3, MIGRATION_003),
+    (4, MIGRATION_004),
+];
 
 const HOT_TIER_DIR: &str = "hot";
 const WARM_TIER_DIR: &str = "warm";
@@ -55,6 +68,9 @@ pub enum StateError {
 
     #[error("invalid audit record: {0}")]
     InvalidAuditRecord(String),
+
+    #[error("invalid mission projection: {0}")]
+    InvalidMissionProjection(String),
 
     #[error("failed to encode audit JSON: {0}")]
     AuditJson(#[from] serde_json::Error),
@@ -181,6 +197,26 @@ pub struct EvictedSession {
     pub export: WarmExportMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewMissionProjectionReceipt {
+    pub event: LifecycleEvent,
+    pub envelope: AuditEnvelopeRef,
+    pub verification: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredMissionProjection {
+    pub mission: MissionRecord,
+    pub audit_entry_id: String,
+    pub audit_entry_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissionProjectionWrite {
+    pub projection: StoredMissionProjection,
+    pub receipt: AuditRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WarmChainHeader {
     #[serde(rename = "_type")]
@@ -254,67 +290,157 @@ impl StateStore {
         Ok(version)
     }
 
-    pub fn append_audit_record(&mut self, record: NewAuditRecord) -> Result<AuditRecord> {
+    pub fn create_mission(
+        &mut self,
+        mission: MissionRecord,
+        receipt: NewMissionProjectionReceipt,
+    ) -> Result<MissionProjectionWrite> {
+        mission
+            .validate()
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        if mission.phase != MissionPhase::Created || mission.revision != 0 {
+            return Err(StateError::InvalidMissionProjection(
+                "initial projection must be a revision-zero created mission".to_owned(),
+            ));
+        }
+        if !matches!(
+            &receipt.event.payload,
+            LifecyclePayload::MissionCreated { revision: 0 }
+        ) || !matches!(
+            receipt.event.source.kind,
+            EventSourceKind::VerifiedAttestation | EventSourceKind::OperatorCommand
+        ) {
+            return Err(StateError::InvalidMissionProjection(
+                "initial receipt must be an authoritative mission_created event at revision zero"
+                    .to_owned(),
+            ));
+        }
+        validate_history(&mission, std::slice::from_ref(&receipt.event))
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+
+        let mission_id = mission.mission_id.to_string();
+        let projection_json = serde_json::to_string(&mission)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        let event_json = serde_json::to_value(&receipt.event)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        let audit_input = NewAuditRecord {
+            entry_id: receipt.event.event_id.to_string(),
+            session_id: mission_id.clone(),
+            timestamp: receipt
+                .event
+                .recorded_at
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            kind: AuditRecordKind::MissionEvent,
+            action: receipt.event.event_type.clone(),
+            severity: AuditSeverity::Notice,
+            envelope: receipt.envelope,
+            payload: event_json,
+            verification: receipt.verification,
+        };
+
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let latest: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT chain_index, entry_hash FROM audit_records WHERE session_id = ?1 ORDER BY chain_index DESC LIMIT 1",
-                (&record.session_id,),
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let (chain_index, prev_hash) = match latest {
-            Some((chain_index, entry_hash)) => (chain_index + 1, entry_hash),
-            None => (0, genesis_prev_hash(&record.session_id)),
-        };
-        let record = record.finalize(prev_hash);
-        record
-            .validate()
-            .map_err(|err| StateError::InvalidAuditRecord(err.to_owned()))?;
-        let session_id = record.session_id.clone();
-        let payload_json = serde_json::to_string(&record.payload)?;
-        let verification_json = record
-            .verification
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-
+        let chain_exists: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit_records WHERE session_id = ?1)",
+            (&mission_id,),
+            |row| row.get(0),
+        )?;
+        if chain_exists != 0 {
+            return Err(StateError::InvalidMissionProjection(
+                "mission creation requires an empty receipt chain".to_owned(),
+            ));
+        }
+        let audit = append_audit_record_tx(&tx, audit_input)?;
         tx.execute(
-            "INSERT INTO audit_records(entry_id, session_id, chain_index, timestamp, record_kind, action, severity, conversation_id, turn_id, action_id, causation_id, correlation_id, external_ref, trust_ref, gate_ref, payload_json, verification_json, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            "INSERT INTO missions(mission_id, mission_schema, revision, goal, policy_id, phase, operating_role, operating_scope, created_at, updated_at, evidence_chain_id, record_json, receipt_entry_id, receipt_entry_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
-                &record.entry_id,
-                &record.session_id,
-                chain_index,
-                &record.timestamp,
-                audit_record_kind_name(record.kind),
-                &record.action,
-                audit_severity_name(record.severity),
-                &record.envelope.conversation_id,
-                &record.envelope.turn_id,
-                &record.envelope.action_id,
-                &record.envelope.causation_id,
-                &record.envelope.correlation_id,
-                &record.envelope.external_ref,
-                &record.envelope.trust_ref,
-                &record.envelope.gate_ref,
-                payload_json,
-                verification_json,
-                &record.prev_hash,
-                &record.entry_hash,
+                &mission_id,
+                &mission.mission_schema,
+                i64::try_from(mission.revision).map_err(|_| {
+                    StateError::InvalidMissionProjection(
+                        "mission revision exceeds SQLite integer range".to_owned(),
+                    )
+                })?,
+                &mission.goal,
+                &mission.policy_id,
+                mission_phase_name(mission.phase),
+                &mission.operating_role.role,
+                &mission.operating_role.scope,
+                mission
+                    .created_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                mission
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                mission.evidence_chain_id.to_string(),
+                &projection_json,
+                &audit.entry_id,
+                &audit.entry_hash,
             ],
         )?;
         tx.commit()?;
 
-        self.audit_records(&session_id)?
-            .into_iter()
-            .last()
-            .ok_or_else(|| {
-                StateError::InvalidAuditRecord(
-                    "appended audit record missing after commit".to_owned(),
-                )
-            })
+        Ok(MissionProjectionWrite {
+            projection: StoredMissionProjection {
+                mission,
+                audit_entry_id: audit.entry_id.clone(),
+                audit_entry_hash: audit.entry_hash.clone(),
+            },
+            receipt: audit,
+        })
+    }
+
+    pub fn mission(&self, mission_id: &str) -> Result<Option<StoredMissionProjection>> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT revision, phase, record_json, receipt_entry_id, receipt_entry_hash \
+                 FROM missions WHERE mission_id = ?1 LIMIT 1",
+                (mission_id,),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((revision, phase, projection_json, audit_entry_id, audit_entry_hash)) = stored
+        else {
+            return Ok(None);
+        };
+        let mission: MissionRecord = serde_json::from_str(&projection_json)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        mission
+            .validate()
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        if mission.mission_id.to_string() != mission_id
+            || i64::try_from(mission.revision).ok() != Some(revision)
+            || mission_phase_name(mission.phase) != phase
+        {
+            return Err(StateError::InvalidMissionProjection(
+                "indexed mission fields do not match stored projection".to_owned(),
+            ));
+        }
+        Ok(Some(StoredMissionProjection {
+            mission,
+            audit_entry_id,
+            audit_entry_hash,
+        }))
+    }
+
+    pub fn append_audit_record(&mut self, record: NewAuditRecord) -> Result<AuditRecord> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = append_audit_record_tx(&tx, record)?;
+        tx.commit()?;
+        Ok(record)
     }
 
     pub fn audit_records(&self, session_id: &str) -> Result<Vec<AuditRecord>> {
@@ -407,7 +533,12 @@ impl StateStore {
 
     fn eviction_candidates(&self, cutoff: &str) -> Result<Vec<String>> {
         let mut stmt = self.connection.prepare(
-            "SELECT session_id FROM audit_records GROUP BY session_id HAVING MAX(timestamp) < ?1 ORDER BY MAX(timestamp) ASC",
+            "SELECT records.session_id \
+             FROM audit_records AS records \
+             WHERE NOT EXISTS (SELECT 1 FROM missions WHERE missions.mission_id = records.session_id) \
+             GROUP BY records.session_id \
+             HAVING MAX(records.timestamp) < ?1 \
+             ORDER BY MAX(records.timestamp) ASC",
         )?;
         let rows = stmt.query_map((cutoff,), |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -534,6 +665,71 @@ impl SessionEvictor<'_> {
     }
 }
 
+fn append_audit_record_tx(tx: &Transaction<'_>, record: NewAuditRecord) -> Result<AuditRecord> {
+    let latest: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT chain_index, entry_hash FROM audit_records WHERE session_id = ?1 ORDER BY chain_index DESC LIMIT 1",
+            (&record.session_id,),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (chain_index, prev_hash) = match latest {
+        Some((chain_index, entry_hash)) => (chain_index + 1, entry_hash),
+        None => (0, genesis_prev_hash(&record.session_id)),
+    };
+    let record = record.finalize(prev_hash);
+    record
+        .validate()
+        .map_err(|err| StateError::InvalidAuditRecord(err.to_owned()))?;
+    let payload_json = serde_json::to_string(&record.payload)?;
+    let verification_json = record
+        .verification
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    tx.execute(
+        "INSERT INTO audit_records(entry_id, session_id, chain_index, timestamp, record_kind, action, severity, conversation_id, turn_id, action_id, causation_id, correlation_id, external_ref, trust_ref, gate_ref, payload_json, verification_json, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![
+            &record.entry_id,
+            &record.session_id,
+            chain_index,
+            &record.timestamp,
+            audit_record_kind_name(record.kind),
+            &record.action,
+            audit_severity_name(record.severity),
+            &record.envelope.conversation_id,
+            &record.envelope.turn_id,
+            &record.envelope.action_id,
+            &record.envelope.causation_id,
+            &record.envelope.correlation_id,
+            &record.envelope.external_ref,
+            &record.envelope.trust_ref,
+            &record.envelope.gate_ref,
+            payload_json,
+            verification_json,
+            &record.prev_hash,
+            &record.entry_hash,
+        ],
+    )?;
+    Ok(record)
+}
+
+const fn mission_phase_name(phase: MissionPhase) -> &'static str {
+    match phase {
+        MissionPhase::Created => "created",
+        MissionPhase::Active => "active",
+        MissionPhase::Waiting => "waiting",
+        MissionPhase::RecoveryPending => "recovery_pending",
+        MissionPhase::Suspended => "suspended",
+        MissionPhase::Completed => "completed",
+        MissionPhase::Cancelled => "cancelled",
+        MissionPhase::Failed => "failed",
+        MissionPhase::DeadlineExceeded => "deadline_exceeded",
+        MissionPhase::BudgetExhausted => "budget_exhausted",
+    }
+}
+
 fn audit_record_kind_name(kind: AuditRecordKind) -> &'static str {
     match kind {
         AuditRecordKind::Effect => "effect",
@@ -541,6 +737,7 @@ fn audit_record_kind_name(kind: AuditRecordKind) -> &'static str {
         AuditRecordKind::GateDecision => "gate_decision",
         AuditRecordKind::Verification => "verification",
         AuditRecordKind::SessionAttestation => "session_attestation",
+        AuditRecordKind::MissionEvent => "mission_event",
     }
 }
 
@@ -560,6 +757,7 @@ fn parse_audit_record_kind(input: &str) -> rusqlite::Result<AuditRecordKind> {
         "gate_decision" => Ok(AuditRecordKind::GateDecision),
         "verification" => Ok(AuditRecordKind::Verification),
         "session_attestation" => Ok(AuditRecordKind::SessionAttestation),
+        "mission_event" => Ok(AuditRecordKind::MissionEvent),
         other => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
@@ -848,6 +1046,105 @@ mod tests {
     const TEST_ENTRY_ID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
     const TEST_ENTRY_ID_B: &str = "550e8400-e29b-41d4-a716-446655440001";
     const TEST_SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440002";
+
+    fn created_mission() -> MissionRecord {
+        serde_json::from_value(serde_json::json!({
+            "mission_schema": lanyte_mission::MISSION_RECORD_SCHEMA,
+            "mission_id": TEST_SESSION_ID,
+            "revision": 0,
+            "goal": "Persist one mission projection",
+            "policy_id": "policy.default",
+            "created_at": "2026-08-17T20:00:00Z",
+            "updated_at": "2026-08-17T20:00:00Z",
+            "initiator": {
+                "kind": "attested_session",
+                "subject": "operator-1",
+                "role": "entarch",
+                "scope": "lanytehq",
+                "attestation": {
+                    "issuer": "lanyte-attest",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440003",
+                    "jti": "550e8400-e29b-41d4-a716-446655440004",
+                    "context_sha256": "a".repeat(64),
+                    "token_sha256": "b".repeat(64),
+                    "verification_policy_sha256": "c".repeat(64),
+                    "trust_ref": "attestations/1"
+                }
+            },
+            "authorizer": null,
+            "authorization_ref": null,
+            "supervisor": {
+                "kind": "service",
+                "subject": "lanyte",
+                "role": null,
+                "scope": null,
+                "attestation": null
+            },
+            "operating_role": {
+                "role": "entarch",
+                "scope": "lanytehq"
+            },
+            "phase": "created",
+            "terminal_reason": null,
+            "deadline_at": null,
+            "lease_policy": {
+                "enabled": false,
+                "lease_seconds": null,
+                "deadman_seconds": null
+            },
+            "budget_policy": {
+                "wall_clock_seconds": null,
+                "token_limit": null,
+                "cost_micros": null,
+                "action_limit": null
+            },
+            "harness_selection": null,
+            "recovery_policy": "ask_operator",
+            "recovery_point_ref": null,
+            "attempts": [],
+            "current_attempt_id": null,
+            "evidence_chain_id": TEST_SESSION_ID,
+            "terminal_entry_hash": null
+        }))
+        .expect("mission fixture should deserialize")
+    }
+
+    fn created_mission_receipt(entry_id: &str) -> NewMissionProjectionReceipt {
+        let event = serde_json::from_value(serde_json::json!({
+            "event_schema": lanyte_mission::LIFECYCLE_EVENT_SCHEMA,
+            "event_id": entry_id,
+            "mission_id": TEST_SESSION_ID,
+            "sequence": 1,
+            "previous_entry_hash": null,
+            "entry_hash": "d".repeat(64),
+            "occurred_at": "2026-08-17T20:00:00Z",
+            "recorded_at": "2026-08-17T20:00:00Z",
+            "event_type": "mission_created",
+            "source": {
+                "kind": "verified_attestation",
+                "subject": "operator-1",
+                "producer_version": "0.1.0",
+                "assurance": "resource_attested",
+                "evidence_ref": "attestations/1"
+            },
+            "payload": {
+                "type": "mission_created",
+                "revision": 0
+            }
+        }))
+        .expect("lifecycle fixture should deserialize");
+        NewMissionProjectionReceipt {
+            event,
+            envelope: AuditEnvelopeRef {
+                action_id: Some(entry_id.to_owned()),
+                correlation_id: Some(TEST_SESSION_ID.to_owned()),
+                trust_ref: Some("attestations/1".to_owned()),
+                ..AuditEnvelopeRef::default()
+            },
+            verification: None,
+        }
+    }
+
     const TEST_ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -900,7 +1197,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store should open");
 
         assert!(paths.hot_db_path().exists());
-        assert_eq!(store.schema_version().expect("schema version query"), 3);
+        assert_eq!(store.schema_version().expect("schema version query"), 4);
     }
 
     #[test]
@@ -909,10 +1206,201 @@ mod tests {
         let paths = StatePaths::new(&root);
 
         let store_a = StateStore::open(paths.clone()).expect("state store should open");
-        assert_eq!(store_a.schema_version().expect("schema version query"), 3);
+        assert_eq!(store_a.schema_version().expect("schema version query"), 4);
 
         let store_b = StateStore::open(paths).expect("state store should open again");
-        assert_eq!(store_b.schema_version().expect("schema version query"), 3);
+        assert_eq!(store_b.schema_version().expect("schema version query"), 4);
+    }
+
+    #[test]
+    fn version_three_store_upgrades_to_mission_projection_schema() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        drop(StateStore::open(paths.clone()).expect("state store should open"));
+
+        let connection =
+            Connection::open(paths.hot_db_path()).expect("database should reopen directly");
+        connection
+            .execute_batch(
+                "DROP TABLE missions; \
+                 UPDATE state_metadata SET value = 3 WHERE key = 'schema_version';",
+            )
+            .expect("version-three fixture should prepare");
+        drop(connection);
+
+        let mut store = StateStore::open(paths).expect("version-three store should upgrade");
+        assert_eq!(store.schema_version().expect("schema version query"), 4);
+        store
+            .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("upgraded store should persist missions");
+    }
+
+    #[test]
+    fn mission_projection_and_receipt_commit_atomically() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let mission = created_mission();
+
+        let write = store
+            .create_mission(mission.clone(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("mission and receipt should commit");
+
+        assert_eq!(write.projection.mission, mission);
+        assert_eq!(write.receipt.kind, AuditRecordKind::MissionEvent);
+        assert_eq!(write.receipt.session_id, TEST_SESSION_ID);
+        assert_eq!(write.projection.audit_entry_hash, write.receipt.entry_hash);
+
+        let stored = store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .expect("mission should exist");
+        assert_eq!(stored, write.projection);
+        let records = store
+            .audit_records(TEST_SESSION_ID)
+            .expect("mission receipt chain should load");
+        assert_eq!(records, vec![write.receipt]);
+    }
+
+    #[test]
+    fn duplicate_projection_does_not_append_a_receipt() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let mission = created_mission();
+        store
+            .create_mission(mission.clone(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("first mission should commit");
+
+        let result = store.create_mission(mission, created_mission_receipt(TEST_ENTRY_ID_B));
+        assert!(result.is_err(), "duplicate mission must fail");
+
+        let records = store
+            .audit_records(TEST_SESSION_ID)
+            .expect("mission receipt chain should remain valid");
+        assert_eq!(records.len(), 1, "failed projection must roll back receipt");
+        assert_eq!(records[0].entry_id, TEST_ENTRY_ID_A);
+    }
+
+    #[test]
+    fn projection_insert_failure_rolls_back_audit_append() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_mission_insert \
+                 BEFORE INSERT ON missions \
+                 BEGIN \
+                     SELECT RAISE(FAIL, 'forced mission insert failure'); \
+                 END;",
+            )
+            .expect("failure trigger should install");
+
+        let result =
+            store.create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A));
+        assert!(result.is_err(), "forced projection failure must surface");
+        assert!(store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .is_none());
+        assert!(store
+            .audit_records(TEST_SESSION_ID)
+            .expect("receipt chain query should succeed")
+            .is_empty());
+    }
+
+    #[test]
+    fn claimed_create_receipt_cannot_persist_a_projection() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let mut receipt = created_mission_receipt(TEST_ENTRY_ID_A);
+        receipt.event.source.kind = EventSourceKind::DriverReported;
+        receipt.event.source.assurance = lanyte_mission::ObservationLevel::DriverObserved;
+        receipt.event.source.evidence_ref = None;
+
+        let result = store.create_mission(created_mission(), receipt);
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidMissionProjection(_))
+        ));
+        assert!(store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .is_none());
+        assert!(store
+            .audit_records(TEST_SESSION_ID)
+            .expect("empty receipt chain should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn mission_projection_survives_reopen_with_receipt_binding() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mission = created_mission();
+        let expected_hash = {
+            let mut store = StateStore::open(paths.clone()).expect("state store should open");
+            store
+                .create_mission(mission.clone(), created_mission_receipt(TEST_ENTRY_ID_A))
+                .expect("mission should commit")
+                .receipt
+                .entry_hash
+        };
+
+        let store = StateStore::open(paths).expect("state store should reopen");
+        let stored = store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .expect("mission should survive reopen");
+        assert_eq!(stored.mission, mission);
+        assert_eq!(stored.audit_entry_hash, expected_hash);
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("receipt chain should survive reopen")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn mission_receipt_chain_is_not_generic_session_eviction() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        store
+            .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("mission should commit");
+
+        let evicted = store
+            .session_evictor()
+            .evict_older_than(
+                DateTime::parse_from_rfc3339("2026-10-01T00:00:00.000Z")
+                    .expect("valid time")
+                    .with_timezone(&Utc),
+                &AgeBasedEvictionPolicy::default(),
+            )
+            .expect("eviction should succeed");
+
+        assert!(evicted.is_empty());
+        assert!(store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .is_some());
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("mission receipt chain should remain hot")
+                .len(),
+            1
+        );
+        assert!(store
+            .warm_export_metadata(TEST_SESSION_ID)
+            .expect("warm metadata query should succeed")
+            .is_none());
     }
 
     #[test]
