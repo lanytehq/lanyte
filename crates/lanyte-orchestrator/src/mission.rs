@@ -240,7 +240,7 @@ impl MissionService {
         &self,
         mission_id: &str,
         idempotency: &lanyte_state::MissionMutationIdempotency,
-    ) -> Result<Option<String>, MissionCommandError> {
+    ) -> Result<lanyte_state::MutationReserve, MissionCommandError> {
         self.store
             .lock()
             .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
@@ -258,12 +258,12 @@ impl MissionService {
     pub(crate) fn release_mutation(
         &self,
         key: &str,
-        fingerprint: &str,
+        owner_token: &str,
     ) -> Result<(), MissionCommandError> {
         self.store
             .lock()
             .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
-            .release_mutation(key, fingerprint)
+            .release_mutation(key, owner_token)
             .map_err(|err| MissionCommandError::internal(err.to_string()))
     }
 

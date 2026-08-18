@@ -263,6 +263,13 @@ pub struct MissionMutationIdempotency {
     pub request_fingerprint: String,
     pub operation: String,
     pub result_json: String,
+    pub owner_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationReserve {
+    Replay(String),
+    Owned(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -369,12 +376,17 @@ impl StateStore {
         &mut self,
         mission_id: &str,
         idempotency: &MissionMutationIdempotency,
-    ) -> Result<Option<String>> {
+    ) -> Result<MutationReserve> {
         validate_mission_create_idempotency(&idempotency.key, &idempotency.request_fingerprint)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now();
+        let token = format!(
+            "{:x}-{:x}",
+            now.timestamp_nanos_opt().unwrap_or(0),
+            now.timestamp_subsec_nanos()
+        );
         let existing: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT request_fingerprint, result_json, reserved_at FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
@@ -390,12 +402,12 @@ impl StateStore {
             }
             if !result.is_empty() {
                 tx.commit()?;
-                return Ok(Some(result));
+                return Ok(MutationReserve::Replay(result));
             }
             let reserved = DateTime::parse_from_rfc3339(&reserved_at)
                 .ok()
                 .map(|timestamp| timestamp.with_timezone(&Utc));
-            let stale = reserved.is_none_or(|timestamp| {
+            let stale = reserved.is_some_and(|timestamp| {
                 now.signed_duration_since(timestamp) >= chrono::Duration::seconds(60)
             });
             if !stale {
@@ -404,17 +416,18 @@ impl StateStore {
                 ));
             }
             tx.execute(
-                "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2",
+                "UPDATE mission_mutations SET reserved_at = ?1, owner_token = ?2 WHERE idempotency_key = ?3",
                 params![
                     now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                    &token,
                     &idempotency.key
                 ],
             )?;
             tx.commit()?;
-            return Ok(None);
+            return Ok(MutationReserve::Owned(token));
         }
         tx.execute(
-            "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at, owner_token) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 &idempotency.key,
                 &idempotency.request_fingerprint,
@@ -422,16 +435,17 @@ impl StateStore {
                 &idempotency.operation,
                 "",
                 now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                &token,
             ],
         )?;
         tx.commit()?;
-        Ok(None)
+        Ok(MutationReserve::Owned(token))
     }
 
-    pub fn release_mutation(&mut self, key: &str, fingerprint: &str) -> Result<()> {
+    pub fn release_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
         self.connection.execute(
-            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND request_fingerprint = ?2 AND result_json = ''",
-            params![key, fingerprint],
+            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND owner_token = ?2 AND result_json = ''",
+            params![key, owner_token],
         )?;
         Ok(())
     }
@@ -556,14 +570,14 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(idempotency) = &idempotency {
-            let existing: Option<(String, String)> = tx
+            let existing: Option<(String, String, String)> = tx
                 .query_row(
-                    "SELECT request_fingerprint, result_json FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                    "SELECT request_fingerprint, result_json, owner_token FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
                     [&idempotency.key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            if let Some((stored_fingerprint, stored_result)) = existing {
+            if let Some((stored_fingerprint, stored_result, stored_owner)) = existing {
                 if stored_fingerprint != idempotency.request_fingerprint {
                     return Err(StateError::MissionIdempotencyConflict {
                         key: idempotency.key.clone(),
@@ -593,6 +607,11 @@ impl StateStore {
                         replayed: true,
                         replayed_result_json: Some(stored_result),
                     });
+                }
+                if stored_owner != idempotency.owner_token {
+                    return Err(StateError::InvalidMissionProjection(
+                        "mutation owner token does not match the reservation".to_owned(),
+                    ));
                 }
             }
         }
@@ -667,7 +686,7 @@ impl StateStore {
             )?;
             if updated == 0 {
                 tx.execute(
-                    "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at, owner_token) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         &idempotency.key,
                         &idempotency.request_fingerprint,
@@ -675,6 +694,7 @@ impl StateStore {
                         &idempotency.operation,
                         &idempotency.result_json,
                         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                        &idempotency.owner_token,
                     ],
                 )?;
             }

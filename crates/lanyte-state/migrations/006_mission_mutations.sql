@@ -4,7 +4,8 @@ CREATE TABLE IF NOT EXISTS mission_mutations (
     mission_id TEXT NOT NULL REFERENCES missions(mission_id),
     operation TEXT NOT NULL,
     result_json TEXT NOT NULL,
-    reserved_at TEXT NOT NULL DEFAULT ''
+    reserved_at TEXT NOT NULL DEFAULT '',
+    owner_token TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_mission_mutations_mission_id

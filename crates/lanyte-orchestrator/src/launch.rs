@@ -208,13 +208,16 @@ impl Orchestrator {
             request_fingerprint: fingerprint.clone(),
             operation: "mission.launch".to_owned(),
             result_json: String::new(),
+            owner_token: String::new(),
         };
-        if let Some(replayed) =
-            service.reserve_mutation(&body.mission_id.to_string(), &reservation)?
-        {
-            return replayed_control_result(&replayed);
-        }
-        let mut reservation_guard = ReservationGuard::new(service, &idempotency_key, &fingerprint);
+        let owner_token =
+            match service.reserve_mutation(&body.mission_id.to_string(), &reservation)? {
+                lanyte_state::MutationReserve::Replay(replayed) => {
+                    return replayed_control_result(&replayed);
+                }
+                lanyte_state::MutationReserve::Owned(token) => token,
+            };
+        let mut reservation_guard = ReservationGuard::new(service, &idempotency_key, &owner_token);
         let paths = service.state_paths()?;
         let workspace = confine_workspace(
             PathBuf::from(&body.workspace).as_path(),
@@ -412,6 +415,7 @@ impl Orchestrator {
                 operation: "mission.launch".to_owned(),
                 result_json: serde_json::to_string(&result)
                     .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                owner_token,
             }),
         ) {
             let mut session = session;
@@ -513,7 +517,11 @@ impl Orchestrator {
         )?;
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
         let before = stored.mission.clone();
-        if before.revision != expected_revision {
+        let already_cancelling = before.attempts.iter().any(|attempt| {
+            attempt.state == AttemptState::Cancelling
+                && before.current_attempt_id == Some(attempt.attempt_id)
+        });
+        if !already_cancelling && before.revision != expected_revision {
             return Err(MissionCommandError::invalid_args(format!(
                 "stale mission revision: expected {expected_revision}, actual {}",
                 before.revision
@@ -529,19 +537,19 @@ impl Orchestrator {
             request_fingerprint: fingerprint.clone(),
             operation: "mission.close".to_owned(),
             result_json: String::new(),
+            owner_token: String::new(),
         };
-        if let Some(replayed) =
-            service.reserve_mutation(&body.mission_id.to_string(), &reservation)?
-        {
-            return replayed_control_result(&replayed);
-        }
-        let mut reservation_guard = ReservationGuard::new(service, &idempotency_key, &fingerprint);
+        let owner_token =
+            match service.reserve_mutation(&body.mission_id.to_string(), &reservation)? {
+                lanyte_state::MutationReserve::Replay(replayed) => {
+                    return replayed_control_result(&replayed);
+                }
+                lanyte_state::MutationReserve::Owned(token) => token,
+            };
+        let mut reservation_guard = ReservationGuard::new(service, &idempotency_key, &owner_token);
         let attempt_id = before
             .current_attempt_id
             .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
-        let already_cancelling = before.attempts.iter().any(|attempt| {
-            attempt.attempt_id == attempt_id && attempt.state == AttemptState::Cancelling
-        });
         let (cancelling, terminal_expected) = if already_cancelling {
             reservation_guard.disarm();
             (before.clone(), before.revision)
@@ -677,6 +685,7 @@ impl Orchestrator {
                 operation: "mission.close".to_owned(),
                 result_json: serde_json::to_string(&result)
                     .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                owner_token,
             }),
         )?;
         sessions.remove(&attempt_id);
