@@ -1,5 +1,6 @@
 //! Event-loop skeleton for the Lanyte orchestrator.
 
+mod launch;
 mod mission;
 mod model;
 
@@ -208,6 +209,19 @@ impl Orchestrator {
                 request_type = %command_request.kind,
                 "command payload logged and dropped"
             );
+            return;
+        }
+
+        if command_request.command == "mission.launch" {
+            self.handle_mission_launch(event, command_request).await;
+            return;
+        }
+        if command_request.command == "mission.observe" {
+            self.handle_mission_observe(event, command_request).await;
+            return;
+        }
+        if command_request.command == "mission.close" {
+            self.handle_mission_close(event, command_request).await;
             return;
         }
 

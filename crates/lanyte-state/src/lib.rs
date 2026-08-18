@@ -24,6 +24,7 @@ use rusqlite::{
     params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const LANYTE_STATE_ROOT_ENV: &str = "LANYTE_STATE_ROOT";
 pub const DEFAULT_STATE_ROOT: &str = "/var/lib/lanyte/state";
@@ -48,12 +49,17 @@ const MIGRATION_005: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/005_mission_requests.sql"
 ));
+const MIGRATION_006: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/006_mission_mutations.sql"
+));
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
     (2, MIGRATION_002),
     (3, MIGRATION_003),
     (4, MIGRATION_004),
     (5, MIGRATION_005),
+    (6, MIGRATION_006),
 ];
 
 const HOT_TIER_DIR: &str = "hot";
@@ -148,7 +154,19 @@ impl StatePaths {
         fs::create_dir_all(&self.hot_dir)?;
         fs::create_dir_all(&self.warm_dir)?;
         fs::create_dir_all(&self.cold_dir)?;
+        fs::create_dir_all(self.workspace_root())?;
+        fs::create_dir_all(self.pin_dir())?;
         Ok(())
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> PathBuf {
+        self.root_dir.join("workspaces")
+    }
+
+    #[must_use]
+    pub fn pin_dir(&self) -> PathBuf {
+        self.root_dir.join("pins")
     }
 
     #[must_use]
@@ -240,10 +258,26 @@ pub struct MissionCreateIdempotency {
     pub request_fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionMutationIdempotency {
+    pub key: String,
+    pub request_fingerprint: String,
+    pub operation: String,
+    pub result_json: String,
+    pub owner_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationReserve {
+    Replay(String),
+    Owned(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct IdempotentMissionWrite {
     pub write: MissionProjectionWrite,
     pub replayed: bool,
+    pub replayed_result_json: Option<String>,
 }
 
 /// An opaque, filter-bound position in one caller-scoped mission listing.
@@ -339,6 +373,142 @@ impl StateStore {
         SessionEvictor { store: self }
     }
 
+    pub fn completed_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
+        validate_mission_create_idempotency(key, fingerprint)?;
+        let existing: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT request_fingerprint, result_json FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            None => Ok(None),
+            Some((stored, result)) if stored == fingerprint && !result.is_empty() => {
+                Ok(Some(result))
+            }
+            Some((stored, _)) if stored != fingerprint => {
+                Err(StateError::MissionIdempotencyConflict {
+                    key: key.to_owned(),
+                })
+            }
+            Some(_) => Ok(None),
+        }
+    }
+
+    pub fn renew_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
+        let now = Utc::now();
+        let updated = self.connection.execute(
+            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2 AND owner_token = ?3 AND result_json = ''",
+            params![
+                now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                key,
+                owner_token
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidMissionProjection(
+                "mutation lease could not be renewed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn reserve_mutation(
+        &mut self,
+        mission_id: &str,
+        idempotency: &MissionMutationIdempotency,
+    ) -> Result<MutationReserve> {
+        validate_mission_create_idempotency(&idempotency.key, &idempotency.request_fingerprint)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now();
+        let token = Uuid::new_v4().to_string();
+        let existing: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT request_fingerprint, result_json, reserved_at FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                [&idempotency.key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((stored, result, reserved_at)) = existing {
+            if stored != idempotency.request_fingerprint {
+                return Err(StateError::MissionIdempotencyConflict {
+                    key: idempotency.key.clone(),
+                });
+            }
+            if !result.is_empty() {
+                tx.commit()?;
+                return Ok(MutationReserve::Replay(result));
+            }
+            let reserved = DateTime::parse_from_rfc3339(&reserved_at)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc));
+            let stale = reserved.is_some_and(|timestamp| {
+                now.signed_duration_since(timestamp) >= chrono::Duration::seconds(60)
+            });
+            if !stale {
+                return Err(StateError::InvalidMissionProjection(
+                    "identical mutation is already in flight".to_owned(),
+                ));
+            }
+            tx.execute(
+                "UPDATE mission_mutations SET reserved_at = ?1, owner_token = ?2 WHERE idempotency_key = ?3",
+                params![
+                    now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                    &token,
+                    &idempotency.key
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(MutationReserve::Owned(token));
+        }
+        tx.execute(
+            "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at, owner_token) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &idempotency.key,
+                &idempotency.request_fingerprint,
+                mission_id,
+                &idempotency.operation,
+                "",
+                now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                &token,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(MutationReserve::Owned(token))
+    }
+
+    pub fn release_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND owner_token = ?2 AND result_json = ''",
+            params![key, owner_token],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn replay_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
+        validate_mission_create_idempotency(key, fingerprint)?;
+        let existing: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT request_fingerprint, result_json FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            None => Ok(None),
+            Some((stored, result)) if stored == fingerprint => Ok(Some(result)),
+            Some(_) => Err(StateError::MissionIdempotencyConflict {
+                key: key.to_owned(),
+            }),
+        }
+    }
+
     pub fn schema_version(&self) -> Result<i64> {
         let version = self.connection.query_row(
             "SELECT value FROM state_metadata WHERE key = 'schema_version'",
@@ -372,6 +542,215 @@ impl StateStore {
             Some((&idempotency.key, &idempotency.request_fingerprint)),
         )?;
         Ok(outcome)
+    }
+
+    /// Replace a mission projection and append one receipt in the same transaction.
+    pub fn update_mission(
+        &mut self,
+        expected_revision: u64,
+        mission: MissionRecord,
+        receipt: NewMissionProjectionReceipt,
+    ) -> Result<MissionProjectionWrite> {
+        Ok(self
+            .update_mission_with_events(expected_revision, mission, vec![receipt], None)?
+            .write)
+    }
+
+    /// Replace a mission projection and append one or more hash-linked receipts.
+    pub fn update_mission_with_events(
+        &mut self,
+        expected_revision: u64,
+        mission: MissionRecord,
+        receipts: Vec<NewMissionProjectionReceipt>,
+        idempotency: Option<MissionMutationIdempotency>,
+    ) -> Result<IdempotentMissionWrite> {
+        if let Some(idempotency) = &idempotency {
+            validate_mission_create_idempotency(
+                &idempotency.key,
+                &idempotency.request_fingerprint,
+            )?;
+        }
+        mission
+            .validate()
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        if mission.revision != expected_revision.saturating_add(1) {
+            return Err(StateError::InvalidMissionProjection(
+                "updated mission revision must be expected_revision + 1".to_owned(),
+            ));
+        }
+        if receipts.is_empty() {
+            return Err(StateError::InvalidMissionProjection(
+                "mission update requires at least one lifecycle receipt".to_owned(),
+            ));
+        }
+        for receipt in &receipts {
+            receipt
+                .event
+                .validate()
+                .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+            if !matches!(
+                receipt.event.source.kind,
+                EventSourceKind::VerifiedAttestation
+                    | EventSourceKind::OperatorCommand
+                    | EventSourceKind::KernelObserved
+                    | EventSourceKind::DriverReported
+            ) {
+                return Err(StateError::InvalidMissionProjection(
+                    "update receipt must be authoritative".to_owned(),
+                ));
+            }
+        }
+
+        let mission_id = mission.mission_id.to_string();
+        let projection_json = serde_json::to_string(&mission)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(idempotency) = &idempotency {
+            let existing: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT request_fingerprint, result_json, owner_token FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                    [&idempotency.key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((stored_fingerprint, stored_result, stored_owner)) = existing {
+                if stored_fingerprint != idempotency.request_fingerprint {
+                    return Err(StateError::MissionIdempotencyConflict {
+                        key: idempotency.key.clone(),
+                    });
+                }
+                if !stored_result.is_empty() {
+                    let projection =
+                        load_mission_projection_tx(&tx, &mission_id)?.ok_or_else(|| {
+                            StateError::InvalidMissionProjection(
+                                "idempotency binding references a missing mission projection"
+                                    .to_owned(),
+                            )
+                        })?;
+                    let receipt = load_audit_record_tx(&tx, &projection.audit_entry_id)?
+                        .ok_or_else(|| {
+                            StateError::InvalidMissionProjection(
+                                "idempotency binding references a missing mission receipt"
+                                    .to_owned(),
+                            )
+                        })?;
+                    tx.commit()?;
+                    return Ok(IdempotentMissionWrite {
+                        write: MissionProjectionWrite {
+                            projection,
+                            receipt,
+                        },
+                        replayed: true,
+                        replayed_result_json: Some(stored_result),
+                    });
+                }
+                if stored_owner != idempotency.owner_token {
+                    return Err(StateError::InvalidMissionProjection(
+                        "mutation owner token does not match the reservation".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let mut history = load_lifecycle_history_tx(&tx, &mission_id)?;
+        history.extend(receipts.iter().map(|receipt| receipt.event.clone()));
+        validate_history(&mission, &history)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+
+        let updated = tx.execute(
+            "UPDATE missions SET revision = ?1, phase = ?2, updated_at = ?3, record_json = ?4, \
+             receipt_entry_id = ?5, receipt_entry_hash = ?6 \
+             WHERE mission_id = ?7 AND revision = ?8",
+            params![
+                i64::try_from(mission.revision).map_err(|_| {
+                    StateError::InvalidMissionProjection(
+                        "mission revision exceeds SQLite integer range".to_owned(),
+                    )
+                })?,
+                mission_phase_name(mission.phase),
+                mission
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                &projection_json,
+                "",
+                "",
+                &mission_id,
+                i64::try_from(expected_revision).map_err(|_| {
+                    StateError::InvalidMissionProjection(
+                        "expected revision exceeds SQLite integer range".to_owned(),
+                    )
+                })?,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidMissionProjection(
+                "mission update did not match the expected revision".to_owned(),
+            ));
+        }
+
+        let mut last_audit = None;
+        for receipt in receipts {
+            let event_json = serde_json::to_value(&receipt.event)
+                .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+            let audit_input = NewAuditRecord {
+                entry_id: receipt.event.event_id.to_string(),
+                session_id: mission_id.clone(),
+                timestamp: receipt
+                    .event
+                    .recorded_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                kind: AuditRecordKind::MissionEvent,
+                action: receipt.event.event_type.clone(),
+                severity: AuditSeverity::Notice,
+                envelope: receipt.envelope,
+                payload: event_json,
+                verification: receipt.verification,
+            };
+            last_audit = Some(append_audit_record_tx(&tx, audit_input)?);
+        }
+        let audit = last_audit.ok_or_else(|| {
+            StateError::InvalidMissionProjection("mission update produced no receipts".to_owned())
+        })?;
+        tx.execute(
+            "UPDATE missions SET receipt_entry_id = ?1, receipt_entry_hash = ?2 WHERE mission_id = ?3",
+            params![&audit.entry_id, &audit.entry_hash, &mission_id],
+        )?;
+        if let Some(idempotency) = &idempotency {
+            let updated = tx.execute(
+                "UPDATE mission_mutations SET result_json = ?1 WHERE idempotency_key = ?2 AND request_fingerprint = ?3",
+                params![&idempotency.result_json, &idempotency.key, &idempotency.request_fingerprint],
+            )?;
+            if updated == 0 {
+                tx.execute(
+                    "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at, owner_token) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        &idempotency.key,
+                        &idempotency.request_fingerprint,
+                        &mission_id,
+                        &idempotency.operation,
+                        &idempotency.result_json,
+                        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                        &idempotency.owner_token,
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(IdempotentMissionWrite {
+            write: MissionProjectionWrite {
+                projection: StoredMissionProjection {
+                    mission,
+                    audit_entry_id: audit.entry_id.clone(),
+                    audit_entry_hash: audit.entry_hash.clone(),
+                },
+                receipt: audit,
+            },
+            replayed: false,
+            replayed_result_json: None,
+        })
     }
 
     fn create_mission_inner(
@@ -418,6 +797,7 @@ impl StateStore {
                         receipt,
                     },
                     replayed: true,
+                    replayed_result_json: None,
                 });
             }
         }
@@ -521,6 +901,7 @@ impl StateStore {
                 receipt: audit,
             },
             replayed: false,
+            replayed_result_json: None,
         })
     }
 
@@ -1038,6 +1419,27 @@ fn validate_projection_receipt_binding(
         ));
     }
     Ok(())
+}
+
+fn load_lifecycle_history_tx(
+    tx: &Transaction<'_>,
+    mission_id: &str,
+) -> Result<Vec<LifecycleEvent>> {
+    let mut stmt = tx.prepare(
+        "SELECT payload_json FROM audit_records WHERE session_id = ?1 AND record_kind = ?2 ORDER BY chain_index ASC",
+    )?;
+    let rows = stmt.query_map(params![mission_id, "mission_event"], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut events = Vec::new();
+    for payload in rows {
+        let payload = payload?;
+        let value: serde_json::Value = serde_json::from_str(&payload)?;
+        let event: LifecycleEvent = serde_json::from_value(value)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        events.push(event);
+    }
+    Ok(events)
 }
 
 fn validate_mission_create_idempotency(key: &str, fingerprint: &str) -> Result<()> {
@@ -1785,7 +2187,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store should open");
 
         assert!(paths.hot_db_path().exists());
-        assert_eq!(store.schema_version().expect("schema version query"), 5);
+        assert_eq!(store.schema_version().expect("schema version query"), 6);
     }
 
     #[test]
@@ -1794,10 +2196,10 @@ mod tests {
         let paths = StatePaths::new(&root);
 
         let store_a = StateStore::open(paths.clone()).expect("state store should open");
-        assert_eq!(store_a.schema_version().expect("schema version query"), 5);
+        assert_eq!(store_a.schema_version().expect("schema version query"), 6);
 
         let store_b = StateStore::open(paths).expect("state store should open again");
-        assert_eq!(store_b.schema_version().expect("schema version query"), 5);
+        assert_eq!(store_b.schema_version().expect("schema version query"), 6);
     }
 
     #[test]
@@ -1817,7 +2219,7 @@ mod tests {
         drop(connection);
 
         let mut store = StateStore::open(paths).expect("version-three store should upgrade");
-        assert_eq!(store.schema_version().expect("schema version query"), 5);
+        assert_eq!(store.schema_version().expect("schema version query"), 6);
         store
             .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
             .expect("upgraded store should persist missions");
@@ -1840,7 +2242,7 @@ mod tests {
         drop(connection);
 
         let mut store = StateStore::open(paths).expect("version-four store should upgrade");
-        assert_eq!(store.schema_version().expect("schema version query"), 5);
+        assert_eq!(store.schema_version().expect("schema version query"), 6);
         store
             .create_mission_idempotent(
                 created_mission(),
@@ -2864,5 +3266,112 @@ mod tests {
         assert!(err
             .to_string()
             .contains("timestamp must be RFC3339 UTC with millisecond precision"));
+    }
+
+    #[test]
+    fn stale_owner_cannot_renew_release_or_finalize_after_reclaim() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        store
+            .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("mission should commit");
+
+        let reservation = MissionMutationIdempotency {
+            key: "mutation:reclaim-owner".to_owned(),
+            request_fingerprint: "ab".repeat(32),
+            operation: "mission.close".to_owned(),
+            result_json: String::new(),
+            owner_token: String::new(),
+        };
+        let MutationReserve::Owned(stale_token) = store
+            .reserve_mutation(TEST_SESSION_ID, &reservation)
+            .expect("first reserve")
+        else {
+            panic!("first reserve must own the lease");
+        };
+
+        store
+            .connection
+            .execute(
+                "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2",
+                ("2020-01-01T00:00:00.000Z", "mutation:reclaim-owner"),
+            )
+            .expect("backdate reservation");
+
+        let MutationReserve::Owned(current_token) = store
+            .reserve_mutation(TEST_SESSION_ID, &reservation)
+            .expect("reclaim reserve")
+        else {
+            panic!("stale lease must be reclaimable");
+        };
+        assert_ne!(stale_token, current_token);
+
+        let stale_renew = store
+            .renew_mutation("mutation:reclaim-owner", &stale_token)
+            .expect_err("stale owner must not renew");
+        assert!(stale_renew
+            .to_string()
+            .contains("mutation lease could not be renewed"));
+        store
+            .release_mutation("mutation:reclaim-owner", &stale_token)
+            .expect("stale release is a no-op");
+        let remaining: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM mission_mutations WHERE idempotency_key = ?1",
+                ["mutation:reclaim-owner"],
+                |row| row.get(0),
+            )
+            .expect("count reservation");
+        assert_eq!(
+            remaining, 1,
+            "stale release must not drop the current lease"
+        );
+
+        store
+            .renew_mutation("mutation:reclaim-owner", &current_token)
+            .expect("current owner must renew");
+
+        let mut terminal = created_mission();
+        terminal.revision = 1;
+        terminal.phase = MissionPhase::Failed;
+        terminal.terminal_reason = Some(lanyte_mission::MissionTerminalReason::InternalError);
+        terminal.terminal_entry_hash = Some("d".repeat(64));
+        terminal.updated_at += chrono::Duration::seconds(1);
+
+        let mut stale_finalize = reservation.clone();
+        stale_finalize.owner_token = stale_token;
+        let stale_err = store
+            .update_mission_with_events(
+                0,
+                terminal.clone(),
+                vec![created_mission_receipt(TEST_ENTRY_ID_B)],
+                Some(stale_finalize),
+            )
+            .expect_err("stale owner must not finalize");
+        assert!(
+            stale_err
+                .to_string()
+                .contains("mutation owner token does not match the reservation"),
+            "stale finalize error: {stale_err}"
+        );
+
+        let mut current_finalize = reservation;
+        current_finalize.owner_token = current_token;
+        let current_err = store
+            .update_mission_with_events(
+                0,
+                terminal,
+                vec![created_mission_receipt(TEST_ENTRY_ID_B)],
+                Some(current_finalize),
+            )
+            .expect_err("fixture history is not a valid close fold");
+        assert!(
+            !current_err
+                .to_string()
+                .contains("mutation owner token does not match the reservation"),
+            "current owner must pass the token fence: {current_err}"
+        );
     }
 }

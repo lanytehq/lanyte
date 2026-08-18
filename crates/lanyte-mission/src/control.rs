@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::{Uuid, Version};
 
-use crate::{MissionPhase, MissionRecord, RecoveryPolicy, Validate};
+use crate::{MissionPhase, MissionRecord, NormalizedHarnessEvent, RecoveryPolicy, Validate};
 
 pub const MISSION_CONTROL_SCHEMA: &str =
     "https://schemas.3leaps.dev/agentic/mission/v0/mission-control.schema.json";
@@ -84,6 +84,51 @@ pub struct MissionListBody {
     pub cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissionLaunchBody {
+    pub mission_id: Uuid,
+    pub workspace: String,
+    pub binary: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for MissionLaunchBody {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            mission_id: String,
+            workspace: String,
+            binary: Value,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.workspace.is_empty() || raw.workspace.chars().count() > 4096 {
+            return Err(D::Error::custom(
+                "workspace must contain 1..=4096 characters",
+            ));
+        }
+        let binary = match raw.binary {
+            Value::Null => None,
+            Value::String(value) if !value.is_empty() && value.chars().count() <= 4096 => {
+                Some(value)
+            }
+            _ => {
+                return Err(D::Error::custom(
+                    "binary must be null or a path of 1..=4096 characters",
+                ));
+            }
+        };
+        Ok(Self {
+            mission_id: parse_canonical_uuid_v4::<D::Error>(&raw.mission_id, "mission_id")?,
+            workspace: raw.workspace,
+            binary,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissionControlRequest {
     Create {
@@ -98,6 +143,22 @@ pub enum MissionControlRequest {
     List {
         request_id: Uuid,
         body: MissionListBody,
+    },
+    Launch {
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        body: MissionLaunchBody,
+    },
+    Observe {
+        request_id: Uuid,
+        body: MissionShowBody,
+    },
+    Close {
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        body: MissionShowBody,
     },
 }
 
@@ -131,12 +192,56 @@ impl MissionControlRequest {
         Ok(request)
     }
 
+    pub fn launch(
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        body: MissionLaunchBody,
+    ) -> Result<Self, String> {
+        let request = Self::Launch {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            body,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn observe(request_id: Uuid, mission_id: Uuid) -> Result<Self, String> {
+        let request = Self::Observe {
+            request_id,
+            body: MissionShowBody { mission_id },
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn close(
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        mission_id: Uuid,
+    ) -> Result<Self, String> {
+        let request = Self::Close {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            body: MissionShowBody { mission_id },
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     #[must_use]
     pub const fn request_id(&self) -> Uuid {
         match self {
             Self::Create { request_id, .. }
             | Self::Show { request_id, .. }
-            | Self::List { request_id, .. } => *request_id,
+            | Self::List { request_id, .. }
+            | Self::Launch { request_id, .. }
+            | Self::Observe { request_id, .. }
+            | Self::Close { request_id, .. } => *request_id,
         }
     }
 
@@ -146,6 +251,9 @@ impl MissionControlRequest {
             Self::Create { .. } => "mission.create",
             Self::Show { .. } => "mission.show",
             Self::List { .. } => "mission.list",
+            Self::Launch { .. } => "mission.launch",
+            Self::Observe { .. } => "mission.observe",
+            Self::Close { .. } => "mission.close",
         }
     }
 
@@ -162,13 +270,38 @@ impl MissionControlRequest {
                 validate_idempotency_key(idempotency_key)?;
                 validate_create_body(body)
             }
-            Self::Show { body, .. } => {
+            Self::Show { body, .. } | Self::Observe { body, .. } => {
                 if body.mission_id.get_version() != Some(Version::Random) {
                     return Err("mission_id must be a UUID v4".to_owned());
                 }
                 Ok(())
             }
             Self::List { body, .. } => validate_list_body(body),
+            Self::Launch {
+                idempotency_key,
+                body,
+                ..
+            } => {
+                validate_idempotency_key(idempotency_key)?;
+                if body.mission_id.get_version() != Some(Version::Random) {
+                    return Err("mission_id must be a UUID v4".to_owned());
+                }
+                if body.workspace.is_empty() || body.workspace.chars().count() > 4096 {
+                    return Err("workspace must contain 1..=4096 characters".to_owned());
+                }
+                Ok(())
+            }
+            Self::Close {
+                idempotency_key,
+                body,
+                ..
+            } => {
+                validate_idempotency_key(idempotency_key)?;
+                if body.mission_id.get_version() != Some(Version::Random) {
+                    return Err("mission_id must be a UUID v4".to_owned());
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -210,6 +343,43 @@ impl Serialize for MissionControlRequest {
                 "operation": "mission.list",
                 "body": body,
             }),
+            Self::Launch {
+                request_id,
+                idempotency_key,
+                expected_revision,
+                body,
+            } => serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "request",
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "expected_revision": expected_revision,
+                "operation": "mission.launch",
+                "body": body,
+            }),
+            Self::Observe { request_id, body } => serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "request",
+                "request_id": request_id,
+                "idempotency_key": null,
+                "expected_revision": null,
+                "operation": "mission.observe",
+                "body": body,
+            }),
+            Self::Close {
+                request_id,
+                idempotency_key,
+                expected_revision,
+                body,
+            } => serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "request",
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "expected_revision": expected_revision,
+                "operation": "mission.close",
+                "body": body,
+            }),
         };
         value.serialize(serializer)
     }
@@ -239,14 +409,10 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
         if raw.kind != "request" {
             return Err(D::Error::custom("kind must be request"));
         }
-        if !raw.expected_revision.is_null() {
-            return Err(D::Error::custom(
-                "expected_revision must be null for Wave 1 operations",
-            ));
-        }
         let request_id = parse_canonical_uuid_v4::<D::Error>(&raw.request_id, "request_id")?;
         let request = match raw.operation.as_str() {
             "mission.create" => {
+                require_null_revision(&raw.expected_revision)?;
                 let idempotency_key = raw
                     .idempotency_key
                     .as_str()
@@ -262,6 +428,7 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
                 }
             }
             "mission.show" => {
+                require_null_revision(&raw.expected_revision)?;
                 if !raw.idempotency_key.is_null() {
                     return Err(D::Error::custom(
                         "mission.show idempotency_key must be null",
@@ -271,6 +438,7 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
                 Self::Show { request_id, body }
             }
             "mission.list" => {
+                require_null_revision(&raw.expected_revision)?;
                 if !raw.idempotency_key.is_null() {
                     return Err(D::Error::custom(
                         "mission.list idempotency_key must be null",
@@ -278,6 +446,50 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
                 }
                 let body = serde_json::from_value(raw.body).map_err(D::Error::custom)?;
                 Self::List { request_id, body }
+            }
+            "mission.launch" => {
+                let expected_revision = require_revision(&raw.expected_revision)?;
+                let idempotency_key = raw
+                    .idempotency_key
+                    .as_str()
+                    .ok_or_else(|| {
+                        D::Error::custom("mission.launch idempotency_key must be a string")
+                    })?
+                    .to_owned();
+                let body = serde_json::from_value(raw.body).map_err(D::Error::custom)?;
+                Self::Launch {
+                    request_id,
+                    idempotency_key,
+                    expected_revision,
+                    body,
+                }
+            }
+            "mission.observe" => {
+                require_null_revision(&raw.expected_revision)?;
+                if !raw.idempotency_key.is_null() {
+                    return Err(D::Error::custom(
+                        "mission.observe idempotency_key must be null",
+                    ));
+                }
+                let body = serde_json::from_value(raw.body).map_err(D::Error::custom)?;
+                Self::Observe { request_id, body }
+            }
+            "mission.close" => {
+                let expected_revision = require_revision(&raw.expected_revision)?;
+                let idempotency_key = raw
+                    .idempotency_key
+                    .as_str()
+                    .ok_or_else(|| {
+                        D::Error::custom("mission.close idempotency_key must be a string")
+                    })?
+                    .to_owned();
+                let body = serde_json::from_value(raw.body).map_err(D::Error::custom)?;
+                Self::Close {
+                    request_id,
+                    idempotency_key,
+                    expected_revision,
+                    body,
+                }
             }
             _ => return Err(D::Error::custom("unsupported mission operation")),
         };
@@ -292,12 +504,26 @@ pub enum MissionControlResult {
         request_id: Uuid,
         operation: &'static str,
         idempotency_key: Option<String>,
+        expected_revision: Option<u64>,
         record: Box<MissionRecord>,
     },
     List {
         request_id: Uuid,
         records: Vec<MissionRecord>,
         next_cursor: Option<String>,
+    },
+    Observe {
+        request_id: Uuid,
+        mission_id: Uuid,
+        attempt_id: Uuid,
+        events: Vec<NormalizedHarnessEvent>,
+    },
+    Close {
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        mission_id: Uuid,
+        attempt_id: Uuid,
     },
 }
 
@@ -313,6 +539,7 @@ impl MissionControlResult {
             request_id,
             operation: "mission.create",
             idempotency_key: Some(idempotency_key),
+            expected_revision: None,
             record: Box::new(record),
         })
     }
@@ -323,7 +550,59 @@ impl MissionControlResult {
             request_id,
             operation: "mission.show",
             idempotency_key: None,
+            expected_revision: None,
             record: Box::new(record),
+        })
+    }
+
+    pub fn launch(
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        record: MissionRecord,
+    ) -> Result<Self, String> {
+        record.validate().map_err(|err| err.to_string())?;
+        validate_idempotency_key(&idempotency_key)?;
+        Ok(Self::Record {
+            request_id,
+            operation: "mission.launch",
+            idempotency_key: Some(idempotency_key),
+            expected_revision: Some(expected_revision),
+            record: Box::new(record),
+        })
+    }
+
+    pub fn observe(
+        request_id: Uuid,
+        mission_id: Uuid,
+        attempt_id: Uuid,
+        events: Vec<NormalizedHarnessEvent>,
+    ) -> Result<Self, String> {
+        if events.len() > 32 {
+            return Err("observe result exceeds 32 events".to_owned());
+        }
+        Ok(Self::Observe {
+            request_id,
+            mission_id,
+            attempt_id,
+            events,
+        })
+    }
+
+    pub fn close(
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        mission_id: Uuid,
+        attempt_id: Uuid,
+    ) -> Result<Self, String> {
+        validate_idempotency_key(&idempotency_key)?;
+        Ok(Self::Close {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            mission_id,
+            attempt_id,
         })
     }
 
@@ -357,13 +636,14 @@ impl Serialize for MissionControlResult {
                 request_id,
                 operation,
                 idempotency_key,
+                expected_revision,
                 record,
             } => serde_json::json!({
                 "control_schema": MISSION_CONTROL_SCHEMA,
                 "kind": "result",
                 "request_id": request_id,
                 "idempotency_key": idempotency_key,
-                "expected_revision": null,
+                "expected_revision": expected_revision,
                 "operation": operation,
                 "body": { "record": record },
             }),
@@ -383,9 +663,68 @@ impl Serialize for MissionControlResult {
                     "next_cursor": next_cursor,
                 },
             }),
+            Self::Observe {
+                request_id,
+                mission_id,
+                attempt_id,
+                events,
+            } => serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "result",
+                "request_id": request_id,
+                "idempotency_key": null,
+                "expected_revision": null,
+                "operation": "mission.observe",
+                "body": {
+                    "mission_id": mission_id,
+                    "attempt_id": attempt_id,
+                    "events": events,
+                },
+            }),
+            Self::Close {
+                request_id,
+                idempotency_key,
+                expected_revision,
+                mission_id,
+                attempt_id,
+            } => serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "result",
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "expected_revision": expected_revision,
+                "operation": "mission.close",
+                "body": {
+                    "mission_id": mission_id,
+                    "attempt_id": attempt_id,
+                    "closed": true,
+                },
+            }),
         };
         value.serialize(serializer)
     }
+}
+
+fn require_null_revision<E>(value: &Value) -> Result<(), E>
+where
+    E: serde::de::Error,
+{
+    if value.is_null() {
+        Ok(())
+    } else {
+        Err(E::custom(
+            "expected_revision must be null for this operation",
+        ))
+    }
+}
+
+fn require_revision<E>(value: &Value) -> Result<u64, E>
+where
+    E: serde::de::Error,
+{
+    value
+        .as_u64()
+        .ok_or_else(|| E::custom("expected_revision must be an integer >= 0"))
 }
 
 fn parse_canonical_uuid_v4<E>(input: &str, field: &str) -> Result<Uuid, E>
@@ -624,5 +963,57 @@ mod tests {
                 "{invalid} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn launch_observe_close_requests_round_trip() {
+        let launch = serde_json::json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "request",
+            "request_id": "55555555-5555-4555-8555-555555555555",
+            "idempotency_key": "mission-launch-example-0001",
+            "expected_revision": 0,
+            "operation": "mission.launch",
+            "body": {
+                "mission_id": REQUEST_ID,
+                "workspace": "/tmp/lanyte-mission-workspace",
+                "binary": null
+            }
+        });
+        let parsed = serde_json::from_value::<MissionControlRequest>(launch.clone()).unwrap();
+        assert_eq!(parsed.operation(), "mission.launch");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), launch);
+
+        let observe = serde_json::json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "request",
+            "request_id": "66666666-6666-4666-8666-666666666666",
+            "idempotency_key": null,
+            "expected_revision": null,
+            "operation": "mission.observe",
+            "body": { "mission_id": REQUEST_ID }
+        });
+        assert_eq!(
+            serde_json::from_value::<MissionControlRequest>(observe)
+                .unwrap()
+                .operation(),
+            "mission.observe"
+        );
+
+        let close = serde_json::json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "request",
+            "request_id": "77777777-7777-4777-8777-777777777777",
+            "idempotency_key": "mission-close-example-0001",
+            "expected_revision": 1,
+            "operation": "mission.close",
+            "body": { "mission_id": REQUEST_ID }
+        });
+        assert_eq!(
+            serde_json::from_value::<MissionControlRequest>(close)
+                .unwrap()
+                .operation(),
+            "mission.close"
+        );
     }
 }

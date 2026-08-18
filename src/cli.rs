@@ -9,7 +9,8 @@ use ipcprims::peer::handshake::async_handshake_client_with_config;
 use ipcprims::peer::HandshakeConfig;
 use lanyte_common::channels;
 use lanyte_mission::{
-    MissionControlRequest, MissionCreateBody, MissionListBody, MissionPhase, RecoveryPolicy,
+    MissionControlRequest, MissionCreateBody, MissionLaunchBody, MissionListBody, MissionPhase,
+    RecoveryPolicy,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -44,6 +45,9 @@ pub enum MissionCommand {
     Create(CreateArgs),
     Show(ShowArgs),
     List(ListArgs),
+    Launch(LaunchArgs),
+    Observe(ObserveArgs),
+    Close(CloseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -77,6 +81,39 @@ pub struct ListArgs {
     limit: u16,
     #[arg(long)]
     cursor: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LaunchArgs {
+    mission_id: String,
+    #[arg(long)]
+    workspace: String,
+    #[arg(long)]
+    binary: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    expected_revision: u64,
+    #[arg(long)]
+    idempotency_key: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ObserveArgs {
+    mission_id: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CloseArgs {
+    mission_id: String,
+    #[arg(long, default_value_t = 1)]
+    expected_revision: u64,
+    #[arg(long)]
+    idempotency_key: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -181,11 +218,12 @@ pub async fn run_mission(command: MissionCommand, socket: &Path) -> Result<(), C
     let (request, json) = build_request(command)?;
     let request_id = request.request_id().to_string();
     let operation = request.operation().to_owned();
+    let args = serde_json::to_value(&request)?;
     let envelope = serde_json::json!({
         "type": "invoke",
         "request_id": request_id,
         "command": operation,
-        "args": request,
+        "args": args,
     });
 
     let stream = tokio::net::UnixStream::connect(socket)
@@ -279,6 +317,44 @@ async fn read_frame(
 fn build_request(command: MissionCommand) -> Result<(MissionControlRequest, bool), ClientError> {
     let request_id = Uuid::new_v4();
     match command {
+        MissionCommand::Launch(args) => {
+            let mission_id = parse_canonical_uuid_v4(&args.mission_id)?;
+            let idempotency_key = args
+                .idempotency_key
+                .unwrap_or_else(|| format!("mission-launch:{request_id}"));
+            let request = MissionControlRequest::launch(
+                request_id,
+                idempotency_key,
+                args.expected_revision,
+                MissionLaunchBody {
+                    mission_id,
+                    workspace: args.workspace,
+                    binary: args.binary,
+                },
+            )
+            .map_err(ClientError::InvalidArgument)?;
+            Ok((request, args.json))
+        }
+        MissionCommand::Observe(args) => {
+            let mission_id = parse_canonical_uuid_v4(&args.mission_id)?;
+            let request = MissionControlRequest::observe(request_id, mission_id)
+                .map_err(ClientError::InvalidArgument)?;
+            Ok((request, args.json))
+        }
+        MissionCommand::Close(args) => {
+            let mission_id = parse_canonical_uuid_v4(&args.mission_id)?;
+            let idempotency_key = args
+                .idempotency_key
+                .unwrap_or_else(|| format!("mission-close:{request_id}"));
+            let request = MissionControlRequest::close(
+                request_id,
+                idempotency_key,
+                args.expected_revision,
+                mission_id,
+            )
+            .map_err(ClientError::InvalidArgument)?;
+            Ok((request, args.json))
+        }
         MissionCommand::Create(args) => {
             let deadline_at = args
                 .deadline

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{SecondsFormat, Utc};
@@ -102,7 +103,7 @@ pub struct MissionCommandError {
 }
 
 impl MissionCommandError {
-    fn invalid_args(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_args(message: impl Into<String>) -> Self {
         Self {
             code: MissionCommandErrorCode::InvalidArgs,
             message: message.into(),
@@ -116,7 +117,7 @@ impl MissionCommandError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             code: MissionCommandErrorCode::InternalError,
             message: message.into(),
@@ -128,17 +129,203 @@ impl MissionCommandError {
 pub struct MissionService {
     store: Arc<Mutex<StateStore>>,
     verifier: Arc<dyn SessionVerifier>,
+    fail_next_terminal_persist: Arc<AtomicBool>,
 }
 
 impl MissionService {
     #[must_use]
     pub fn new(store: Arc<Mutex<StateStore>>, verifier: Arc<dyn SessionVerifier>) -> Self {
-        Self { store, verifier }
+        Self {
+            store,
+            verifier,
+            fail_next_terminal_persist: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_terminal_persist(&self) {
+        self.fail_next_terminal_persist
+            .store(true, Ordering::SeqCst);
     }
 
     #[must_use]
     pub fn production(store: Arc<Mutex<StateStore>>) -> Self {
         Self::new(store, Arc::new(AttestationSessionVerifier))
+    }
+
+    pub(crate) fn authenticate(
+        &self,
+        token: Option<&str>,
+    ) -> Result<VerifiedSession, MissionCommandError> {
+        let token = token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(MissionCommandError::permission_denied)?;
+        self.verifier.verify(token).map_err(|err| {
+            tracing::warn!(error = %err, "mission caller attestation denied");
+            MissionCommandError::permission_denied()
+        })
+    }
+
+    pub(crate) fn visible_mission(
+        &self,
+        mission_id: &str,
+        caller: &VerifiedSession,
+    ) -> Result<lanyte_mission::MissionRecord, MissionCommandError> {
+        Ok(self.visible_projection(mission_id, caller)?.mission)
+    }
+
+    pub(crate) fn visible_projection(
+        &self,
+        mission_id: &str,
+        caller: &VerifiedSession,
+    ) -> Result<lanyte_state::StoredMissionProjection, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .mission(mission_id)
+            .map_err(map_state_error)?
+            .filter(|projection| visible_to(&projection.mission, caller))
+            .ok_or_else(MissionCommandError::permission_denied)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn persist_update(
+        &self,
+        expected_revision: u64,
+        mission: lanyte_mission::MissionRecord,
+        receipt: lanyte_state::NewMissionProjectionReceipt,
+    ) -> Result<lanyte_state::MissionProjectionWrite, MissionCommandError> {
+        Ok(self
+            .persist_update_events(expected_revision, mission, vec![receipt], None)?
+            .write)
+    }
+
+    pub(crate) fn persist_update_events(
+        &self,
+        expected_revision: u64,
+        mission: lanyte_mission::MissionRecord,
+        receipts: Vec<lanyte_state::NewMissionProjectionReceipt>,
+        idempotency: Option<lanyte_state::MissionMutationIdempotency>,
+    ) -> Result<lanyte_state::IdempotentMissionWrite, MissionCommandError> {
+        for receipt in &receipts {
+            receipt
+                .event
+                .validate()
+                .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
+        }
+        if mission.phase.is_terminal()
+            && self
+                .fail_next_terminal_persist
+                .swap(false, Ordering::SeqCst)
+        {
+            return Err(MissionCommandError::internal(
+                "injected terminal persist failure",
+            ));
+        }
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .update_mission_with_events(expected_revision, mission, receipts, idempotency)
+            .map_err(|err| match err {
+                lanyte_state::StateError::MissionIdempotencyConflict { .. } => {
+                    MissionCommandError::invalid_args(
+                        "idempotency key conflicts with a prior mutation",
+                    )
+                }
+                other => MissionCommandError::internal(other.to_string()),
+            })
+    }
+
+    pub(crate) fn lifecycle_history(
+        &self,
+        mission_id: &str,
+    ) -> Result<Vec<lanyte_mission::LifecycleEvent>, MissionCommandError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?;
+        let records = store
+            .audit_records(mission_id)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        records
+            .into_iter()
+            .filter(|record| record.kind == lanyte_telemetry::AuditRecordKind::MissionEvent)
+            .map(|record| {
+                serde_json::from_value(record.payload)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))
+            })
+            .collect()
+    }
+
+    pub(crate) fn completed_mutation(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<Option<String>, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .completed_mutation(key, fingerprint)
+            .map_err(|err| match err {
+                lanyte_state::StateError::MissionIdempotencyConflict { .. } => {
+                    MissionCommandError::invalid_args(
+                        "idempotency key conflicts with a prior mutation",
+                    )
+                }
+                other => MissionCommandError::internal(other.to_string()),
+            })
+    }
+
+    pub(crate) fn renew_mutation(
+        &self,
+        key: &str,
+        owner_token: &str,
+    ) -> Result<(), MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .renew_mutation(key, owner_token)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))
+    }
+
+    pub(crate) fn reserve_mutation(
+        &self,
+        mission_id: &str,
+        idempotency: &lanyte_state::MissionMutationIdempotency,
+    ) -> Result<lanyte_state::MutationReserve, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .reserve_mutation(mission_id, idempotency)
+            .map_err(|err| match err {
+                lanyte_state::StateError::MissionIdempotencyConflict { .. } => {
+                    MissionCommandError::invalid_args(
+                        "idempotency key conflicts with a prior mutation",
+                    )
+                }
+                other => MissionCommandError::internal(other.to_string()),
+            })
+    }
+
+    pub(crate) fn release_mutation(
+        &self,
+        key: &str,
+        owner_token: &str,
+    ) -> Result<(), MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .release_mutation(key, owner_token)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))
+    }
+
+    pub(crate) fn state_paths(&self) -> Result<lanyte_state::StatePaths, MissionCommandError> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .paths()
+            .clone())
     }
 
     pub fn handle(
@@ -216,17 +403,17 @@ impl MissionService {
                 )
                 .map_err(MissionCommandError::internal)
             }
+            MissionControlRequest::Launch { .. }
+            | MissionControlRequest::Observe { .. }
+            | MissionControlRequest::Close { .. } => Err(MissionCommandError::invalid_args(
+                "launch, observe, and close are kernel-owned and cannot use the sync control path",
+            )),
         }
     }
 }
 
-fn build_created_mission(
-    caller: &VerifiedSession,
-    body: lanyte_mission::MissionCreateBody,
-) -> Result<(MissionRecord, NewMissionProjectionReceipt), String> {
-    let now = Utc::now();
-    let mission_id = Uuid::new_v4();
-    let principal = Principal {
+pub(crate) fn caller_principal(caller: &VerifiedSession) -> Principal {
+    Principal {
         kind: PrincipalKind::AttestedSession,
         subject: caller.subject.clone(),
         role: Some(caller.role.clone()),
@@ -240,7 +427,16 @@ fn build_created_mission(
             verification_policy_sha256: caller.verification_policy_sha256.clone(),
             trust_ref: caller.trust_ref.clone(),
         }),
-    };
+    }
+}
+
+fn build_created_mission(
+    caller: &VerifiedSession,
+    body: lanyte_mission::MissionCreateBody,
+) -> Result<(MissionRecord, NewMissionProjectionReceipt), String> {
+    let now = Utc::now();
+    let mission_id = Uuid::new_v4();
+    let principal = caller_principal(caller);
     let mission = MissionRecord {
         mission_schema: MISSION_RECORD_SCHEMA.to_owned(),
         mission_id,
@@ -480,7 +676,9 @@ mod tests {
                 assert_eq!(operation, "mission.create");
                 *record
             }
-            MissionControlResult::List { .. } => panic!("expected record result"),
+            MissionControlResult::List { .. }
+            | MissionControlResult::Observe { .. }
+            | MissionControlResult::Close { .. } => panic!("expected record result"),
         }
     }
 
@@ -575,7 +773,9 @@ mod tests {
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].mission_id, created.mission_id);
             }
-            MissionControlResult::Record { .. } => panic!("expected list result"),
+            MissionControlResult::Record { .. }
+            | MissionControlResult::Observe { .. }
+            | MissionControlResult::Close { .. } => panic!("expected list result"),
         }
 
         let hidden = service
@@ -607,7 +807,9 @@ mod tests {
                 assert_eq!(operation, "mission.show");
                 assert_eq!(*record, created);
             }
-            MissionControlResult::List { .. } => panic!("expected record result"),
+            MissionControlResult::List { .. }
+            | MissionControlResult::Observe { .. }
+            | MissionControlResult::Close { .. } => panic!("expected record result"),
         }
 
         let database = std::fs::read(paths.hot_db_path()).expect("read hot database");
