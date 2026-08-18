@@ -550,28 +550,31 @@ impl StateStore {
                         key: idempotency.key.clone(),
                     });
                 }
-                let projection =
-                    load_mission_projection_tx(&tx, &mission_id)?.ok_or_else(|| {
-                        StateError::InvalidMissionProjection(
-                            "idempotency binding references a missing mission projection"
-                                .to_owned(),
-                        )
-                    })?;
-                let receipt =
-                    load_audit_record_tx(&tx, &projection.audit_entry_id)?.ok_or_else(|| {
-                        StateError::InvalidMissionProjection(
-                            "idempotency binding references a missing mission receipt".to_owned(),
-                        )
-                    })?;
-                tx.commit()?;
-                return Ok(IdempotentMissionWrite {
-                    write: MissionProjectionWrite {
-                        projection,
-                        receipt,
-                    },
-                    replayed: true,
-                    replayed_result_json: Some(stored_result),
-                });
+                if !stored_result.is_empty() {
+                    let projection =
+                        load_mission_projection_tx(&tx, &mission_id)?.ok_or_else(|| {
+                            StateError::InvalidMissionProjection(
+                                "idempotency binding references a missing mission projection"
+                                    .to_owned(),
+                            )
+                        })?;
+                    let receipt = load_audit_record_tx(&tx, &projection.audit_entry_id)?
+                        .ok_or_else(|| {
+                            StateError::InvalidMissionProjection(
+                                "idempotency binding references a missing mission receipt"
+                                    .to_owned(),
+                            )
+                        })?;
+                    tx.commit()?;
+                    return Ok(IdempotentMissionWrite {
+                        write: MissionProjectionWrite {
+                            projection,
+                            receipt,
+                        },
+                        replayed: true,
+                        replayed_result_json: Some(stored_result),
+                    });
+                }
             }
         }
 

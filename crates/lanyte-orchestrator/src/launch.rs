@@ -190,18 +190,6 @@ impl Orchestrator {
                 "body": body,
             }),
         )?;
-        let reservation = lanyte_state::MissionMutationIdempotency {
-            key: idempotency_key.clone(),
-            request_fingerprint: fingerprint.clone(),
-            operation: "mission.launch".to_owned(),
-            result_json: String::new(),
-        };
-        if let Some(replayed) =
-            service.reserve_mutation(&body.mission_id.to_string(), &reservation)?
-        {
-            let _ = service.visible_projection(&body.mission_id.to_string(), &caller)?;
-            return replayed_control_result(&replayed);
-        }
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
         let before = stored.mission.clone();
         if before.revision != expected_revision {
@@ -215,6 +203,18 @@ impl Orchestrator {
                 "mission.launch requires a created mission with no live attempt",
             ));
         }
+        let reservation = lanyte_state::MissionMutationIdempotency {
+            key: idempotency_key.clone(),
+            request_fingerprint: fingerprint.clone(),
+            operation: "mission.launch".to_owned(),
+            result_json: String::new(),
+        };
+        if let Some(replayed) =
+            service.reserve_mutation(&body.mission_id.to_string(), &reservation)?
+        {
+            return replayed_control_result(&replayed);
+        }
+        let mut reservation_guard = ReservationGuard::new(service, &idempotency_key, &fingerprint);
         let paths = service.state_paths()?;
         let workspace = confine_workspace(
             PathBuf::from(&body.workspace).as_path(),
@@ -243,13 +243,15 @@ impl Orchestrator {
             )
             .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         let attempt_id = Uuid::new_v4();
-        let session = match driver.create(attempt_id).await {
-            Ok(session) => session,
-            Err(err) => {
-                let _ = service.release_mutation(&idempotency_key, &fingerprint);
-                return Err(MissionCommandError::internal(err.to_string()));
-            }
-        };
+        let session = driver
+            .create(attempt_id)
+            .await
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        if session.binary.digest != report.validity_condition.executable_sha256 {
+            return Err(MissionCommandError::internal(
+                "pinned executable digest does not match the gated capability report",
+            ));
+        }
         let now = Utc::now();
         let authorizer = caller_principal(&caller);
         let mut mission = before.clone();
@@ -257,7 +259,7 @@ impl Orchestrator {
         mission.updated_at = now;
         mission.phase = MissionPhase::Active;
         mission.authorizer = Some(authorizer.clone());
-        mission.authorization_ref = Some(caller.trust_ref.clone());
+        mission.authorization_ref = Some(format!("mission.launch/{request_id}"));
         mission.harness_selection = Some(HarnessSelection {
             harness_id: "codex".to_owned(),
             driver_id: CODEX_DRIVER_ID.to_owned(),
@@ -300,9 +302,10 @@ impl Orchestrator {
         let report_path = paths
             .pin_dir()
             .join(format!("{}.capability.json", session.binary.digest));
-        if let Ok(encoded) = serde_json::to_string(&report) {
-            let _ = std::fs::write(&report_path, encoded);
-        }
+        let encoded = serde_json::to_string(&report)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        std::fs::write(&report_path, encoded)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
         let payloads = vec![
             (
                 EventSourceKind::OperatorCommand,
@@ -310,7 +313,7 @@ impl Orchestrator {
                     authorizer: PrincipalRef {
                         kind: authorizer.kind,
                         subject: authorizer.subject.clone(),
-                        attestation_ref: caller.trust_ref.clone(),
+                        attestation_ref: format!("mission.launch/{request_id}"),
                     },
                 },
             ),
@@ -339,6 +342,42 @@ impl Orchestrator {
                     generation: 1,
                     driver_id: CODEX_DRIVER_ID.to_owned(),
                     capability: CapabilityName::Create,
+                    availability: report.availability,
+                    fidelity: lanyte_mission::CapabilityFidelity::Native,
+                    report_id: report.report_id,
+                },
+            ),
+            (
+                EventSourceKind::DriverReported,
+                LifecyclePayload::DriverCapabilityEvaluated {
+                    attempt_id,
+                    generation: 1,
+                    driver_id: CODEX_DRIVER_ID.to_owned(),
+                    capability: CapabilityName::Identify,
+                    availability: report.availability,
+                    fidelity: lanyte_mission::CapabilityFidelity::Native,
+                    report_id: report.report_id,
+                },
+            ),
+            (
+                EventSourceKind::DriverReported,
+                LifecyclePayload::DriverCapabilityEvaluated {
+                    attempt_id,
+                    generation: 1,
+                    driver_id: CODEX_DRIVER_ID.to_owned(),
+                    capability: CapabilityName::Observe,
+                    availability: report.availability,
+                    fidelity: lanyte_mission::CapabilityFidelity::Native,
+                    report_id: report.report_id,
+                },
+            ),
+            (
+                EventSourceKind::DriverReported,
+                LifecyclePayload::DriverCapabilityEvaluated {
+                    attempt_id,
+                    generation: 1,
+                    driver_id: CODEX_DRIVER_ID.to_owned(),
+                    capability: CapabilityName::Close,
                     availability: report.availability,
                     fidelity: lanyte_mission::CapabilityFidelity::Native,
                     report_id: report.report_id,
@@ -381,6 +420,7 @@ impl Orchestrator {
         }
 
         live_sessions().lock().await.insert(attempt_id, session);
+        reservation_guard.disarm();
         Ok(result)
     }
 
@@ -466,6 +506,19 @@ impl Orchestrator {
                 "mission_id": body.mission_id,
             }),
         )?;
+        let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
+        let before = stored.mission.clone();
+        if before.revision != expected_revision {
+            return Err(MissionCommandError::invalid_args(format!(
+                "stale mission revision: expected {expected_revision}, actual {}",
+                before.revision
+            )));
+        }
+        if before.phase != MissionPhase::Active {
+            return Err(MissionCommandError::invalid_args(
+                "mission.close requires an active mission",
+            ));
+        }
         let reservation = lanyte_state::MissionMutationIdempotency {
             key: idempotency_key.clone(),
             request_fingerprint: fingerprint.clone(),
@@ -475,20 +528,44 @@ impl Orchestrator {
         if let Some(replayed) =
             service.reserve_mutation(&body.mission_id.to_string(), &reservation)?
         {
-            let _ = service.visible_projection(&body.mission_id.to_string(), &caller)?;
             return replayed_control_result(&replayed);
         }
-        let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
-        let before = stored.mission.clone();
-        if before.revision != expected_revision {
-            return Err(MissionCommandError::invalid_args(format!(
-                "stale mission revision: expected {expected_revision}, actual {}",
-                before.revision
-            )));
-        }
+        let mut reservation_guard = ReservationGuard::new(service, &idempotency_key, &fingerprint);
         let attempt_id = before
             .current_attempt_id
             .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
+        let now = Utc::now();
+        let mut cancelling = before.clone();
+        cancelling.revision = expected_revision + 1;
+        cancelling.updated_at = now;
+        if let Some(attempt) = cancelling
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.attempt_id == attempt_id)
+        {
+            attempt.state = AttemptState::Cancelling;
+        }
+        let cancelling_receipts = chain_receipts(
+            &service.lifecycle_history(&body.mission_id.to_string())?,
+            &cancelling,
+            &caller,
+            vec![(
+                EventSourceKind::OperatorCommand,
+                LifecyclePayload::AttemptStateChanged {
+                    attempt_id,
+                    generation: 1,
+                    from: AttemptState::Running,
+                    to: AttemptState::Cancelling,
+                    reason: Some("operator close".to_owned()),
+                },
+            )],
+        )?;
+        service.persist_update_events(
+            expected_revision,
+            cancelling.clone(),
+            cancelling_receipts,
+            None,
+        )?;
         let mut sessions = live_sessions().lock().await;
         {
             let session = sessions.get_mut(&attempt_id).ok_or_else(|| {
@@ -503,8 +580,8 @@ impl Orchestrator {
         }
 
         let now = Utc::now();
-        let mut mission = before.clone();
-        mission.revision = expected_revision + 1;
+        let mut mission = cancelling.clone();
+        mission.revision = expected_revision + 2;
         mission.updated_at = now;
         mission.phase = MissionPhase::Cancelled;
         mission.terminal_reason = Some(MissionTerminalReason::OperatorCancelled);
@@ -514,16 +591,16 @@ impl Orchestrator {
             .iter_mut()
             .find(|attempt| attempt.attempt_id == attempt_id)
         {
-            attempt.state = AttemptState::Completed;
+            attempt.state = AttemptState::Cancelled;
             attempt.ended_at = Some(now);
             attempt.terminal_reason = Some(AttemptTerminalReason::OperatorCancelled);
         }
         MissionTransition {
-            expected_revision,
+            expected_revision: expected_revision + 1,
             from: MissionPhase::Active,
             to: MissionPhase::Cancelled,
         }
-        .check(&before, &mission)
+        .check(&cancelling, &mission)
         .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
 
         let history = service.lifecycle_history(&body.mission_id.to_string())?;
@@ -533,8 +610,8 @@ impl Orchestrator {
                 LifecyclePayload::AttemptStateChanged {
                     attempt_id,
                     generation: 1,
-                    from: AttemptState::Running,
-                    to: AttemptState::Completed,
+                    from: AttemptState::Cancelling,
+                    to: AttemptState::Cancelled,
                     reason: Some("operator close".to_owned()),
                 },
             ),
@@ -577,7 +654,7 @@ impl Orchestrator {
         )
         .map_err(MissionCommandError::internal)?;
         service.persist_update_events(
-            expected_revision,
+            expected_revision + 1,
             mission,
             receipts,
             Some(lanyte_state::MissionMutationIdempotency {
@@ -589,6 +666,7 @@ impl Orchestrator {
             }),
         )?;
         sessions.remove(&attempt_id);
+        reservation_guard.disarm();
         Ok(result)
     }
 }
@@ -719,6 +797,36 @@ fn replayed_control_result(json: &str) -> Result<MissionControlResult, MissionCo
         other => Err(MissionCommandError::internal(format!(
             "unsupported replayed operation: {other:?}"
         ))),
+    }
+}
+
+struct ReservationGuard<'a> {
+    service: &'a crate::mission::MissionService,
+    key: String,
+    fingerprint: String,
+    armed: bool,
+}
+
+impl<'a> ReservationGuard<'a> {
+    fn new(service: &'a crate::mission::MissionService, key: &str, fingerprint: &str) -> Self {
+        Self {
+            service,
+            key: key.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.service.release_mutation(&self.key, &self.fingerprint);
+        }
     }
 }
 
