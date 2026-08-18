@@ -1585,6 +1585,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanyte-mission"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "lanyte-orchestrator"
 version = "0.1.0"
 dependencies = [

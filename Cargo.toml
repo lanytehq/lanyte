@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/lanyte-common",
+    "crates/lanyte-mission",
     "crates/lanyte-telemetry",
     "crates/lanyte-gateway",
     "crates/lanyte-state",

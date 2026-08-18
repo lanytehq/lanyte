@@ -1,0 +1,15 @@
+[package]
+name = "lanyte-mission"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
