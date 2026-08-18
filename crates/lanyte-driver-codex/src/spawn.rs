@@ -37,6 +37,7 @@ impl CodexBinary {
         if !path.is_file() {
             return Err(SpawnError::MissingBinary(path.display().to_string()));
         }
+        let path = resolve_native_executable(&path)?;
         let output = Command::new(&path)
             .arg("--version")
             .env_clear()
@@ -128,6 +129,46 @@ pub fn scrub_child_env(workspace: &Path) -> BTreeMap<String, String> {
     env.insert("TERM".to_owned(), "dumb".to_owned());
     env.insert("LANG".to_owned(), "C".to_owned());
     env
+}
+
+fn resolve_native_executable(path: &Path) -> Result<PathBuf, SpawnError> {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if looks_like_native(&resolved) {
+        return Ok(resolved);
+    }
+    if let Some(native) = native_from_npm_wrapper(&resolved) {
+        return Ok(native);
+    }
+    Err(SpawnError::Exec(
+        resolved.display().to_string(),
+        "codex path is a script wrapper, not a pinned native executable".to_owned(),
+    ))
+}
+
+fn looks_like_native(path: &Path) -> bool {
+    !matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "mjs" | "cjs" | "ts")
+    )
+}
+
+fn native_from_npm_wrapper(wrapper: &Path) -> Option<PathBuf> {
+    let package_root = wrapper.parent()?.parent()?;
+    let (package, triple) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("@openai/codex-darwin-arm64", "aarch64-apple-darwin"),
+        ("macos", "x86_64") => ("@openai/codex-darwin-x64", "x86_64-apple-darwin"),
+        ("linux", "aarch64") => ("@openai/codex-linux-arm64", "aarch64-unknown-linux-musl"),
+        ("linux", "x86_64") => ("@openai/codex-linux-x64", "x86_64-unknown-linux-musl"),
+        _ => return None,
+    };
+    let candidate = package_root
+        .join("node_modules")
+        .join(package)
+        .join("vendor")
+        .join(triple)
+        .join("bin")
+        .join("codex");
+    candidate.is_file().then_some(candidate)
 }
 
 fn which(name: &str) -> Option<PathBuf> {

@@ -85,9 +85,10 @@ impl CodexSession {
                     Ok(_) => {
                         if let Some(event) = map_notification(attempt_id, line.trim_end()) {
                             let mut queue = events.lock().await;
-                            if queue.len() < 256 {
-                                queue.push_back(event);
+                            if queue.len() >= 256 {
+                                queue.pop_front();
                             }
+                            queue.push_back(event);
                         }
                     }
                     Err(_) => break,

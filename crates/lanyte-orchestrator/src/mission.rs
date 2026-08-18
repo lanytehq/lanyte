@@ -236,17 +236,15 @@ impl MissionService {
             .collect()
     }
 
-    pub(crate) fn replay_mutation(
+    pub(crate) fn reserve_mutation(
         &self,
-        key: &str,
-        fingerprint: &str,
+        mission_id: &str,
+        idempotency: &lanyte_state::MissionMutationIdempotency,
     ) -> Result<Option<String>, MissionCommandError> {
-        let store = self
-            .store
+        self.store
             .lock()
-            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?;
-        store
-            .replay_mutation(key, fingerprint)
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .reserve_mutation(mission_id, idempotency)
             .map_err(|err| match err {
                 lanyte_state::StateError::MissionIdempotencyConflict { .. } => {
                     MissionCommandError::invalid_args(
@@ -255,6 +253,18 @@ impl MissionService {
                 }
                 other => MissionCommandError::internal(other.to_string()),
             })
+    }
+
+    pub(crate) fn release_mutation(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<(), MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .release_mutation(key, fingerprint)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))
     }
 
     pub(crate) fn state_paths(&self) -> Result<lanyte_state::StatePaths, MissionCommandError> {

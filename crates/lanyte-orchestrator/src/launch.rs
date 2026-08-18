@@ -185,9 +185,21 @@ impl Orchestrator {
         let fingerprint = mutation_fingerprint(
             "mission.launch",
             &caller,
-            &serde_json::to_value(&body).unwrap_or_default(),
+            &serde_json::json!({
+                "expected_revision": expected_revision,
+                "body": body,
+            }),
         )?;
-        if let Some(replayed) = service.replay_mutation(&idempotency_key, &fingerprint)? {
+        let reservation = lanyte_state::MissionMutationIdempotency {
+            key: idempotency_key.clone(),
+            request_fingerprint: fingerprint.clone(),
+            operation: "mission.launch".to_owned(),
+            result_json: String::new(),
+        };
+        if let Some(replayed) =
+            service.reserve_mutation(&body.mission_id.to_string(), &reservation)?
+        {
+            let _ = service.visible_projection(&body.mission_id.to_string(), &caller)?;
             return replayed_control_result(&replayed);
         }
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
@@ -216,8 +228,8 @@ impl Orchestrator {
             binary_path: body.binary.map(PathBuf::from),
         });
         let descriptor = driver.descriptor();
-        driver
-            .capabilities()
+        let report = driver.capabilities();
+        report
             .require_usable_at(
                 Utc::now(),
                 &descriptor,
@@ -231,10 +243,13 @@ impl Orchestrator {
             )
             .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         let attempt_id = Uuid::new_v4();
-        let session = driver
-            .create(attempt_id)
-            .await
-            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        let session = match driver.create(attempt_id).await {
+            Ok(session) => session,
+            Err(err) => {
+                let _ = service.release_mutation(&idempotency_key, &fingerprint);
+                return Err(MissionCommandError::internal(err.to_string()));
+            }
+        };
         let now = Utc::now();
         let authorizer = caller_principal(&caller);
         let mut mission = before.clone();
@@ -282,51 +297,65 @@ impl Orchestrator {
         }
 
         let history = service.lifecycle_history(&body.mission_id.to_string())?;
-        let report = driver.capabilities();
+        let report_path = paths
+            .pin_dir()
+            .join(format!("{}.capability.json", session.binary.digest));
+        if let Ok(encoded) = serde_json::to_string(&report) {
+            let _ = std::fs::write(&report_path, encoded);
+        }
         let payloads = vec![
-            LifecyclePayload::AuthorizationBound {
-                authorizer: PrincipalRef {
-                    kind: authorizer.kind,
-                    subject: authorizer.subject.clone(),
-                    attestation_ref: caller.trust_ref.clone(),
+            (
+                EventSourceKind::OperatorCommand,
+                LifecyclePayload::AuthorizationBound {
+                    authorizer: PrincipalRef {
+                        kind: authorizer.kind,
+                        subject: authorizer.subject.clone(),
+                        attestation_ref: caller.trust_ref.clone(),
+                    },
                 },
-            },
-            LifecyclePayload::MissionPhaseChanged {
-                from: MissionPhase::Created,
-                to: MissionPhase::Active,
-                reason: Some("codex launch".to_owned()),
-            },
-            LifecyclePayload::AttemptCreated {
-                attempt_id,
-                ordinal: 1,
-                generation: 1,
-                recovery_relation: RecoveryRelation::Initial,
-                predecessor_attempt_id: None,
-            },
-            LifecyclePayload::DriverCapabilityEvaluated {
-                attempt_id,
-                generation: 1,
-                driver_id: CODEX_DRIVER_ID.to_owned(),
-                capability: CapabilityName::Create,
-                availability: report.availability,
-                fidelity: lanyte_mission::CapabilityFidelity::Native,
-                report_id: report.report_id,
-            },
-            LifecyclePayload::AttemptStateChanged {
-                attempt_id,
-                generation: 1,
-                from: AttemptState::Starting,
-                to: AttemptState::Running,
-                reason: Some("thread/start".to_owned()),
-            },
+            ),
+            (
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::MissionPhaseChanged {
+                    from: MissionPhase::Created,
+                    to: MissionPhase::Active,
+                    reason: Some("codex launch".to_owned()),
+                },
+            ),
+            (
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::AttemptCreated {
+                    attempt_id,
+                    ordinal: 1,
+                    generation: 1,
+                    recovery_relation: RecoveryRelation::Initial,
+                    predecessor_attempt_id: None,
+                },
+            ),
+            (
+                EventSourceKind::DriverReported,
+                LifecyclePayload::DriverCapabilityEvaluated {
+                    attempt_id,
+                    generation: 1,
+                    driver_id: CODEX_DRIVER_ID.to_owned(),
+                    capability: CapabilityName::Create,
+                    availability: report.availability,
+                    fidelity: lanyte_mission::CapabilityFidelity::Native,
+                    report_id: report.report_id,
+                },
+            ),
+            (
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::AttemptStateChanged {
+                    attempt_id,
+                    generation: 1,
+                    from: AttemptState::Starting,
+                    to: AttemptState::Running,
+                    reason: Some("thread/start".to_owned()),
+                },
+            ),
         ];
-        let receipts = chain_receipts(
-            &history,
-            &mission,
-            &caller,
-            EventSourceKind::VerifiedAttestation,
-            payloads,
-        )?;
+        let receipts = chain_receipts(&history, &mission, &caller, payloads)?;
         let result = MissionControlResult::launch(
             request_id,
             idempotency_key.clone(),
@@ -432,9 +461,21 @@ impl Orchestrator {
         let fingerprint = mutation_fingerprint(
             "mission.close",
             &caller,
-            &serde_json::json!({ "mission_id": body.mission_id }),
+            &serde_json::json!({
+                "expected_revision": expected_revision,
+                "mission_id": body.mission_id,
+            }),
         )?;
-        if let Some(replayed) = service.replay_mutation(&idempotency_key, &fingerprint)? {
+        let reservation = lanyte_state::MissionMutationIdempotency {
+            key: idempotency_key.clone(),
+            request_fingerprint: fingerprint.clone(),
+            operation: "mission.close".to_owned(),
+            result_json: String::new(),
+        };
+        if let Some(replayed) =
+            service.reserve_mutation(&body.mission_id.to_string(), &reservation)?
+        {
+            let _ = service.visible_projection(&body.mission_id.to_string(), &caller)?;
             return replayed_control_result(&replayed);
         }
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
@@ -449,16 +490,17 @@ impl Orchestrator {
             .current_attempt_id
             .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
         let mut sessions = live_sessions().lock().await;
-        let mut session = sessions.remove(&attempt_id).ok_or_else(|| {
-            MissionCommandError::invalid_args(
-                "codex session is not in this kernel; close will not claim cancellation",
-            )
-        })?;
-        session
-            .close()
-            .await
-            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-        drop(sessions);
+        {
+            let session = sessions.get_mut(&attempt_id).ok_or_else(|| {
+                MissionCommandError::invalid_args(
+                    "codex session is not in this kernel; close will not claim cancellation",
+                )
+            })?;
+            session
+                .close()
+                .await
+                .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        }
 
         let now = Utc::now();
         let mut mission = before.clone();
@@ -486,41 +528,44 @@ impl Orchestrator {
 
         let history = service.lifecycle_history(&body.mission_id.to_string())?;
         let payloads = vec![
-            LifecyclePayload::AttemptStateChanged {
-                attempt_id,
-                generation: 1,
-                from: AttemptState::Running,
-                to: AttemptState::Completed,
-                reason: Some("operator close".to_owned()),
-            },
-            LifecyclePayload::MissionPhaseChanged {
-                from: MissionPhase::Active,
-                to: MissionPhase::Cancelled,
-                reason: Some("operator close".to_owned()),
-            },
-            LifecyclePayload::MissionTerminal {
-                phase: MissionPhase::Cancelled,
-                reason: MissionTerminalReason::OperatorCancelled,
-                terminal_entry_hash: "0".repeat(64),
-            },
+            (
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::AttemptStateChanged {
+                    attempt_id,
+                    generation: 1,
+                    from: AttemptState::Running,
+                    to: AttemptState::Completed,
+                    reason: Some("operator close".to_owned()),
+                },
+            ),
+            (
+                EventSourceKind::OperatorCommand,
+                LifecyclePayload::MissionPhaseChanged {
+                    from: MissionPhase::Active,
+                    to: MissionPhase::Cancelled,
+                    reason: Some("operator close".to_owned()),
+                },
+            ),
+            (
+                EventSourceKind::OperatorCommand,
+                LifecyclePayload::MissionTerminal {
+                    phase: MissionPhase::Cancelled,
+                    reason: MissionTerminalReason::OperatorCancelled,
+                    terminal_entry_hash: "0".repeat(64),
+                },
+            ),
         ];
-        let mut receipts = chain_receipts(
-            &history,
-            &mission,
-            &caller,
-            EventSourceKind::OperatorCommand,
-            payloads.clone(),
-        )?;
+        let mut receipts = chain_receipts(&history, &mission, &caller, payloads)?;
         if let Some(last) = receipts.last_mut() {
+            let digest = last.event.entry_hash.clone();
             if let LifecyclePayload::MissionTerminal {
                 terminal_entry_hash,
                 ..
             } = &mut last.event.payload
             {
-                *terminal_entry_hash = last.event.entry_hash.clone();
+                *terminal_entry_hash = digest.clone();
             }
-            last.event.entry_hash = hash_lifecycle(&last.event)?;
-            mission.terminal_entry_hash = Some(last.event.entry_hash.clone());
+            mission.terminal_entry_hash = Some(digest);
         }
         let _ = payloads;
         let result = MissionControlResult::close(
@@ -543,6 +588,7 @@ impl Orchestrator {
                     .map_err(|err| MissionCommandError::internal(err.to_string()))?,
             }),
         )?;
+        sessions.remove(&attempt_id);
         Ok(result)
     }
 }
@@ -550,10 +596,16 @@ impl Orchestrator {
 fn hash_lifecycle(event: &LifecycleEvent) -> Result<String, MissionCommandError> {
     let mut material = serde_json::to_value(event)
         .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-    material
+    let object = material
         .as_object_mut()
-        .ok_or_else(|| MissionCommandError::internal("lifecycle event was not an object"))?
-        .remove("entry_hash");
+        .ok_or_else(|| MissionCommandError::internal("lifecycle event was not an object"))?;
+    object.remove("entry_hash");
+    if let Some(payload) = object
+        .get_mut("payload")
+        .and_then(|value| value.as_object_mut())
+    {
+        payload.remove("terminal_entry_hash");
+    }
     Ok(format!(
         "{:x}",
         Sha256::digest(material.to_string().as_bytes())
@@ -564,14 +616,13 @@ fn chain_receipts(
     history: &[LifecycleEvent],
     mission: &lanyte_mission::MissionRecord,
     caller: &crate::mission::VerifiedSession,
-    source_kind: EventSourceKind,
-    payloads: Vec<LifecyclePayload>,
+    payloads: Vec<(EventSourceKind, LifecyclePayload)>,
 ) -> Result<Vec<NewMissionProjectionReceipt>, MissionCommandError> {
     let mut previous = history.last().map(|event| event.entry_hash.clone());
     let mut sequence = u64::try_from(history.len() + 1)
         .map_err(|_| MissionCommandError::internal("lifecycle sequence overflow"))?;
     let mut receipts = Vec::new();
-    for payload in payloads {
+    for (source_kind, payload) in payloads {
         let event_id = Uuid::new_v4();
         let mut event = LifecycleEvent {
             event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
@@ -678,7 +729,12 @@ fn mutation_fingerprint(
 ) -> Result<String, MissionCommandError> {
     let encoded = serde_json::to_string(&serde_json::json!({
         "operation": operation,
-        "caller": caller.subject,
+        "caller": {
+            "issuer": caller.issuer,
+            "subject": caller.subject,
+            "role": caller.role,
+            "scope": caller.scope,
+        },
         "body": body,
     }))
     .map_err(|err| MissionCommandError::internal(err.to_string()))?;

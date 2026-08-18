@@ -365,6 +365,59 @@ impl StateStore {
         SessionEvictor { store: self }
     }
 
+    pub fn reserve_mutation(
+        &mut self,
+        mission_id: &str,
+        idempotency: &MissionMutationIdempotency,
+    ) -> Result<Option<String>> {
+        validate_mission_create_idempotency(&idempotency.key, &idempotency.request_fingerprint)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT request_fingerprint, result_json FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                [&idempotency.key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored, result)) = existing {
+            if stored != idempotency.request_fingerprint {
+                return Err(StateError::MissionIdempotencyConflict {
+                    key: idempotency.key.clone(),
+                });
+            }
+            tx.commit()?;
+            if result.is_empty() {
+                return Err(StateError::InvalidMissionProjection(
+                    "identical mutation is already in flight".to_owned(),
+                ));
+            }
+            return Ok(Some(result));
+        }
+        tx.execute(
+            "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &idempotency.key,
+                &idempotency.request_fingerprint,
+                mission_id,
+                &idempotency.operation,
+                "",
+            ],
+        )?;
+        tx.commit()?;
+        Ok(None)
+    }
+
+    pub fn release_mutation(&mut self, key: &str, fingerprint: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND request_fingerprint = ?2 AND result_json = ''",
+            params![key, fingerprint],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn replay_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
         validate_mission_create_idempotency(key, fingerprint)?;
         let existing: Option<(String, String)> = self
@@ -465,7 +518,10 @@ impl StateStore {
                 .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
             if !matches!(
                 receipt.event.source.kind,
-                EventSourceKind::VerifiedAttestation | EventSourceKind::OperatorCommand
+                EventSourceKind::VerifiedAttestation
+                    | EventSourceKind::OperatorCommand
+                    | EventSourceKind::KernelObserved
+                    | EventSourceKind::DriverReported
             ) {
                 return Err(StateError::InvalidMissionProjection(
                     "update receipt must be authoritative".to_owned(),
@@ -580,19 +636,25 @@ impl StateStore {
         })?;
         tx.execute(
             "UPDATE missions SET receipt_entry_id = ?1, receipt_entry_hash = ?2 WHERE mission_id = ?3",
-            params![&audit.entry_id, &receipts_last_lifecycle_hash(&history), &mission_id],
+            params![&audit.entry_id, &audit.entry_hash, &mission_id],
         )?;
         if let Some(idempotency) = &idempotency {
-            tx.execute(
-                "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    &idempotency.key,
-                    &idempotency.request_fingerprint,
-                    &mission_id,
-                    &idempotency.operation,
-                    &idempotency.result_json,
-                ],
+            let updated = tx.execute(
+                "UPDATE mission_mutations SET result_json = ?1 WHERE idempotency_key = ?2 AND request_fingerprint = ?3",
+                params![&idempotency.result_json, &idempotency.key, &idempotency.request_fingerprint],
             )?;
+            if updated == 0 {
+                tx.execute(
+                    "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        &idempotency.key,
+                        &idempotency.request_fingerprint,
+                        &mission_id,
+                        &idempotency.operation,
+                        &idempotency.result_json,
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(IdempotentMissionWrite {
@@ -600,7 +662,7 @@ impl StateStore {
                 projection: StoredMissionProjection {
                     mission,
                     audit_entry_id: audit.entry_id.clone(),
-                    audit_entry_hash: receipts_last_lifecycle_hash(&history),
+                    audit_entry_hash: audit.entry_hash.clone(),
                 },
                 receipt: audit,
             },
@@ -1296,13 +1358,6 @@ fn load_lifecycle_history_tx(
         events.push(event);
     }
     Ok(events)
-}
-
-fn receipts_last_lifecycle_hash(events: &[LifecycleEvent]) -> String {
-    events
-        .last()
-        .map(|event| event.entry_hash.clone())
-        .unwrap_or_else(|| "0".repeat(64))
 }
 
 fn validate_mission_create_idempotency(key: &str, fingerprint: &str) -> Result<()> {

@@ -37,16 +37,22 @@ async fn launch_observe_close_against_fake_app_server() {
     assert!(!session.harness_session_id.is_empty());
 
     tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut saw_started = false;
     let mut saw_tool = false;
-    for _ in 0..8 {
-        if let Some(NormalizedHarnessEvent::ToolProposed { tool, .. }) =
-            session.observe().await.expect("observe")
-        {
-            saw_tool = tool == "shell";
+    for _ in 0..12 {
+        match session.observe().await.expect("observe") {
+            Some(NormalizedHarnessEvent::Started { .. }) => saw_started = true,
+            Some(NormalizedHarnessEvent::ToolProposed { tool, .. }) if tool == "shell" => {
+                saw_tool = true;
+            }
+            _ => {}
+        }
+        if saw_started && saw_tool {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(saw_started, "expected a started event");
     assert!(saw_tool, "expected a tool proposal from the fake server");
     session.close().await.expect("close");
     let _ = std::fs::remove_dir_all(root);
