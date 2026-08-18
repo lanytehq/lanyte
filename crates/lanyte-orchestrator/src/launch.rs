@@ -1035,7 +1035,10 @@ impl CloseDisposition {
             Some(CloseOutcome::AlreadyExited(status)) => {
                 let (attempt_state, attempt_reason) = if status.success() {
                     if from_state == AttemptState::Cancelling {
-                        (AttemptState::Failed, AttemptTerminalReason::HarnessCompleted)
+                        (
+                            AttemptState::Failed,
+                            AttemptTerminalReason::HarnessCompleted,
+                        )
                     } else {
                         (
                             AttemptState::Completed,
@@ -1230,8 +1233,8 @@ mod close_disposition_tests {
         use std::sync::{Arc, Mutex};
 
         use lanyte_mission::{
-            MissionCreateBody, MissionLaunchBody, MissionPhase, RecoveryPolicy,
-            NormalizedHarnessEvent,
+            MissionCreateBody, MissionLaunchBody, MissionPhase, NormalizedHarnessEvent,
+            RecoveryPolicy,
         };
         use lanyte_state::{StatePaths, StateStore};
 
@@ -1354,7 +1357,10 @@ mod close_disposition_tests {
         );
 
         let midway = service
-            .visible_mission(&created.mission_id.to_string(), &TestVerifier.verify("valid-session-secret").unwrap())
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
             .expect("midway mission");
         assert_eq!(midway.phase, MissionPhase::Active);
         assert_eq!(midway.attempts[0].state, AttemptState::Cancelling);
@@ -1380,9 +1386,7 @@ mod close_disposition_tests {
             panic!("expected close result");
         };
 
-        let caller = TestVerifier
-            .verify("valid-session-secret")
-            .expect("caller");
+        let caller = TestVerifier.verify("valid-session-secret").expect("caller");
         let finished = service
             .visible_mission(&created.mission_id.to_string(), &caller)
             .expect("finished mission");

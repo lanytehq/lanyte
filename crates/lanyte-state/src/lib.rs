@@ -3324,7 +3324,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count reservation");
-        assert_eq!(remaining, 1, "stale release must not drop the current lease");
+        assert_eq!(
+            remaining, 1,
+            "stale release must not drop the current lease"
+        );
 
         store
             .renew_mutation("mutation:reclaim-owner", &current_token)
