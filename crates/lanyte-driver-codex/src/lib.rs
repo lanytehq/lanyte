@@ -55,6 +55,7 @@ pub struct CodexSession {
     child: Child,
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
+    pending: Mutex<Vec<NormalizedHarnessEvent>>,
     next_id: AtomicU64,
 }
 
@@ -64,6 +65,12 @@ impl CodexSession {
     }
 
     pub async fn observe(&mut self) -> Result<Option<NormalizedHarnessEvent>, CodexDriverError> {
+        {
+            let mut pending = self.pending.lock().await;
+            if !pending.is_empty() {
+                return Ok(Some(pending.remove(0)));
+            }
+        }
         let mut stdout = self.stdout.lock().await;
         let mut line = String::new();
         let read = tokio::time::timeout(
@@ -80,11 +87,25 @@ impl CodexSession {
     }
 
     pub async fn close(&mut self) -> Result<(), CodexDriverError> {
-        let _ = self
-            .request("shutdown", json!({}))
-            .await;
+        if !self.harness_session_id.is_empty() {
+            let _ = self
+                .notify(
+                    "thread/unsubscribe",
+                    json!({ "threadId": self.harness_session_id }),
+                )
+                .await;
+        }
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+        Ok(())
+    }
+
+    async fn notify(&self, method: &str, params: Value) -> Result<(), CodexDriverError> {
+        let mut encoded = serde_json::to_string(&json!({"method": method, "params": params}))?;
+        encoded.push('\n');
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(encoded.as_bytes()).await?;
+        stdin.flush().await?;
         Ok(())
     }
 
@@ -115,6 +136,9 @@ impl CodexSession {
                     return Err(CodexProtocolError::Remote(error.to_string()).into());
                 }
                 return Ok(parsed.get("result").cloned().unwrap_or(Value::Null));
+            }
+            if let Some(event) = map_notification(self.attempt_id, line.trim_end()) {
+                self.pending.lock().await.push(event);
             }
         }
     }
@@ -151,9 +175,10 @@ impl CodexAppServerDriver {
             child,
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
+            pending: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
         };
-        let init = session
+        let _ = session
             .request(
                 "initialize",
                 json!({
@@ -165,7 +190,7 @@ impl CodexAppServerDriver {
                 }),
             )
             .await?;
-        let _ = init;
+        session.notify("initialized", json!({})).await?;
         let started = session
             .request(
                 "thread/start",
@@ -180,7 +205,21 @@ impl CodexAppServerDriver {
             .unwrap_or("unknown")
             .to_owned();
         let mut session = session;
-        session.harness_session_id = thread_id;
+        session.harness_session_id = thread_id.clone();
+        {
+            let mut pending = session.pending.lock().await;
+            let already_started = pending
+                .iter()
+                .any(|event| matches!(event, NormalizedHarnessEvent::Started { .. }));
+            if !already_started {
+                pending.push(NormalizedHarnessEvent::Started {
+                    occurred_at: Utc::now(),
+                    attempt_id,
+                    harness_session_id: thread_id,
+                    detail: Some("thread/start".to_owned()),
+                });
+            }
+        }
         Ok(session)
     }
 }
