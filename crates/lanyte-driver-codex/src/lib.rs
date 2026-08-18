@@ -5,10 +5,12 @@ mod protocol;
 mod spawn;
 
 pub use protocol::{map_notification, CodexProtocolError, JsonRpcLine};
-pub use spawn::{scrub_child_env, CodexBinary, CodexLaunchSpec, SpawnError};
+pub use spawn::{confine_workspace, scrub_child_env, CodexBinary, CodexLaunchSpec, SpawnError};
 
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use chrono::Utc;
 use lanyte_mission::{
@@ -54,8 +56,8 @@ pub struct CodexSession {
     pub binary: CodexBinary,
     child: Child,
     stdin: Mutex<ChildStdin>,
-    stdout: Mutex<BufReader<ChildStdout>>,
-    pending: Mutex<Vec<NormalizedHarnessEvent>>,
+    stdout: Option<Mutex<BufReader<ChildStdout>>>,
+    events: Arc<Mutex<VecDeque<NormalizedHarnessEvent>>>,
     next_id: AtomicU64,
 }
 
@@ -65,25 +67,33 @@ impl CodexSession {
     }
 
     pub async fn observe(&mut self) -> Result<Option<NormalizedHarnessEvent>, CodexDriverError> {
-        {
-            let mut pending = self.pending.lock().await;
-            if !pending.is_empty() {
-                return Ok(Some(pending.remove(0)));
+        Ok(self.events.lock().await.pop_front())
+    }
+
+    fn start_observation_pump(&mut self) {
+        let Some(stdout) = self.stdout.take() else {
+            return;
+        };
+        let events = Arc::clone(&self.events);
+        let attempt_id = self.attempt_id;
+        tokio::spawn(async move {
+            let mut stdout = stdout.lock().await;
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Some(event) = map_notification(attempt_id, line.trim_end()) {
+                            let mut queue = events.lock().await;
+                            if queue.len() < 256 {
+                                queue.push_back(event);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
-        }
-        let mut stdout = self.stdout.lock().await;
-        let mut line = String::new();
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            stdout.read_line(&mut line),
-        )
-        .await;
-        match read {
-            Ok(Ok(0)) => Ok(None),
-            Ok(Ok(_)) => Ok(map_notification(self.attempt_id, line.trim_end())),
-            Ok(Err(err)) => Err(err.into()),
-            Err(_) => Ok(None),
-        }
+        });
     }
 
     pub async fn close(&mut self) -> Result<(), CodexDriverError> {
@@ -95,8 +105,13 @@ impl CodexSession {
                 )
                 .await;
         }
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        self.child.start_kill()?;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
+            .await
+            .map_err(|_| CodexDriverError::Timeout)??;
+        if !status.success() && status.code().is_none() {
+            return Ok(());
+        }
         Ok(())
     }
 
@@ -119,7 +134,8 @@ impl CodexSession {
             stdin.write_all(encoded.as_bytes()).await?;
             stdin.flush().await?;
         }
-        let mut stdout = self.stdout.lock().await;
+        let stdout = self.stdout.as_ref().ok_or(CodexDriverError::StdoutClosed)?;
+        let mut stdout = stdout.lock().await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -141,7 +157,7 @@ impl CodexSession {
                 return Ok(parsed.get("result").cloned().unwrap_or(Value::Null));
             }
             if let Some(event) = map_notification(self.attempt_id, line.trim_end()) {
-                self.pending.lock().await.push(event);
+                self.events.lock().await.push_back(event);
             }
         }
     }
@@ -158,17 +174,19 @@ impl CodexAppServerDriver {
     }
 
     pub async fn create(&self, attempt_id: Uuid) -> Result<CodexSession, CodexDriverError> {
-        let binary = CodexBinary::resolve(&self.spec.binary_path, &self.spec.workspace)?;
+        let workspace = confine_workspace(&self.spec.workspace, &self.spec.allowed_root)?;
+        let binary = CodexBinary::resolve(&self.spec.binary_path, &workspace)?
+            .pin_copy(&self.spec.pin_dir)?;
         let mut command = Command::new(&binary.path);
         command
             .args(["app-server"])
-            .current_dir(&self.spec.workspace)
+            .current_dir(&workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .env_clear()
-            .envs(scrub_child_env(&self.spec.workspace));
+            .envs(scrub_child_env(&workspace));
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().ok_or(CodexDriverError::StdinClosed)?;
         let stdout = child.stdout.take().ok_or(CodexDriverError::StdoutClosed)?;
@@ -187,8 +205,8 @@ impl CodexAppServerDriver {
             binary,
             child,
             stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
-            pending: Mutex::new(Vec::new()),
+            stdout: Some(Mutex::new(BufReader::new(stdout))),
+            events: Arc::new(Mutex::new(VecDeque::new())),
             next_id: AtomicU64::new(1),
         };
         if let Err(err) = session
@@ -216,7 +234,7 @@ impl CodexAppServerDriver {
         let started = match session
             .request(
                 "thread/start",
-                json!({ "cwd": self.spec.workspace.display().to_string() }),
+                json!({ "cwd": workspace.display().to_string() }),
             )
             .await
         {
@@ -237,12 +255,12 @@ impl CodexAppServerDriver {
         let mut session = session;
         session.harness_session_id = thread_id.clone();
         {
-            let mut pending = session.pending.lock().await;
-            let already_started = pending
+            let mut events = session.events.lock().await;
+            let already_started = events
                 .iter()
                 .any(|event| matches!(event, NormalizedHarnessEvent::Started { .. }));
             if !already_started {
-                pending.push(NormalizedHarnessEvent::Started {
+                events.push_back(NormalizedHarnessEvent::Started {
                     occurred_at: Utc::now(),
                     attempt_id,
                     harness_session_id: thread_id,
@@ -250,6 +268,7 @@ impl CodexAppServerDriver {
                 });
             }
         }
+        session.start_observation_pump();
         Ok(session)
     }
 }
@@ -300,13 +319,13 @@ impl HarnessDriver for CodexAppServerDriver {
                 observation: ObservationLevel::KernelObserved,
                 enforcement: EnforcementLevel::ProtocolConfirmed,
                 replay: ReplaySupport::None,
-                limitation: None,
+                limitation: Some(format!("codex-cli:{version}")),
                 evidence_ref: Some("probes/codex-app-server".to_owned()),
             })
             .collect(),
             validity_condition: DriverValidityCondition {
                 kind: "executable-version-platform-match".to_owned(),
-                executable_version: version,
+                executable_version: DRIVER_VERSION.to_owned(),
                 executable_sha256: digest,
                 configuration_sha256: format!(
                     "{:x}",

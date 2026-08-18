@@ -4,13 +4,13 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 use chrono::Utc;
-use lanyte_driver_codex::{CodexAppServerDriver, CodexLaunchSpec, CodexSession};
+use lanyte_driver_codex::{confine_workspace, CodexAppServerDriver, CodexLaunchSpec, CodexSession};
 use lanyte_gateway::GatewayEvent;
 use lanyte_mission::{
-    AttemptRecord, AttemptState, AttemptTerminalReason, EventSource, EventSourceKind,
-    HarnessSelection, LifecycleEvent, LifecyclePayload, MissionControlRequest,
-    MissionControlResult, MissionPhase, MissionTerminalReason, MissionTransition, ObservationLevel,
-    RecoveryRelation, LIFECYCLE_EVENT_SCHEMA,
+    AttemptRecord, AttemptState, AttemptTerminalReason, CapabilityName, EventSource,
+    EventSourceKind, HarnessDriver, HarnessSelection, LifecycleEvent, LifecyclePayload,
+    MissionControlRequest, MissionControlResult, MissionPhase, MissionTerminalReason,
+    MissionTransition, ObservationLevel, PrincipalRef, RecoveryRelation, LIFECYCLE_EVENT_SCHEMA,
 };
 use lanyte_state::NewMissionProjectionReceipt;
 use lanyte_telemetry::AuditEnvelopeRef;
@@ -182,6 +182,14 @@ impl Orchestrator {
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
         )?;
+        let fingerprint = mutation_fingerprint(
+            "mission.launch",
+            &caller,
+            &serde_json::to_value(&body).unwrap_or_default(),
+        )?;
+        if let Some(replayed) = service.replay_mutation(&idempotency_key, &fingerprint)? {
+            return replayed_control_result(&replayed);
+        }
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
         let before = stored.mission.clone();
         if before.revision != expected_revision {
@@ -195,16 +203,33 @@ impl Orchestrator {
                 "mission.launch requires a created mission with no live attempt",
             ));
         }
-        let workspace = PathBuf::from(&body.workspace);
-        if !workspace.is_dir() {
-            return Err(MissionCommandError::invalid_args(
-                "workspace must be an existing directory",
-            ));
-        }
+        let paths = service.state_paths()?;
+        let workspace = confine_workspace(
+            PathBuf::from(&body.workspace).as_path(),
+            &paths.workspace_root(),
+        )
+        .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         let driver = CodexAppServerDriver::new(CodexLaunchSpec {
             workspace: workspace.clone(),
+            allowed_root: paths.workspace_root(),
+            pin_dir: paths.pin_dir(),
             binary_path: body.binary.map(PathBuf::from),
         });
+        let descriptor = driver.descriptor();
+        driver
+            .capabilities()
+            .require_usable_at(
+                Utc::now(),
+                &descriptor,
+                std::env::consts::OS,
+                &[
+                    CapabilityName::Create,
+                    CapabilityName::Identify,
+                    CapabilityName::Observe,
+                    CapabilityName::Close,
+                ],
+            )
+            .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         let attempt_id = Uuid::new_v4();
         let session = driver
             .create(attempt_id)
@@ -212,13 +237,12 @@ impl Orchestrator {
             .map_err(|err| MissionCommandError::internal(err.to_string()))?;
         let now = Utc::now();
         let authorizer = caller_principal(&caller);
-        let authorization_ref = format!("authorizations/launch/{attempt_id}");
         let mut mission = before.clone();
         mission.revision = expected_revision + 1;
         mission.updated_at = now;
         mission.phase = MissionPhase::Active;
         mission.authorizer = Some(authorizer.clone());
-        mission.authorization_ref = Some(authorization_ref);
+        mission.authorization_ref = Some(caller.trust_ref.clone());
         mission.harness_selection = Some(HarnessSelection {
             harness_id: "codex".to_owned(),
             driver_id: CODEX_DRIVER_ID.to_owned(),
@@ -257,46 +281,70 @@ impl Orchestrator {
             return Err(MissionCommandError::invalid_args(err.to_string()));
         }
 
-        let event_id = Uuid::new_v4();
-        let mut lifecycle = LifecycleEvent {
-            event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
-            event_id,
-            mission_id: mission.mission_id,
-            sequence: 2,
-            previous_entry_hash: Some(stored.audit_entry_hash.clone()),
-            entry_hash: "0".repeat(64),
-            occurred_at: now,
-            recorded_at: now,
-            event_type: "attempt_created".to_owned(),
-            source: EventSource {
-                kind: EventSourceKind::VerifiedAttestation,
-                subject: caller.subject.clone(),
-                producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-                assurance: ObservationLevel::KernelObserved,
-                evidence_ref: Some(caller.trust_ref.clone()),
+        let history = service.lifecycle_history(&body.mission_id.to_string())?;
+        let report = driver.capabilities();
+        let payloads = vec![
+            LifecyclePayload::AuthorizationBound {
+                authorizer: PrincipalRef {
+                    kind: authorizer.kind,
+                    subject: authorizer.subject.clone(),
+                    attestation_ref: caller.trust_ref.clone(),
+                },
             },
-            payload: LifecyclePayload::AttemptCreated {
+            LifecyclePayload::MissionPhaseChanged {
+                from: MissionPhase::Created,
+                to: MissionPhase::Active,
+                reason: Some("codex launch".to_owned()),
+            },
+            LifecyclePayload::AttemptCreated {
                 attempt_id,
                 ordinal: 1,
                 generation: 1,
                 recovery_relation: RecoveryRelation::Initial,
                 predecessor_attempt_id: None,
             },
-        };
-        lifecycle.entry_hash = hash_lifecycle(&lifecycle)?;
-        if let Err(err) = service.persist_update(
+            LifecyclePayload::DriverCapabilityEvaluated {
+                attempt_id,
+                generation: 1,
+                driver_id: CODEX_DRIVER_ID.to_owned(),
+                capability: CapabilityName::Create,
+                availability: report.availability,
+                fidelity: lanyte_mission::CapabilityFidelity::Native,
+                report_id: report.report_id,
+            },
+            LifecyclePayload::AttemptStateChanged {
+                attempt_id,
+                generation: 1,
+                from: AttemptState::Starting,
+                to: AttemptState::Running,
+                reason: Some("thread/start".to_owned()),
+            },
+        ];
+        let receipts = chain_receipts(
+            &history,
+            &mission,
+            &caller,
+            EventSourceKind::VerifiedAttestation,
+            payloads,
+        )?;
+        let result = MissionControlResult::launch(
+            request_id,
+            idempotency_key.clone(),
             expected_revision,
             mission.clone(),
-            NewMissionProjectionReceipt {
-                event: lifecycle,
-                envelope: AuditEnvelopeRef {
-                    action_id: Some(event_id.to_string()),
-                    correlation_id: Some(mission.mission_id.to_string()),
-                    trust_ref: Some(caller.trust_ref.clone()),
-                    ..AuditEnvelopeRef::default()
-                },
-                verification: None,
-            },
+        )
+        .map_err(MissionCommandError::internal)?;
+        if let Err(err) = service.persist_update_events(
+            expected_revision,
+            mission,
+            receipts,
+            Some(lanyte_state::MissionMutationIdempotency {
+                key: idempotency_key,
+                request_fingerprint: fingerprint,
+                operation: "mission.launch".to_owned(),
+                result_json: serde_json::to_string(&result)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+            }),
         ) {
             let mut session = session;
             let _ = session.close().await;
@@ -304,8 +352,7 @@ impl Orchestrator {
         }
 
         live_sessions().lock().await.insert(attempt_id, session);
-        MissionControlResult::launch(request_id, idempotency_key, expected_revision, mission)
-            .map_err(MissionCommandError::internal)
+        Ok(result)
     }
 
     async fn observe_codex(
@@ -382,6 +429,14 @@ impl Orchestrator {
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
         )?;
+        let fingerprint = mutation_fingerprint(
+            "mission.close",
+            &caller,
+            &serde_json::json!({ "mission_id": body.mission_id }),
+        )?;
+        if let Some(replayed) = service.replay_mutation(&idempotency_key, &fingerprint)? {
+            return replayed_control_result(&replayed);
+        }
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
         let before = stored.mission.clone();
         if before.revision != expected_revision {
@@ -421,41 +476,6 @@ impl Orchestrator {
             attempt.ended_at = Some(now);
             attempt.terminal_reason = Some(AttemptTerminalReason::OperatorCancelled);
         }
-        let event_id = Uuid::new_v4();
-        let mut lifecycle = LifecycleEvent {
-            event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
-            event_id,
-            mission_id: mission.mission_id,
-            sequence: 3,
-            previous_entry_hash: Some(stored.audit_entry_hash.clone()),
-            entry_hash: "0".repeat(64),
-            occurred_at: now,
-            recorded_at: now,
-            event_type: "mission_terminal".to_owned(),
-            source: EventSource {
-                kind: EventSourceKind::OperatorCommand,
-                subject: caller.subject.clone(),
-                producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-                assurance: ObservationLevel::KernelObserved,
-                evidence_ref: Some(caller.trust_ref.clone()),
-            },
-            payload: LifecyclePayload::MissionTerminal {
-                phase: MissionPhase::Cancelled,
-                reason: MissionTerminalReason::OperatorCancelled,
-                terminal_entry_hash: "0".repeat(64),
-            },
-        };
-        let entry_hash = hash_lifecycle(&lifecycle)?;
-        if let LifecyclePayload::MissionTerminal {
-            terminal_entry_hash,
-            ..
-        } = &mut lifecycle.payload
-        {
-            *terminal_entry_hash = entry_hash.clone();
-        }
-        lifecycle.entry_hash = entry_hash.clone();
-        mission.terminal_entry_hash = Some(entry_hash);
-
         MissionTransition {
             expected_revision,
             from: MissionPhase::Active,
@@ -464,29 +484,66 @@ impl Orchestrator {
         .check(&before, &mission)
         .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
 
-        service.persist_update(
-            expected_revision,
-            mission,
-            NewMissionProjectionReceipt {
-                event: lifecycle,
-                envelope: AuditEnvelopeRef {
-                    action_id: Some(event_id.to_string()),
-                    correlation_id: Some(body.mission_id.to_string()),
-                    trust_ref: Some(caller.trust_ref.clone()),
-                    ..AuditEnvelopeRef::default()
-                },
-                verification: None,
+        let history = service.lifecycle_history(&body.mission_id.to_string())?;
+        let payloads = vec![
+            LifecyclePayload::AttemptStateChanged {
+                attempt_id,
+                generation: 1,
+                from: AttemptState::Running,
+                to: AttemptState::Completed,
+                reason: Some("operator close".to_owned()),
             },
+            LifecyclePayload::MissionPhaseChanged {
+                from: MissionPhase::Active,
+                to: MissionPhase::Cancelled,
+                reason: Some("operator close".to_owned()),
+            },
+            LifecyclePayload::MissionTerminal {
+                phase: MissionPhase::Cancelled,
+                reason: MissionTerminalReason::OperatorCancelled,
+                terminal_entry_hash: "0".repeat(64),
+            },
+        ];
+        let mut receipts = chain_receipts(
+            &history,
+            &mission,
+            &caller,
+            EventSourceKind::OperatorCommand,
+            payloads.clone(),
         )?;
-
-        MissionControlResult::close(
+        if let Some(last) = receipts.last_mut() {
+            if let LifecyclePayload::MissionTerminal {
+                terminal_entry_hash,
+                ..
+            } = &mut last.event.payload
+            {
+                *terminal_entry_hash = last.event.entry_hash.clone();
+            }
+            last.event.entry_hash = hash_lifecycle(&last.event)?;
+            mission.terminal_entry_hash = Some(last.event.entry_hash.clone());
+        }
+        let _ = payloads;
+        let result = MissionControlResult::close(
             request_id,
-            idempotency_key,
+            idempotency_key.clone(),
             expected_revision,
             body.mission_id,
             attempt_id,
         )
-        .map_err(MissionCommandError::internal)
+        .map_err(MissionCommandError::internal)?;
+        service.persist_update_events(
+            expected_revision,
+            mission,
+            receipts,
+            Some(lanyte_state::MissionMutationIdempotency {
+                key: idempotency_key,
+                request_fingerprint: fingerprint,
+                operation: "mission.close".to_owned(),
+                result_json: serde_json::to_string(&result)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+            }),
+        )?;
+        Ok(result)
     }
 }
 
@@ -501,4 +558,129 @@ fn hash_lifecycle(event: &LifecycleEvent) -> Result<String, MissionCommandError>
         "{:x}",
         Sha256::digest(material.to_string().as_bytes())
     ))
+}
+
+fn chain_receipts(
+    history: &[LifecycleEvent],
+    mission: &lanyte_mission::MissionRecord,
+    caller: &crate::mission::VerifiedSession,
+    source_kind: EventSourceKind,
+    payloads: Vec<LifecyclePayload>,
+) -> Result<Vec<NewMissionProjectionReceipt>, MissionCommandError> {
+    let mut previous = history.last().map(|event| event.entry_hash.clone());
+    let mut sequence = u64::try_from(history.len() + 1)
+        .map_err(|_| MissionCommandError::internal("lifecycle sequence overflow"))?;
+    let mut receipts = Vec::new();
+    for payload in payloads {
+        let event_id = Uuid::new_v4();
+        let mut event = LifecycleEvent {
+            event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
+            event_id,
+            mission_id: mission.mission_id,
+            sequence,
+            previous_entry_hash: previous.clone(),
+            entry_hash: "0".repeat(64),
+            occurred_at: mission.updated_at,
+            recorded_at: mission.updated_at,
+            event_type: payload.event_type().to_owned(),
+            source: EventSource {
+                kind: source_kind,
+                subject: caller.subject.clone(),
+                producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+                assurance: ObservationLevel::KernelObserved,
+                evidence_ref: Some(caller.trust_ref.clone()),
+            },
+            payload,
+        };
+        event.entry_hash = hash_lifecycle(&event)?;
+        previous = Some(event.entry_hash.clone());
+        sequence += 1;
+        receipts.push(NewMissionProjectionReceipt {
+            event,
+            envelope: AuditEnvelopeRef {
+                action_id: Some(event_id.to_string()),
+                correlation_id: Some(mission.mission_id.to_string()),
+                trust_ref: Some(caller.trust_ref.clone()),
+                ..AuditEnvelopeRef::default()
+            },
+            verification: None,
+        });
+    }
+    Ok(receipts)
+}
+
+fn replayed_control_result(json: &str) -> Result<MissionControlResult, MissionCommandError> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|err| MissionCommandError::internal(err.to_string()))?;
+    let request_id = value
+        .get("request_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| MissionCommandError::internal("replayed result missing request_id"))?;
+    match value.get("operation").and_then(|value| value.as_str()) {
+        Some("mission.launch") => {
+            let record = serde_json::from_value(
+                value
+                    .pointer("/body/record")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+            let key = value
+                .get("idempotency_key")
+                .and_then(|value| value.as_str())
+                .unwrap_or("replayed-launch-key")
+                .to_owned();
+            let expected = value
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            MissionControlResult::launch(request_id, key, expected, record)
+                .map_err(MissionCommandError::internal)
+        }
+        Some("mission.close") => {
+            let mission_id = value
+                .pointer("/body/mission_id")
+                .and_then(|value| value.as_str())
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| {
+                    MissionCommandError::internal("replayed close missing mission_id")
+                })?;
+            let attempt_id = value
+                .pointer("/body/attempt_id")
+                .and_then(|value| value.as_str())
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| {
+                    MissionCommandError::internal("replayed close missing attempt_id")
+                })?;
+            let key = value
+                .get("idempotency_key")
+                .and_then(|value| value.as_str())
+                .unwrap_or("replayed-close-key")
+                .to_owned();
+            let expected = value
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            MissionControlResult::close(request_id, key, expected, mission_id, attempt_id)
+                .map_err(MissionCommandError::internal)
+        }
+        other => Err(MissionCommandError::internal(format!(
+            "unsupported replayed operation: {other:?}"
+        ))),
+    }
+}
+
+fn mutation_fingerprint(
+    operation: &str,
+    caller: &crate::mission::VerifiedSession,
+    body: &serde_json::Value,
+) -> Result<String, MissionCommandError> {
+    let encoded = serde_json::to_string(&serde_json::json!({
+        "operation": operation,
+        "caller": caller.subject,
+        "body": body,
+    }))
+    .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(encoded.as_bytes())))
 }

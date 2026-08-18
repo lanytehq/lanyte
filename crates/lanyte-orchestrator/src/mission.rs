@@ -176,21 +176,94 @@ impl MissionService {
             .ok_or_else(MissionCommandError::permission_denied)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn persist_update(
         &self,
         expected_revision: u64,
         mission: lanyte_mission::MissionRecord,
         receipt: lanyte_state::NewMissionProjectionReceipt,
     ) -> Result<lanyte_state::MissionProjectionWrite, MissionCommandError> {
-        receipt
-            .event
-            .validate()
-            .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
+        Ok(self
+            .persist_update_events(expected_revision, mission, vec![receipt], None)?
+            .write)
+    }
+
+    pub(crate) fn persist_update_events(
+        &self,
+        expected_revision: u64,
+        mission: lanyte_mission::MissionRecord,
+        receipts: Vec<lanyte_state::NewMissionProjectionReceipt>,
+        idempotency: Option<lanyte_state::MissionMutationIdempotency>,
+    ) -> Result<lanyte_state::IdempotentMissionWrite, MissionCommandError> {
+        for receipt in &receipts {
+            receipt
+                .event
+                .validate()
+                .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
+        }
         self.store
             .lock()
             .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
-            .update_mission(expected_revision, mission, receipt)
-            .map_err(|err| MissionCommandError::internal(err.to_string()))
+            .update_mission_with_events(expected_revision, mission, receipts, idempotency)
+            .map_err(|err| match err {
+                lanyte_state::StateError::MissionIdempotencyConflict { .. } => {
+                    MissionCommandError::invalid_args(
+                        "idempotency key conflicts with a prior mutation",
+                    )
+                }
+                other => MissionCommandError::internal(other.to_string()),
+            })
+    }
+
+    pub(crate) fn lifecycle_history(
+        &self,
+        mission_id: &str,
+    ) -> Result<Vec<lanyte_mission::LifecycleEvent>, MissionCommandError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?;
+        let records = store
+            .audit_records(mission_id)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        records
+            .into_iter()
+            .filter(|record| record.kind == lanyte_telemetry::AuditRecordKind::MissionEvent)
+            .map(|record| {
+                serde_json::from_value(record.payload)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))
+            })
+            .collect()
+    }
+
+    pub(crate) fn replay_mutation(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<Option<String>, MissionCommandError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?;
+        store
+            .replay_mutation(key, fingerprint)
+            .map_err(|err| match err {
+                lanyte_state::StateError::MissionIdempotencyConflict { .. } => {
+                    MissionCommandError::invalid_args(
+                        "idempotency key conflicts with a prior mutation",
+                    )
+                }
+                other => MissionCommandError::internal(other.to_string()),
+            })
+    }
+
+    pub(crate) fn state_paths(&self) -> Result<lanyte_state::StatePaths, MissionCommandError> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .paths()
+            .clone())
     }
 
     pub fn handle(

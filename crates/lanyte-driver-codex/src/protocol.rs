@@ -39,7 +39,13 @@ pub fn map_notification(attempt_id: Uuid, line: &str) -> Option<NormalizedHarnes
             harness_session_id: extract_id(&parsed.params).unwrap_or_else(|| "unknown".to_owned()),
             detail: Some(method.to_owned()),
         }),
-        "item/started" | "item/completed" | "tool/called" | "command/started" => {
+        "tool/called" | "command/started" => Some(NormalizedHarnessEvent::ToolProposed {
+            occurred_at: now,
+            attempt_id,
+            tool: extract_tool(&parsed.params).unwrap_or_else(|| method.to_owned()),
+            detail: Some(method.to_owned()),
+        }),
+        "item/started" if is_tool_item(&parsed.params) => {
             Some(NormalizedHarnessEvent::ToolProposed {
                 occurred_at: now,
                 attempt_id,
@@ -47,7 +53,7 @@ pub fn map_notification(attempt_id: Uuid, line: &str) -> Option<NormalizedHarnes
                 detail: Some(method.to_owned()),
             })
         }
-        "thread/exited" | "turn/completed" | "session/completed" => {
+        "thread/exited" | "session/completed" => {
             let failed = parsed
                 .params
                 .as_ref()
@@ -79,9 +85,26 @@ fn extract_tool(params: &Option<Value>) -> Option<String> {
     params
         .get("tool")
         .or_else(|| params.get("name"))
+        .or_else(|| params.pointer("/item/command"))
         .or_else(|| params.pointer("/item/type"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn is_tool_item(params: &Option<Value>) -> bool {
+    let Some(params) = params.as_ref() else {
+        return false;
+    };
+    let item_type = params
+        .pointer("/item/type")
+        .or_else(|| params.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    matches!(
+        item_type,
+        "command_execution" | "tool" | "mcp_tool_call" | "function_call"
+    ) || params.get("tool").is_some()
+        || params.get("name").is_some()
 }
 
 #[cfg(test)]
@@ -108,11 +131,23 @@ mod tests {
     fn maps_tool_and_exit() {
         let attempt = Uuid::nil();
         assert!(matches!(
-            map_notification(attempt, r#"{"method":"item/started","params":{"name":"shell"}}"#),
+            map_notification(
+                attempt,
+                r#"{"method":"item/started","params":{"item":{"type":"command_execution"},"name":"shell"}}"#
+            ),
             Some(NormalizedHarnessEvent::ToolProposed { tool, .. }) if tool == "shell"
         ));
+        assert!(map_notification(
+            attempt,
+            r#"{"method":"item/completed","params":{"item":{"type":"agent_message"}}}"#
+        )
+        .is_none());
+        assert!(map_notification(attempt, r#"{"method":"turn/completed","params":{}}"#).is_none());
         assert!(matches!(
-            map_notification(attempt, r#"{"method":"turn/completed","params":{}}"#),
+            map_notification(
+                attempt,
+                r#"{"method":"thread/exited","params":{"threadId":"thr_1"}}"#
+            ),
             Some(NormalizedHarnessEvent::Exited { success: true, .. })
         ));
     }
