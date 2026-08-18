@@ -374,35 +374,54 @@ impl StateStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<(String, String)> = tx
+        let now = Utc::now();
+        let existing: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT request_fingerprint, result_json FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                "SELECT request_fingerprint, result_json, reserved_at FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
                 [&idempotency.key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((stored, result)) = existing {
+        if let Some((stored, result, reserved_at)) = existing {
             if stored != idempotency.request_fingerprint {
                 return Err(StateError::MissionIdempotencyConflict {
                     key: idempotency.key.clone(),
                 });
             }
-            tx.commit()?;
-            if result.is_empty() {
+            if !result.is_empty() {
+                tx.commit()?;
+                return Ok(Some(result));
+            }
+            let reserved = DateTime::parse_from_rfc3339(&reserved_at)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc));
+            let stale = reserved.is_none_or(|timestamp| {
+                now.signed_duration_since(timestamp) >= chrono::Duration::seconds(60)
+            });
+            if !stale {
                 return Err(StateError::InvalidMissionProjection(
                     "identical mutation is already in flight".to_owned(),
                 ));
             }
-            return Ok(Some(result));
+            tx.execute(
+                "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2",
+                params![
+                    now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                    &idempotency.key
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(None);
         }
         tx.execute(
-            "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 &idempotency.key,
                 &idempotency.request_fingerprint,
                 mission_id,
                 &idempotency.operation,
                 "",
+                now.to_rfc3339_opts(SecondsFormat::Millis, true),
             ],
         )?;
         tx.commit()?;
@@ -648,13 +667,14 @@ impl StateStore {
             )?;
             if updated == 0 {
                 tx.execute(
-                    "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO mission_mutations(idempotency_key, request_fingerprint, mission_id, operation, result_json, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         &idempotency.key,
                         &idempotency.request_fingerprint,
                         &mission_id,
                         &idempotency.operation,
                         &idempotency.result_json,
+                        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                     ],
                 )?;
             }

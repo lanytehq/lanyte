@@ -456,6 +456,11 @@ impl Orchestrator {
         let session = sessions.get_mut(&attempt_id).ok_or_else(|| {
             MissionCommandError::invalid_args("codex session is not in this kernel")
         })?;
+        if session.overflowed() {
+            return Err(MissionCommandError::invalid_args(
+                "observation overflow; oldest events were dropped",
+            ));
+        }
         let mut events = Vec::new();
         while let Some(event) = session
             .observe()
@@ -534,54 +539,63 @@ impl Orchestrator {
         let attempt_id = before
             .current_attempt_id
             .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
-        let now = Utc::now();
-        let mut cancelling = before.clone();
-        cancelling.revision = expected_revision + 1;
-        cancelling.updated_at = now;
-        if let Some(attempt) = cancelling
-            .attempts
-            .iter_mut()
-            .find(|attempt| attempt.attempt_id == attempt_id)
-        {
-            attempt.state = AttemptState::Cancelling;
-        }
-        let cancelling_receipts = chain_receipts(
-            &service.lifecycle_history(&body.mission_id.to_string())?,
-            &cancelling,
-            &caller,
-            vec![(
-                EventSourceKind::OperatorCommand,
-                LifecyclePayload::AttemptStateChanged {
-                    attempt_id,
-                    generation: 1,
-                    from: AttemptState::Running,
-                    to: AttemptState::Cancelling,
-                    reason: Some("operator close".to_owned()),
-                },
-            )],
-        )?;
-        service.persist_update_events(
-            expected_revision,
-            cancelling.clone(),
-            cancelling_receipts,
-            None,
-        )?;
+        let already_cancelling = before.attempts.iter().any(|attempt| {
+            attempt.attempt_id == attempt_id && attempt.state == AttemptState::Cancelling
+        });
+        let (cancelling, terminal_expected) = if already_cancelling {
+            reservation_guard.disarm();
+            (before.clone(), before.revision)
+        } else {
+            let now = Utc::now();
+            let mut cancelling = before.clone();
+            cancelling.revision = expected_revision + 1;
+            cancelling.updated_at = now;
+            if let Some(attempt) = cancelling
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.attempt_id == attempt_id)
+            {
+                attempt.state = AttemptState::Cancelling;
+            }
+            let cancelling_receipts = chain_receipts(
+                &service.lifecycle_history(&body.mission_id.to_string())?,
+                &cancelling,
+                &caller,
+                vec![(
+                    EventSourceKind::OperatorCommand,
+                    LifecyclePayload::AttemptStateChanged {
+                        attempt_id,
+                        generation: 1,
+                        from: AttemptState::Running,
+                        to: AttemptState::Cancelling,
+                        reason: Some("operator close".to_owned()),
+                    },
+                )],
+            )?;
+            service.persist_update_events(
+                expected_revision,
+                cancelling.clone(),
+                cancelling_receipts,
+                None,
+            )?;
+            reservation_guard.disarm();
+            (cancelling, expected_revision + 1)
+        };
         let mut sessions = live_sessions().lock().await;
-        {
-            let session = sessions.get_mut(&attempt_id).ok_or_else(|| {
-                MissionCommandError::invalid_args(
-                    "codex session is not in this kernel; close will not claim cancellation",
-                )
-            })?;
+        if let Some(session) = sessions.get_mut(&attempt_id) {
             session
                 .close()
                 .await
                 .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        } else if !already_cancelling {
+            return Err(MissionCommandError::invalid_args(
+                "codex session is not in this kernel; close will not claim cancellation",
+            ));
         }
 
         let now = Utc::now();
         let mut mission = cancelling.clone();
-        mission.revision = expected_revision + 2;
+        mission.revision = terminal_expected + 1;
         mission.updated_at = now;
         mission.phase = MissionPhase::Cancelled;
         mission.terminal_reason = Some(MissionTerminalReason::OperatorCancelled);
@@ -596,7 +610,7 @@ impl Orchestrator {
             attempt.terminal_reason = Some(AttemptTerminalReason::OperatorCancelled);
         }
         MissionTransition {
-            expected_revision: expected_revision + 1,
+            expected_revision: terminal_expected,
             from: MissionPhase::Active,
             to: MissionPhase::Cancelled,
         }
@@ -654,7 +668,7 @@ impl Orchestrator {
         )
         .map_err(MissionCommandError::internal)?;
         service.persist_update_events(
-            expected_revision + 1,
+            terminal_expected,
             mission,
             receipts,
             Some(lanyte_state::MissionMutationIdempotency {

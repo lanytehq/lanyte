@@ -58,6 +58,7 @@ pub struct CodexSession {
     stdin: Mutex<ChildStdin>,
     stdout: Option<Mutex<BufReader<ChildStdout>>>,
     events: Arc<Mutex<VecDeque<NormalizedHarnessEvent>>>,
+    overflowed: Arc<std::sync::atomic::AtomicBool>,
     next_id: AtomicU64,
 }
 
@@ -70,11 +71,17 @@ impl CodexSession {
         Ok(self.events.lock().await.pop_front())
     }
 
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::SeqCst)
+    }
+
     fn start_observation_pump(&mut self) {
         let Some(stdout) = self.stdout.take() else {
             return;
         };
         let events = Arc::clone(&self.events);
+        let overflowed = Arc::clone(&self.overflowed);
         let attempt_id = self.attempt_id;
         tokio::spawn(async move {
             let mut stdout = stdout.lock().await;
@@ -87,6 +94,7 @@ impl CodexSession {
                             let mut queue = events.lock().await;
                             if queue.len() >= 256 {
                                 queue.pop_front();
+                                overflowed.store(true, Ordering::SeqCst);
                             }
                             queue.push_back(event);
                         }
@@ -208,6 +216,7 @@ impl CodexAppServerDriver {
             stdin: Mutex::new(stdin),
             stdout: Some(Mutex::new(BufReader::new(stdout))),
             events: Arc::new(Mutex::new(VecDeque::new())),
+            overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
         };
         if let Err(err) = session
