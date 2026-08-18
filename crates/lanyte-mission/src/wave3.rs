@@ -12,10 +12,28 @@ use crate::{
 
 type Fence = (uuid::Uuid, u64, u64);
 
+pub fn semantic_violation_codes(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+) -> Vec<&'static str> {
+    wave3_violations(mission, events)
+        .into_iter()
+        .map(|err| err.field)
+        .collect()
+}
+
 pub(crate) fn validate_wave3_semantics(
     mission: &MissionRecord,
     events: &[LifecycleEvent],
 ) -> Result<(), InvariantError> {
+    match wave3_violations(mission, events).into_iter().next() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn wave3_violations(mission: &MissionRecord, events: &[LifecycleEvent]) -> Vec<InvariantError> {
+    let mut violations = Vec::new();
     let lease_enabled = mission.lease_policy.enabled;
     let lease_seconds = mission.lease_policy.lease_seconds;
     let deadman_seconds = mission.lease_policy.deadman_seconds;
@@ -34,6 +52,7 @@ pub(crate) fn validate_wave3_semantics(
     let mut consumed_restarts: HashSet<(uuid::Uuid, u64)> = HashSet::new();
     let mut cancel_state_edges: HashMap<uuid::Uuid, CancelEdge> = HashMap::new();
     let mut cancel_requested_seen = false;
+    let mut non_success_process = false;
 
     for event in events {
         let sequence = event.sequence;
@@ -51,7 +70,8 @@ pub(crate) fn validate_wave3_semantics(
                         && attempt.recovery_relation == *recovery_relation
                         && attempt.predecessor_attempt_id == *predecessor_attempt_id
                 }) {
-                    return sem(
+                    note(
+                        &mut violations,
                         "SEM-T09",
                         "attempt_created must match the attempt record identity",
                     );
@@ -67,7 +87,8 @@ pub(crate) fn validate_wave3_semantics(
                     || event.source.assurance != crate::ObservationLevel::ResourceAttested
                     || event.source.evidence_ref.is_none()
                 {
-                    return sem(
+                    note(
+                        &mut violations,
                         "SEM-A04",
                         "cancel_requested requires attested operator evidence",
                     );
@@ -77,7 +98,11 @@ pub(crate) fn validate_wave3_semantics(
                 {
                     let key = (attempt_id, generation, lease_generation);
                     if cancel_requests.contains_key(&key) {
-                        return sem("SEM-C08", "a fence may emit at most one cancel_requested");
+                        note(
+                            &mut violations,
+                            "SEM-C08",
+                            "a fence may emit at most one cancel_requested",
+                        );
                     }
                     cancel_requests.insert(key, sequence);
                     check_live_lease(
@@ -85,7 +110,8 @@ pub(crate) fn validate_wave3_semantics(
                         &running_leases,
                         Some(attempt_id),
                         Some(lease_generation),
-                    )?;
+                        &mut violations,
+                    );
                 }
             }
             LifecyclePayload::ProtocolCancelAttempted {
@@ -100,7 +126,8 @@ pub(crate) fn validate_wave3_semantics(
                     event.source.kind,
                     EventSourceKind::DriverReported | EventSourceKind::HarnessReported
                 ) {
-                    return sem(
+                    note(
+                        &mut violations,
                         "SEM-P01",
                         "protocol cancel evidence must stay driver/harness",
                     );
@@ -119,7 +146,8 @@ pub(crate) fn validate_wave3_semantics(
                         protocol_proofs
                             .insert((*attempt_id, *generation, *lease_generation), sequence);
                     } else {
-                        return sem(
+                        note(
+                            &mut violations,
                             "SEM-C02",
                             "interrupted proof must bind attempt, lease, thread, and turn",
                         );
@@ -130,7 +158,8 @@ pub(crate) fn validate_wave3_semantics(
                     &running_leases,
                     Some(*attempt_id),
                     Some(*lease_generation),
-                )?;
+                    &mut violations,
+                );
             }
             LifecyclePayload::ProcessTerminationAttempted {
                 attempt_id,
@@ -139,7 +168,8 @@ pub(crate) fn validate_wave3_semantics(
                 outcome,
             } => {
                 if event.source.kind != EventSourceKind::KernelObserved {
-                    return sem(
+                    note(
+                        &mut violations,
                         "SEM-P01",
                         "process membership evidence must be kernel-observed",
                     );
@@ -151,13 +181,21 @@ pub(crate) fn validate_wave3_semantics(
                     })
                 {
                     process_proofs.insert((*attempt_id, *generation, *lease_generation), sequence);
+                } else if matches!(
+                    *outcome,
+                    FallbackCancelOutcome::KillDispatched
+                        | FallbackCancelOutcome::Survivors
+                        | FallbackCancelOutcome::Unknown
+                ) {
+                    non_success_process = true;
                 }
                 check_live_lease(
                     lease_enabled,
                     &running_leases,
                     Some(*attempt_id),
                     Some(*lease_generation),
-                )?;
+                    &mut violations,
+                );
             }
             LifecyclePayload::LeaseStarted {
                 attempt_id,
@@ -169,13 +207,25 @@ pub(crate) fn validate_wave3_semantics(
                 observation_source,
             } => {
                 if !lease_enabled {
-                    return sem("SEM-L04", "lease events require an enabled lease policy");
+                    note(
+                        &mut violations,
+                        "SEM-L04",
+                        "lease events require an enabled lease policy",
+                    );
                 }
                 if event.source.kind != EventSourceKind::KernelObserved {
-                    return sem("SEM-L09", "lease_started must be kernel-observed");
+                    note(
+                        &mut violations,
+                        "SEM-L09",
+                        "lease_started must be kernel-observed",
+                    );
                 }
                 if *observed_at > event.occurred_at || event.occurred_at > event.recorded_at {
-                    return sem("SEM-M02", "lease timestamps cannot move backward");
+                    note(
+                        &mut violations,
+                        "SEM-M02",
+                        "lease timestamps cannot move backward",
+                    );
                 }
                 let created_ok = events.iter().any(|prior| {
                     prior.sequence < event.sequence
@@ -195,16 +245,28 @@ pub(crate) fn validate_wave3_semantics(
                         .get(attempt_id)
                         .is_some_and(|attempt| attempt.generation != *generation)
                 {
-                    return sem("SEM-L11", "lease_started must be the generation-1 anchor");
+                    note(
+                        &mut violations,
+                        "SEM-L11",
+                        "lease_started must be the generation-1 anchor",
+                    );
                 }
                 if let Some(seconds) = lease_seconds {
                     if *lease_expires_at != *observed_at + Duration::seconds(seconds as i64) {
-                        return sem("SEM-L06", "lease deadline must derive from observed_at");
+                        note(
+                            &mut violations,
+                            "SEM-L06",
+                            "lease deadline must derive from observed_at",
+                        );
                     }
                 }
                 if let Some(seconds) = deadman_seconds {
                     if *deadman_at != *observed_at + Duration::seconds(seconds as i64) {
-                        return sem("SEM-L06", "deadman deadline must derive from observed_at");
+                        note(
+                            &mut violations,
+                            "SEM-L06",
+                            "deadman deadline must derive from observed_at",
+                        );
                     }
                 }
                 running_leases.insert(
@@ -232,41 +294,76 @@ pub(crate) fn validate_wave3_semantics(
                 ..
             } => {
                 if !lease_enabled {
-                    return sem("SEM-L04", "lease events require an enabled lease policy");
+                    note(
+                        &mut violations,
+                        "SEM-L04",
+                        "lease events require an enabled lease policy",
+                    );
                 }
                 if event.source.kind != EventSourceKind::KernelObserved {
-                    return sem("SEM-L09", "lease_tick must be kernel-observed");
+                    note(
+                        &mut violations,
+                        "SEM-L09",
+                        "lease_tick must be kernel-observed",
+                    );
                 }
                 if *observed_at > event.occurred_at || event.occurred_at > event.recorded_at {
-                    return sem("SEM-M02", "lease timestamps cannot move backward");
+                    note(
+                        &mut violations,
+                        "SEM-M02",
+                        "lease timestamps cannot move backward",
+                    );
                 }
                 let Some(running) = running_leases.get(attempt_id).cloned() else {
-                    return sem("SEM-L11", "lease_tick requires a lease_started anchor");
+                    note(
+                        &mut violations,
+                        "SEM-L11",
+                        "lease_tick requires a lease_started anchor",
+                    );
+                    continue;
                 };
                 if *prior_lease_generation != running.lease_generation
                     || *prior_lease_expires_at != running.lease_expires_at
                     || *prior_deadman_at != running.deadman_at
                 {
-                    return sem("SEM-L08", "tick prior tuple must match the running lease");
+                    note(
+                        &mut violations,
+                        "SEM-L01",
+                        "tick prior lease_generation is stale",
+                    );
+                    note(
+                        &mut violations,
+                        "SEM-L08",
+                        "tick prior tuple must match the running lease",
+                    );
                 }
                 match kind {
                     LeaseTickKind::Renewed => {
                         if *result_lease_generation != prior_lease_generation + 1 {
-                            return sem("SEM-L01", "renewed ticks must advance lease_generation");
+                            note(
+                                &mut violations,
+                                "SEM-L01",
+                                "renewed ticks must advance lease_generation",
+                            );
                         }
                         if *observation_source == ObservationSource::KernelClock {
-                            return sem("SEM-L09", "kernel clock cannot renew");
+                            note(&mut violations, "SEM-L09", "kernel clock cannot renew");
                         }
                         if *observation_source == ObservationSource::ProcessProbe
                             && *result_lease_expires_at != *prior_lease_expires_at
                         {
-                            return sem("SEM-L06", "process probe may move deadman only");
+                            note(
+                                &mut violations,
+                                "SEM-L06",
+                                "process probe may move deadman only",
+                            );
                         }
                         if let Some(seconds) = deadman_seconds {
                             if *result_deadman_at
                                 != *observed_at + Duration::seconds(seconds as i64)
                             {
-                                return sem(
+                                note(
+                                    &mut violations,
                                     "SEM-L06",
                                     "renewed deadman must derive from observed_at",
                                 );
@@ -280,7 +377,8 @@ pub(crate) fn validate_wave3_semantics(
                                 if *result_lease_expires_at
                                     != *observed_at + Duration::seconds(seconds as i64)
                                 {
-                                    return sem(
+                                    note(
+                                        &mut violations,
                                         "SEM-L06",
                                         "renewed lease deadline must derive from observed_at",
                                     );
@@ -291,7 +389,11 @@ pub(crate) fn validate_wave3_semantics(
                             || (*observation_source != ObservationSource::ProcessProbe
                                 && *result_lease_expires_at > *prior_lease_expires_at);
                         if !moved {
-                            return sem("SEM-L10", "renewed ticks must move a permitted clock");
+                            note(
+                                &mut violations,
+                                "SEM-L10",
+                                "renewed ticks must move a permitted clock",
+                            );
                         }
                         running_leases.insert(
                             *attempt_id,
@@ -309,10 +411,18 @@ pub(crate) fn validate_wave3_semantics(
                             || *prior_lease_expires_at != *result_lease_expires_at
                             || *prior_deadman_at != *result_deadman_at
                         {
-                            return sem("SEM-L08", "fire/expire ticks cannot rewrite clocks");
+                            note(
+                                &mut violations,
+                                "SEM-L08",
+                                "fire/expire ticks cannot rewrite clocks",
+                            );
                         }
                         if *observation_source != ObservationSource::KernelClock {
-                            return sem("SEM-L09", "fire/expire ticks are kernel-clock only");
+                            note(
+                                &mut violations,
+                                "SEM-L09",
+                                "fire/expire ticks are kernel-clock only",
+                            );
                         }
                         let deadline = if *kind == LeaseTickKind::DeadmanFired {
                             running.deadman_at
@@ -320,11 +430,19 @@ pub(crate) fn validate_wave3_semantics(
                             running.lease_expires_at
                         };
                         if event.occurred_at < deadline {
-                            return sem("SEM-L07", "fire/expire cannot occur before the deadline");
+                            note(
+                                &mut violations,
+                                "SEM-L07",
+                                "fire/expire cannot occur before the deadline",
+                            );
                         }
                         let edge = (*attempt_id, running.lease_generation, *kind, deadline);
                         if !consumed_timer_edges.insert(edge) {
-                            return sem("SEM-L10", "fire/expire edges cannot be emitted twice");
+                            note(
+                                &mut violations,
+                                "SEM-L10",
+                                "fire/expire edges cannot be emitted twice",
+                            );
                         }
                     }
                 }
@@ -336,13 +454,22 @@ pub(crate) fn validate_wave3_semantics(
                 ..
             } => {
                 if !lease_enabled {
-                    return sem("SEM-L04", "lease events require an enabled lease policy");
+                    note(
+                        &mut violations,
+                        "SEM-L04",
+                        "lease events require an enabled lease policy",
+                    );
                 }
                 if event.source.kind != EventSourceKind::KernelObserved {
-                    return sem("SEM-L09", "restart_reconciled must be kernel-observed");
+                    note(
+                        &mut violations,
+                        "SEM-L09",
+                        "restart_reconciled must be kernel-observed",
+                    );
                 }
                 if !*overdue {
-                    return sem(
+                    note(
+                        &mut violations,
                         "SEM-L07",
                         "restart_reconciled exists only for overdue restarts",
                     );
@@ -352,13 +479,15 @@ pub(crate) fn validate_wave3_semantics(
                     &running_leases,
                     Some(*attempt_id),
                     Some(*lease_generation),
-                )?;
+                    &mut violations,
+                );
                 let generation = running_leases
                     .get(attempt_id)
                     .map(|running| running.lease_generation)
                     .unwrap_or(*lease_generation);
                 if !consumed_restarts.insert((*attempt_id, generation)) {
-                    return sem(
+                    note(
+                        &mut violations,
                         "SEM-L03",
                         "at most one overdue restart per lease generation",
                     );
@@ -367,7 +496,11 @@ pub(crate) fn validate_wave3_semantics(
                     if event.occurred_at < running.deadman_at
                         && event.occurred_at < running.lease_expires_at
                     {
-                        return sem("SEM-L07", "overdue restart must be at or after a deadline");
+                        note(
+                            &mut violations,
+                            "SEM-L07",
+                            "overdue restart must be at or after a deadline",
+                        );
                     }
                 }
             }
@@ -383,7 +516,8 @@ pub(crate) fn validate_wave3_semantics(
                     AttemptState::Crashed | AttemptState::TimedOut | AttemptState::Lost
                 ) && *cause == Some(AttemptStateCause::DeadmanSilence)
                 {
-                    return sem(
+                    note(
+                        &mut violations,
                         "SEM-C05",
                         "deadman silence cannot fold crashed/timed_out/lost",
                     );
@@ -404,8 +538,10 @@ pub(crate) fn validate_wave3_semantics(
         }
     }
 
-    let wave3_cancel =
-        cancel_requested_seen || !protocol_proofs.is_empty() || !process_proofs.is_empty();
+    let wave3_cancel = cancel_requested_seen
+        || !protocol_proofs.is_empty()
+        || !process_proofs.is_empty()
+        || non_success_process;
     for attempt in attempts.values() {
         if !wave3_cancel || attempt.state != AttemptState::Cancelled {
             continue;
@@ -422,10 +558,20 @@ pub(crate) fn validate_wave3_semantics(
         if request_seq.is_none()
             || proof.is_none_or(|seq| request_seq.is_some_and(|req| seq <= req))
         {
-            return sem("SEM-C01", "cancelled attempts need request-before-proof");
+            note(
+                &mut violations,
+                "SEM-C01",
+                "cancelled attempts need request-before-proof",
+            );
         }
         if proto_seq.is_none() && proc_seq.is_none() {
-            return sem(
+            note(
+                &mut violations,
+                "SEM-C03",
+                "process fallback folds cancelled only on cleared",
+            );
+            note(
+                &mut violations,
                 "SEM-C02",
                 "cancelled attempts need protocol or process proof",
             );
@@ -436,14 +582,20 @@ pub(crate) fn validate_wave3_semantics(
             Some(AttemptStateCause::ProcessExit)
         };
         let Some(edge) = cancel_state_edges.get(&attempt.attempt_id) else {
-            return sem("SEM-C10", "cancelled attempts need a kernel cancelled edge");
+            note(
+                &mut violations,
+                "SEM-C10",
+                "cancelled attempts need a kernel cancelled edge",
+            );
+            continue;
         };
         if edge.source != EventSourceKind::KernelObserved
             || edge.generation != attempt.generation
             || edge.cause != expected_cause
             || proof.is_some_and(|seq| edge.sequence <= seq.max(request_seq.unwrap_or(0)))
         {
-            return sem(
+            note(
+                &mut violations,
                 "SEM-C10",
                 "cancelled edge must follow matching same-fence proof",
             );
@@ -453,12 +605,17 @@ pub(crate) fn validate_wave3_semantics(
                 .last()
                 .is_some_and(|event| event.sequence <= edge.sequence)
         {
-            return sem("SEM-C10", "mission_terminal must follow the cancelled edge");
+            note(
+                &mut violations,
+                "SEM-C10",
+                "mission_terminal must follow the cancelled edge",
+            );
         }
     }
 
     if wave3_cancel && mission.phase.is_terminal() && mission.phase != MissionPhase::Cancelled {
-        return sem(
+        note(
+            &mut violations,
             "SEM-C01",
             "cancel_requested cannot fold an incompatible terminal phase",
         );
@@ -469,7 +626,15 @@ pub(crate) fn validate_wave3_semantics(
             && process_proofs.is_empty()
             && protocol_proofs.is_empty()
         {
-            return sem(
+            if non_success_process {
+                note(
+                    &mut violations,
+                    "SEM-C03",
+                    "process fallback folds cancelled only on cleared",
+                );
+            }
+            note(
+                &mut violations,
                 "SEM-C02",
                 "mission cancelled requires protocol, process, or created-no-attempt proof",
             );
@@ -479,7 +644,8 @@ pub(crate) fn validate_wave3_semantics(
                 .values()
                 .all(|attempt| attempt.state != AttemptState::Cancelled)
         {
-            return sem(
+            note(
+                &mut violations,
                 "SEM-C09",
                 "cancelled missions must bind a cancelled attempt",
             );
@@ -492,7 +658,11 @@ pub(crate) fn validate_wave3_semantics(
                 || attempt.deadman_at.is_some()
                 || attempt.lease_generation.is_some()
             {
-                return sem("SEM-L04", "disabled lease cannot carry runtime fields");
+                note(
+                    &mut violations,
+                    "SEM-L04",
+                    "disabled lease cannot carry runtime fields",
+                );
             }
             continue;
         }
@@ -503,7 +673,8 @@ pub(crate) fn validate_wave3_semantics(
                 || attempt.last_observed_at.is_none()
                 || attempt.last_observation_source.is_none())
         {
-            return sem(
+            note(
+                &mut violations,
                 "SEM-L04",
                 "live leased attempts need wall deadlines and observation",
             );
@@ -515,24 +686,59 @@ pub(crate) fn validate_wave3_semantics(
                 || Some(running.last_observed_at) != attempt.last_observed_at
                 || Some(running.last_observation_source) != attempt.last_observation_source
             {
-                return sem(
+                note(
+                    &mut violations,
                     "SEM-L08",
                     "final lease projection must match the attempt record",
                 );
             }
         } else if attempt.lease_generation.is_some() {
-            return sem("SEM-L11", "enabled lease runtime requires lease_started");
+            note(
+                &mut violations,
+                "SEM-L11",
+                "enabled lease runtime requires lease_started",
+            );
         }
     }
     if let (Some(last), updated) = (events.last(), mission.updated_at) {
         if updated < last.recorded_at {
-            return sem(
+            note(
+                &mut violations,
                 "SEM-M06",
                 "mission updated_at cannot precede the last event",
             );
         }
     }
-    Ok(())
+    if mission.phase.is_terminal() {
+        match events.last() {
+            Some(event) => match &event.payload {
+                LifecyclePayload::MissionTerminal {
+                    phase,
+                    reason,
+                    terminal_entry_hash,
+                } if *phase == mission.phase
+                    && Some(*reason) == mission.terminal_reason
+                    && Some(terminal_entry_hash.as_str())
+                        == mission.terminal_entry_hash.as_deref()
+                    && terminal_entry_hash == &event.entry_hash => {}
+                _ => {
+                    note(
+                        &mut violations,
+                        "SEM-C06",
+                        "terminal history must end with matching mission_terminal",
+                    );
+                }
+            },
+            None => {
+                note(
+                    &mut violations,
+                    "SEM-C06",
+                    "terminal history must end with matching mission_terminal",
+                );
+            }
+        }
+    }
+    violations
 }
 
 #[derive(Clone)]
@@ -556,22 +762,31 @@ fn check_live_lease(
     running: &HashMap<uuid::Uuid, RunningLease>,
     attempt_id: Option<uuid::Uuid>,
     lease_generation: Option<u64>,
-) -> Result<(), InvariantError> {
+    violations: &mut Vec<InvariantError>,
+) {
     if !lease_enabled {
-        return Ok(());
+        return;
     }
     let Some(attempt_id) = attempt_id else {
-        return Ok(());
+        return;
     };
     let Some(running) = running.get(&attempt_id) else {
-        return sem("SEM-L11", "fenced cancel/restart requires lease_started");
+        note(
+            violations,
+            "SEM-L11",
+            "fenced cancel/restart requires lease_started",
+        );
+        return;
     };
     if lease_generation.is_some_and(|generation| generation != running.lease_generation) {
-        return sem("SEM-L01", "fenced mutation lease_generation is stale");
+        note(
+            violations,
+            "SEM-L01",
+            "fenced mutation lease_generation is stale",
+        );
     }
-    Ok(())
 }
 
-fn sem(field: &'static str, message: &'static str) -> Result<(), InvariantError> {
-    Err(InvariantError { field, message })
+fn note(violations: &mut Vec<InvariantError>, field: &'static str, message: &'static str) {
+    violations.push(InvariantError { field, message });
 }

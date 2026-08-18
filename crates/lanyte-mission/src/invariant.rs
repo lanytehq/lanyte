@@ -646,6 +646,18 @@ pub fn validate_history(
     mission: &MissionRecord,
     events: &[LifecycleEvent],
 ) -> Result<(), InvariantError> {
+    let semantic = crate::wave3::validate_wave3_semantics(mission, events);
+    let structural = validate_history_chain(mission, events);
+    match semantic {
+        Err(sem) => Err(sem),
+        Ok(()) => structural,
+    }
+}
+
+fn validate_history_chain(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+) -> Result<(), InvariantError> {
     mission.validate()?;
     if !matches!(
         events.first().map(|event| &event.payload),
@@ -871,7 +883,6 @@ pub fn validate_history(
             "non-terminal mission cannot contain a terminal event",
         ));
     }
-    crate::wave3::validate_wave3_semantics(mission, events)?;
     Ok(())
 }
 
@@ -1495,6 +1506,7 @@ mod tests {
         mission.phase = MissionPhase::Suspended;
         mission.authorizer = Some(mission.initiator.clone());
         mission.authorization_ref = Some("authorizations/1".to_owned());
+        mission.updated_at = Utc.with_ymd_and_hms(2026, 8, 17, 14, 2, 1).unwrap();
 
         let mut created = event(
             30,
@@ -1574,7 +1586,7 @@ mod tests {
             validate_history(&mission, &[created, attempt_created, capability])
                 .unwrap_err()
                 .field,
-            "payload.generation"
+            "SEM-T09"
         );
     }
 }

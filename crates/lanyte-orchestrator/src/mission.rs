@@ -131,6 +131,7 @@ pub struct MissionService {
     verifier: Arc<dyn SessionVerifier>,
     fail_next_terminal_persist: Arc<AtomicBool>,
     fail_after_cancelling_persist: Arc<AtomicBool>,
+    force_nonterminal_cancel: Arc<AtomicBool>,
 }
 
 impl MissionService {
@@ -141,6 +142,7 @@ impl MissionService {
             verifier,
             fail_next_terminal_persist: Arc::new(AtomicBool::new(false)),
             fail_after_cancelling_persist: Arc::new(AtomicBool::new(false)),
+            force_nonterminal_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -154,6 +156,15 @@ impl MissionService {
     pub fn fail_after_cancelling_persist(&self) {
         self.fail_after_cancelling_persist
             .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_nonterminal_cancel(&self) {
+        self.force_nonterminal_cancel.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_force_nonterminal_cancel(&self) -> bool {
+        self.force_nonterminal_cancel.swap(false, Ordering::SeqCst)
     }
 
     pub(crate) fn crash_after_cancelling_persist(&self) -> Result<(), MissionCommandError> {

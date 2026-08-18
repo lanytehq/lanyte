@@ -485,7 +485,7 @@ impl StateStore {
 
     pub fn release_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
         self.connection.execute(
-            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND owner_token = ?2 AND (result_json = '' OR json_extract(result_json, '$.kind') = 'pending_cancel')",
+            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND owner_token = ?2 AND result_json = ''",
             params![key, owner_token],
         )?;
         Ok(())

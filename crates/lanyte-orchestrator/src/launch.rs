@@ -564,19 +564,6 @@ impl Orchestrator {
             return replayed_control_result(&replayed);
         }
         let before = stored.mission.clone();
-        if before.phase == MissionPhase::Cancelled {
-            return Ok(MissionControlResult::Cancel {
-                request_id,
-                idempotency_key,
-                expected_revision,
-                record: Box::new(before),
-                progress: CancelProgress {
-                    requested: true,
-                    protocol: None,
-                    fallback: None,
-                },
-            });
-        }
         if before.phase.is_terminal() {
             return Err(MissionCommandError::invalid_args(
                 "mission is already terminal",
@@ -784,23 +771,16 @@ impl Orchestrator {
                 expected_revision,
                 cancelling.clone(),
                 receipts,
-                Some(lanyte_state::MissionMutationIdempotency {
-                    key: idempotency_key.clone(),
-                    request_fingerprint: fingerprint.clone(),
-                    operation: "mission.cancel".to_owned(),
-                    result_json: serde_json::json!({
-                        "kind": "pending_cancel",
-                        "request_id": request_id,
-                        "expected_revision": expected_revision,
-                    })
-                    .to_string(),
-                    owner_token: owner_token.clone(),
-                }),
+                Some(pending_cancel_idempotency(
+                    &idempotency_key,
+                    &fingerprint,
+                    request_id,
+                    expected_revision,
+                    &owner_token,
+                )),
             )?;
-            if let Err(err) = service.crash_after_cancelling_persist() {
-                reservation_guard.disarm();
-                return Err(err);
-            }
+            reservation_guard.disarm();
+            service.crash_after_cancelling_persist()?;
         }
 
         let protocol = {
@@ -817,7 +797,7 @@ impl Orchestrator {
                 None => None,
             }
         };
-        let protocol_progress = match protocol {
+        let mut protocol_progress = match protocol {
             None => ProtocolCancelProgress {
                 outcome: ProtocolCancelOutcome::Unavailable,
                 thread_id: attempt.harness_thread_id.clone(),
@@ -858,7 +838,9 @@ impl Orchestrator {
                 turn_id: Some(detail),
             },
         };
-        let interrupted = protocol_progress.outcome == ProtocolCancelOutcome::Interrupted;
+        let force_nonterminal = service.take_force_nonterminal_cancel();
+        let mut interrupted =
+            protocol_progress.outcome == ProtocolCancelOutcome::Interrupted && !force_nonterminal;
         let tree_ref = attempt.process_tree_ref.clone();
         let fallback = if interrupted {
             None
@@ -871,7 +853,7 @@ impl Orchestrator {
                 .map(CodexSession::kill_process_tree)
                 .or_else(|| tree_ref.as_deref().map(terminate_process_tree))
         };
-        let fallback_progress = fallback.map(|outcome| FallbackCancelProgress {
+        let mut fallback_progress = fallback.map(|outcome| FallbackCancelProgress {
             outcome: match outcome {
                 ProcessTreeKill::Cleared => FallbackCancelOutcome::Cleared,
                 ProcessTreeKill::KillDispatched => FallbackCancelOutcome::KillDispatched,
@@ -879,9 +861,17 @@ impl Orchestrator {
                 ProcessTreeKill::Unknown => FallbackCancelOutcome::Unknown,
             },
         });
-        let cleared = fallback_progress
+        let mut cleared = fallback_progress
             .as_ref()
             .is_some_and(|progress| progress.outcome == FallbackCancelOutcome::Cleared);
+        if force_nonterminal {
+            protocol_progress.outcome = ProtocolCancelOutcome::RequestAccepted;
+            fallback_progress = Some(FallbackCancelProgress {
+                outcome: FallbackCancelOutcome::KillDispatched,
+            });
+            interrupted = false;
+            cleared = false;
+        }
         let mut evidence = vec![(
             EventSourceKind::DriverReported,
             LifecyclePayload::ProtocolCancelAttempted {
@@ -1022,22 +1012,26 @@ impl Orchestrator {
             cancelling.revision,
             mission,
             receipts,
-            if complete {
-                Some(lanyte_state::MissionMutationIdempotency {
+            Some(if complete {
+                lanyte_state::MissionMutationIdempotency {
                     key: idempotency_key,
                     request_fingerprint: fingerprint,
                     operation: "mission.cancel".to_owned(),
                     result_json: serde_json::to_string(&result)
                         .map_err(|err| MissionCommandError::internal(err.to_string()))?,
                     owner_token,
-                })
+                }
             } else {
-                None
-            },
+                pending_cancel_idempotency(
+                    &idempotency_key,
+                    &fingerprint,
+                    request_id,
+                    expected_revision,
+                    &owner_token,
+                )
+            }),
         )?;
-        if complete {
-            reservation_guard.disarm();
-        }
+        reservation_guard.disarm();
         Ok(result)
     }
 
@@ -2328,6 +2322,27 @@ fn parse_pending_cancel(result_json: &str) -> Option<PendingCancelStub> {
     (stub.kind == "pending_cancel").then_some(stub)
 }
 
+fn pending_cancel_idempotency(
+    key: &str,
+    fingerprint: &str,
+    request_id: Uuid,
+    expected_revision: u64,
+    owner_token: &str,
+) -> lanyte_state::MissionMutationIdempotency {
+    lanyte_state::MissionMutationIdempotency {
+        key: key.to_owned(),
+        request_fingerprint: fingerprint.to_owned(),
+        operation: "mission.cancel".to_owned(),
+        result_json: serde_json::json!({
+            "kind": "pending_cancel",
+            "request_id": request_id,
+            "expected_revision": expected_revision,
+        })
+        .to_string(),
+        owner_token: owner_token.to_owned(),
+    }
+}
+
 fn mutation_fingerprint(
     operation: &str,
     caller: &crate::mission::VerifiedSession,
@@ -3112,6 +3127,88 @@ mod close_disposition_tests {
                 MissionControlRequest::cancel(
                     Uuid::new_v4(),
                     "cancel:original-key-01".to_owned(),
+                    latest.revision,
+                    created.mission_id,
+                )
+                .expect("replay A"),
+            )
+            .await
+            .expect("original key replays");
+        let MissionControlResult::Cancel {
+            request_id, record, ..
+        } = retried
+        else {
+            panic!("expected cancel result");
+        };
+        assert_eq!(request_id, original_id);
+        assert_eq!(record.phase, MissionPhase::Cancelled);
+        let _ = launched;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn nonterminal_cancel_keeps_pending_stub_until_supervisor_completes() {
+        let (root, orchestrator, service, created, launched) = launched_fixture(true).await;
+        for _ in 0..20 {
+            let _ = orchestrator
+                .observe_codex(
+                    &test_event(),
+                    MissionControlRequest::observe(Uuid::new_v4(), created.mission_id)
+                        .expect("observe"),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let latest = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("latest");
+        service.force_nonterminal_cancel();
+        let original = MissionControlRequest::cancel(
+            Uuid::new_v4(),
+            "cancel:nonterminal-key-01".to_owned(),
+            latest.revision,
+            created.mission_id,
+        )
+        .expect("cancel A");
+        let original_id = original.request_id();
+        let accepted = orchestrator
+            .cancel_mission(&test_event(), original)
+            .await
+            .expect("accepted nonterminal cancel");
+        let MissionControlResult::Cancel { record, .. } = accepted else {
+            panic!("expected cancel result");
+        };
+        assert_ne!(record.phase, MissionPhase::Cancelled);
+        let midway = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("midway");
+        let hijack = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:other-key-0003".to_owned(),
+                    midway.revision,
+                    created.mission_id,
+                )
+                .expect("cancel B"),
+            )
+            .await
+            .expect_err("distinct key must not take over");
+        assert!(hijack.message.contains("already in flight"));
+        orchestrator.tick_leases().await;
+        let retried = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:nonterminal-key-01".to_owned(),
                     latest.revision,
                     created.mission_id,
                 )

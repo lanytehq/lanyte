@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use lanyte_mission::{validate_history, LifecycleEvent, MissionRecord};
+use lanyte_mission::{semantic_violation_codes, validate_history, LifecycleEvent, MissionRecord};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -87,6 +87,11 @@ fn negative_v0_1_histories_reject_with_declared_sem() {
         if let Ok(fixture) = load_history(&dir.join(name)) {
             if validate_history(&fixture.mission, &fixture.events).is_ok() {
                 failures.push(format!("{name}: accepted (wanted {expected})"));
+                continue;
+            }
+            let codes = semantic_violation_codes(&fixture.mission, &fixture.events);
+            if !codes.contains(&expected.as_str()) {
+                failures.push(format!("{name}: wanted {expected}, got {codes:?}"));
             }
         }
     }
