@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 use chrono::Utc;
-use lanyte_driver_codex::{confine_workspace, CodexAppServerDriver, CodexLaunchSpec, CodexSession};
+use lanyte_driver_codex::{
+    confine_workspace, CloseOutcome, CodexAppServerDriver, CodexLaunchSpec, CodexSession,
+};
 use lanyte_gateway::GatewayEvent;
 use lanyte_mission::{
     AttemptRecord, AttemptState, AttemptTerminalReason, CapabilityName, EventSource,
@@ -413,6 +415,14 @@ impl Orchestrator {
             mission.clone(),
         )
         .map_err(MissionCommandError::internal)?;
+        if heartbeat.failed() {
+            let mut session = session;
+            let _ = session.close().await;
+            return Err(MissionCommandError::internal(
+                "mutation lease renewal failed",
+            ));
+        }
+        service.renew_mutation(&idempotency_key, &owner_token)?;
         if let Err(err) = service.persist_update_events(
             expected_revision,
             mission,
@@ -432,7 +442,7 @@ impl Orchestrator {
         }
 
         live_sessions().lock().await.insert(attempt_id, session);
-        heartbeat.stop().await;
+        let _ = heartbeat.stop().await;
         reservation_guard.disarm();
         Ok(result)
     }
@@ -602,7 +612,7 @@ impl Orchestrator {
             (cancelling, expected_revision + 1)
         };
         let mut sessions = live_sessions().lock().await;
-        let reaped = if let Some(session) = sessions.get_mut(&attempt_id) {
+        let close_outcome = if let Some(session) = sessions.get_mut(&attempt_id) {
             Some(
                 session
                     .close()
@@ -618,31 +628,49 @@ impl Orchestrator {
         };
 
         let now = Utc::now();
+        let operator_killed = matches!(close_outcome, Some(CloseOutcome::Terminated(_)));
         let (phase, terminal_reason, attempt_state, attempt_reason, to_state, reap_ref) =
-            if let Some(status) = reaped {
-                let mut reap_ref = format!("reap:code={:?}", status.code());
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    reap_ref.push_str(&format!(":signal={:?}", status.signal()));
+            match close_outcome {
+                Some(CloseOutcome::Terminated(status)) => {
+                    let mut reap_ref = format!("reap:code={:?}", status.code());
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        reap_ref.push_str(&format!(":signal={:?}", status.signal()));
+                    }
+                    (
+                        MissionPhase::Cancelled,
+                        MissionTerminalReason::OperatorCancelled,
+                        AttemptState::Cancelled,
+                        AttemptTerminalReason::ProcessReaped,
+                        AttemptState::Cancelled,
+                        Some(reap_ref),
+                    )
                 }
-                (
-                    MissionPhase::Cancelled,
-                    MissionTerminalReason::OperatorCancelled,
-                    AttemptState::Cancelled,
-                    AttemptTerminalReason::ProcessReaped,
-                    AttemptState::Cancelled,
-                    Some(reap_ref),
-                )
-            } else {
-                (
+                Some(CloseOutcome::AlreadyExited(status)) => {
+                    let mut reap_ref = format!("reap:already-exited:code={:?}", status.code());
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        reap_ref.push_str(&format!(":signal={:?}", status.signal()));
+                    }
+                    (
+                        MissionPhase::Failed,
+                        MissionTerminalReason::InternalError,
+                        AttemptState::Failed,
+                        AttemptTerminalReason::HarnessCompleted,
+                        AttemptState::Failed,
+                        Some(reap_ref),
+                    )
+                }
+                None => (
                     MissionPhase::Failed,
                     MissionTerminalReason::InternalError,
                     AttemptState::Lost,
                     AttemptTerminalReason::OutcomeUnknown,
                     AttemptState::Lost,
                     Some("reap:unknown-handle-lost".to_owned()),
-                )
+                ),
             };
         let mut mission = cancelling.clone();
         mission.revision = terminal_expected + 1;
@@ -658,9 +686,6 @@ impl Orchestrator {
             attempt.state = attempt_state;
             attempt.ended_at = Some(now);
             attempt.terminal_reason = Some(attempt_reason);
-            if let Some(reap_ref) = &reap_ref {
-                attempt.evidence_ref = Some(reap_ref.clone());
-            }
         }
         MissionTransition {
             expected_revision: terminal_expected,
@@ -683,7 +708,7 @@ impl Orchestrator {
                 },
             ),
             (
-                if reaped.is_some() {
+                if operator_killed {
                     EventSourceKind::OperatorCommand
                 } else {
                     EventSourceKind::KernelObserved
@@ -695,7 +720,7 @@ impl Orchestrator {
                 },
             ),
             (
-                if reaped.is_some() {
+                if operator_killed {
                     EventSourceKind::OperatorCommand
                 } else {
                     EventSourceKind::KernelObserved
@@ -878,16 +903,19 @@ fn replayed_control_result(json: &str) -> Result<MissionControlResult, MissionCo
 
 struct MutationHeartbeat {
     cancel: CancellationToken,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MutationHeartbeat {
     fn start(service: &MissionService, key: &str, owner_token: &str) -> Self {
         let cancel = CancellationToken::new();
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let service = service.clone();
         let key = key.to_owned();
         let owner_token = owner_token.to_owned();
         let child_cancel = cancel.clone();
+        let failed_flag = std::sync::Arc::clone(&failed);
         let join = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             interval.tick().await;
@@ -896,6 +924,7 @@ impl MutationHeartbeat {
                     () = child_cancel.cancelled() => break,
                     _ = interval.tick() => {
                         if service.renew_mutation(&key, &owner_token).is_err() {
+                            failed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             break;
                         }
                     }
@@ -904,15 +933,27 @@ impl MutationHeartbeat {
         });
         Self {
             cancel,
+            failed,
             join: Some(join),
         }
     }
 
-    async fn stop(mut self) {
+    fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn stop(mut self) -> Result<(), MissionCommandError> {
         self.cancel.cancel();
         if let Some(join) = self.join.take() {
-            let _ = join.await;
+            join.await
+                .map_err(|_| MissionCommandError::internal("mutation heartbeat task failed"))?;
         }
+        if self.failed() {
+            return Err(MissionCommandError::internal(
+                "mutation lease renewal failed",
+            ));
+        }
+        Ok(())
     }
 }
 

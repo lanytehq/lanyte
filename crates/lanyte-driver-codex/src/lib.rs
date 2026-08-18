@@ -7,6 +7,21 @@ mod spawn;
 pub use protocol::{map_notification, CodexProtocolError, JsonRpcLine};
 pub use spawn::{confine_workspace, scrub_child_env, CodexBinary, CodexLaunchSpec, SpawnError};
 
+#[derive(Debug, Clone, Copy)]
+pub enum CloseOutcome {
+    AlreadyExited(std::process::ExitStatus),
+    Terminated(std::process::ExitStatus),
+}
+
+impl CloseOutcome {
+    #[must_use]
+    pub fn status(&self) -> std::process::ExitStatus {
+        match self {
+            Self::AlreadyExited(status) | Self::Terminated(status) => *status,
+        }
+    }
+}
+
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,9 +120,9 @@ impl CodexSession {
         });
     }
 
-    pub async fn close(&mut self) -> Result<std::process::ExitStatus, CodexDriverError> {
+    pub async fn close(&mut self) -> Result<CloseOutcome, CodexDriverError> {
         if let Ok(Some(status)) = self.child.try_wait() {
-            return Ok(status);
+            return Ok(CloseOutcome::AlreadyExited(status));
         }
         if !self.harness_session_id.is_empty() {
             let _ = self
@@ -118,10 +133,10 @@ impl CodexSession {
                 .await;
         }
         self.child.start_kill()?;
-        tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
             .await
-            .map_err(|_| CodexDriverError::Timeout)?
-            .map_err(Into::into)
+            .map_err(|_| CodexDriverError::Timeout)??;
+        Ok(CloseOutcome::Terminated(status))
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), CodexDriverError> {
