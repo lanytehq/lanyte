@@ -120,6 +120,10 @@ impl CodexSession {
         });
     }
 
+    pub fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>, CodexDriverError> {
+        self.child.try_wait().map_err(Into::into)
+    }
+
     pub async fn close(&mut self) -> Result<CloseOutcome, CodexDriverError> {
         if let Ok(Some(status)) = self.child.try_wait() {
             return Ok(CloseOutcome::AlreadyExited(status));

@@ -407,7 +407,7 @@ impl Orchestrator {
                 },
             ),
         ];
-        let receipts = chain_receipts(&history, &mission, &caller, payloads)?;
+        let receipts = chain_receipts(&history, &mission, &caller, payloads, None)?;
         let result = MissionControlResult::launch(
             request_id,
             idempotency_key.clone(),
@@ -415,14 +415,12 @@ impl Orchestrator {
             mission.clone(),
         )
         .map_err(MissionCommandError::internal)?;
-        if heartbeat.failed() {
+        service.renew_mutation(&idempotency_key, &owner_token)?;
+        if let Err(err) = heartbeat.stop().await {
             let mut session = session;
             let _ = session.close().await;
-            return Err(MissionCommandError::internal(
-                "mutation lease renewal failed",
-            ));
+            return Err(err);
         }
-        service.renew_mutation(&idempotency_key, &owner_token)?;
         if let Err(err) = service.persist_update_events(
             expected_revision,
             mission,
@@ -442,7 +440,6 @@ impl Orchestrator {
         }
 
         live_sessions().lock().await.insert(attempt_id, session);
-        let _ = heartbeat.stop().await;
         reservation_guard.disarm();
         Ok(result)
     }
@@ -572,7 +569,22 @@ impl Orchestrator {
         let attempt_id = before
             .current_attempt_id
             .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
-        let (cancelling, terminal_expected) = if already_cancelling {
+        let prior_exit = {
+            let mut sessions = live_sessions().lock().await;
+            match sessions.get_mut(&attempt_id) {
+                Some(session) => session
+                    .poll_exit()
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                None => None,
+            }
+        };
+        let skip_cancelling = already_cancelling || prior_exit.is_some();
+        let from_state = if prior_exit.is_some() && !already_cancelling {
+            AttemptState::Running
+        } else {
+            AttemptState::Cancelling
+        };
+        let (cancelling, terminal_expected) = if skip_cancelling {
             reservation_guard.disarm();
             (before.clone(), before.revision)
         } else {
@@ -601,6 +613,7 @@ impl Orchestrator {
                         reason: Some("operator close".to_owned()),
                     },
                 )],
+                None,
             )?;
             service.persist_update_events(
                 expected_revision,
@@ -612,7 +625,9 @@ impl Orchestrator {
             (cancelling, expected_revision + 1)
         };
         let mut sessions = live_sessions().lock().await;
-        let close_outcome = if let Some(session) = sessions.get_mut(&attempt_id) {
+        let close_outcome = if let Some(status) = prior_exit {
+            Some(CloseOutcome::AlreadyExited(status))
+        } else if let Some(session) = sessions.get_mut(&attempt_id) {
             Some(
                 session
                     .close()
@@ -628,50 +643,14 @@ impl Orchestrator {
         };
 
         let now = Utc::now();
-        let operator_killed = matches!(close_outcome, Some(CloseOutcome::Terminated(_)));
-        let (phase, terminal_reason, attempt_state, attempt_reason, to_state, reap_ref) =
-            match close_outcome {
-                Some(CloseOutcome::Terminated(status)) => {
-                    let mut reap_ref = format!("reap:code={:?}", status.code());
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::process::ExitStatusExt;
-                        reap_ref.push_str(&format!(":signal={:?}", status.signal()));
-                    }
-                    (
-                        MissionPhase::Cancelled,
-                        MissionTerminalReason::OperatorCancelled,
-                        AttemptState::Cancelled,
-                        AttemptTerminalReason::ProcessReaped,
-                        AttemptState::Cancelled,
-                        Some(reap_ref),
-                    )
-                }
-                Some(CloseOutcome::AlreadyExited(status)) => {
-                    let mut reap_ref = format!("reap:already-exited:code={:?}", status.code());
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::process::ExitStatusExt;
-                        reap_ref.push_str(&format!(":signal={:?}", status.signal()));
-                    }
-                    (
-                        MissionPhase::Failed,
-                        MissionTerminalReason::InternalError,
-                        AttemptState::Failed,
-                        AttemptTerminalReason::HarnessCompleted,
-                        AttemptState::Failed,
-                        Some(reap_ref),
-                    )
-                }
-                None => (
-                    MissionPhase::Failed,
-                    MissionTerminalReason::InternalError,
-                    AttemptState::Lost,
-                    AttemptTerminalReason::OutcomeUnknown,
-                    AttemptState::Lost,
-                    Some("reap:unknown-handle-lost".to_owned()),
-                ),
-            };
+        let disposition = CloseDisposition::from_outcome(from_state, close_outcome);
+        let phase = disposition.phase;
+        let terminal_reason = disposition.terminal_reason;
+        let attempt_state = disposition.attempt_state;
+        let attempt_reason = disposition.attempt_reason;
+        let operator_killed = disposition.operator_killed;
+        let reap_ref = disposition.reap_detail.clone();
+        let reap_evidence = format!("reap/{attempt_id}");
         let mut mission = cancelling.clone();
         mission.revision = terminal_expected + 1;
         mission.updated_at = now;
@@ -702,8 +681,8 @@ impl Orchestrator {
                 LifecyclePayload::AttemptStateChanged {
                     attempt_id,
                     generation: 1,
-                    from: AttemptState::Cancelling,
-                    to: to_state,
+                    from: from_state,
+                    to: attempt_state,
                     reason: reap_ref.clone(),
                 },
             ),
@@ -732,7 +711,13 @@ impl Orchestrator {
                 },
             ),
         ];
-        let mut receipts = chain_receipts(&history, &mission, &caller, payloads)?;
+        let mut receipts = chain_receipts(
+            &history,
+            &mission,
+            &caller,
+            payloads,
+            Some(reap_evidence.as_str()),
+        )?;
         if let Some(last) = receipts.last_mut() {
             let digest = last.event.entry_hash.clone();
             if let LifecyclePayload::MissionTerminal {
@@ -796,6 +781,7 @@ fn chain_receipts(
     mission: &lanyte_mission::MissionRecord,
     caller: &crate::mission::VerifiedSession,
     payloads: Vec<(EventSourceKind, LifecyclePayload)>,
+    kernel_evidence: Option<&str>,
 ) -> Result<Vec<NewMissionProjectionReceipt>, MissionCommandError> {
     let mut previous = history.last().map(|event| event.entry_hash.clone());
     let mut sequence = u64::try_from(history.len() + 1)
@@ -803,6 +789,13 @@ fn chain_receipts(
     let mut receipts = Vec::new();
     for (source_kind, payload) in payloads {
         let event_id = Uuid::new_v4();
+        let evidence_ref = if source_kind == EventSourceKind::KernelObserved {
+            kernel_evidence
+                .map(str::to_owned)
+                .or_else(|| Some(caller.trust_ref.clone()))
+        } else {
+            Some(caller.trust_ref.clone())
+        };
         let mut event = LifecycleEvent {
             event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
             event_id,
@@ -818,7 +811,7 @@ fn chain_receipts(
                 subject: caller.subject.clone(),
                 producer_version: env!("CARGO_PKG_VERSION").to_owned(),
                 assurance: ObservationLevel::KernelObserved,
-                evidence_ref: Some(caller.trust_ref.clone()),
+                evidence_ref,
             },
             payload,
         };
@@ -1010,4 +1003,183 @@ fn mutation_fingerprint(
     }))
     .map_err(|err| MissionCommandError::internal(err.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(encoded.as_bytes())))
+}
+
+struct CloseDisposition {
+    phase: MissionPhase,
+    terminal_reason: MissionTerminalReason,
+    attempt_state: AttemptState,
+    attempt_reason: AttemptTerminalReason,
+    reap_detail: Option<String>,
+    operator_killed: bool,
+}
+
+impl CloseDisposition {
+    fn from_outcome(from_state: AttemptState, outcome: Option<CloseOutcome>) -> Self {
+        match outcome {
+            Some(CloseOutcome::Terminated(status)) => Self {
+                phase: MissionPhase::Cancelled,
+                terminal_reason: MissionTerminalReason::OperatorCancelled,
+                attempt_state: AttemptState::Cancelled,
+                attempt_reason: AttemptTerminalReason::ProcessReaped,
+                reap_detail: Some(reap_detail("reap:terminated", status)),
+                operator_killed: true,
+            },
+            Some(CloseOutcome::AlreadyExited(status)) => {
+                let (attempt_state, attempt_reason) = if status.success() {
+                    if from_state == AttemptState::Cancelling {
+                        (AttemptState::Failed, AttemptTerminalReason::HarnessCompleted)
+                    } else {
+                        (
+                            AttemptState::Completed,
+                            AttemptTerminalReason::HarnessCompleted,
+                        )
+                    }
+                } else {
+                    (AttemptState::Crashed, AttemptTerminalReason::HarnessCrashed)
+                };
+                Self {
+                    phase: MissionPhase::Failed,
+                    terminal_reason: MissionTerminalReason::InternalError,
+                    attempt_state,
+                    attempt_reason,
+                    reap_detail: Some(reap_detail("reap:already-exited", status)),
+                    operator_killed: false,
+                }
+            }
+            None => Self {
+                phase: MissionPhase::Failed,
+                terminal_reason: MissionTerminalReason::InternalError,
+                attempt_state: AttemptState::Lost,
+                attempt_reason: AttemptTerminalReason::OutcomeUnknown,
+                reap_detail: Some("reap:unknown-handle-lost".to_owned()),
+                operator_killed: false,
+            },
+        }
+    }
+}
+
+fn reap_detail(prefix: &str, status: std::process::ExitStatus) -> String {
+    let mut detail = format!("{prefix}:code={:?}", status.code());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        detail.push_str(&format!(":signal={:?}", status.signal()));
+    }
+    detail
+}
+
+#[cfg(test)]
+mod close_disposition_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn status_from_raw(raw: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(raw)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prior_success_from_running_completes_the_attempt() {
+        let disposition = CloseDisposition::from_outcome(
+            AttemptState::Running,
+            Some(CloseOutcome::AlreadyExited(status_from_raw(0))),
+        );
+        assert_eq!(disposition.phase, MissionPhase::Failed);
+        assert_eq!(
+            disposition.terminal_reason,
+            MissionTerminalReason::InternalError
+        );
+        assert_eq!(disposition.attempt_state, AttemptState::Completed);
+        assert_eq!(
+            disposition.attempt_reason,
+            AttemptTerminalReason::HarnessCompleted
+        );
+        assert!(!disposition.operator_killed);
+        assert!(from_state_legal(
+            AttemptState::Running,
+            disposition.attempt_state
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prior_success_from_cancelling_cannot_complete() {
+        let disposition = CloseDisposition::from_outcome(
+            AttemptState::Cancelling,
+            Some(CloseOutcome::AlreadyExited(status_from_raw(0))),
+        );
+        assert_eq!(disposition.attempt_state, AttemptState::Failed);
+        assert_eq!(
+            disposition.attempt_reason,
+            AttemptTerminalReason::HarnessCompleted
+        );
+        assert_eq!(disposition.phase, MissionPhase::Failed);
+        assert!(from_state_legal(
+            AttemptState::Cancelling,
+            disposition.attempt_state
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prior_nonzero_exit_crashes_the_attempt() {
+        let disposition = CloseDisposition::from_outcome(
+            AttemptState::Running,
+            Some(CloseOutcome::AlreadyExited(status_from_raw(1 << 8))),
+        );
+        assert_eq!(disposition.attempt_state, AttemptState::Crashed);
+        assert_eq!(
+            disposition.attempt_reason,
+            AttemptTerminalReason::HarnessCrashed
+        );
+        assert_eq!(disposition.phase, MissionPhase::Failed);
+        assert!(!disposition.operator_killed);
+        assert!(from_state_legal(
+            AttemptState::Running,
+            disposition.attempt_state
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminated_close_is_operator_cancelled() {
+        let disposition = CloseDisposition::from_outcome(
+            AttemptState::Cancelling,
+            Some(CloseOutcome::Terminated(status_from_raw(libc_sigterm()))),
+        );
+        assert_eq!(disposition.phase, MissionPhase::Cancelled);
+        assert_eq!(
+            disposition.terminal_reason,
+            MissionTerminalReason::OperatorCancelled
+        );
+        assert_eq!(disposition.attempt_state, AttemptState::Cancelled);
+        assert_eq!(
+            disposition.attempt_reason,
+            AttemptTerminalReason::ProcessReaped
+        );
+        assert!(disposition.operator_killed);
+    }
+
+    #[test]
+    fn missing_handle_is_lost_and_unknown() {
+        let disposition = CloseDisposition::from_outcome(AttemptState::Cancelling, None);
+        assert_eq!(disposition.attempt_state, AttemptState::Lost);
+        assert_eq!(
+            disposition.attempt_reason,
+            AttemptTerminalReason::OutcomeUnknown
+        );
+        assert_eq!(disposition.phase, MissionPhase::Failed);
+        assert!(!disposition.operator_killed);
+    }
+
+    fn from_state_legal(from: AttemptState, to: AttemptState) -> bool {
+        from.can_transition_to(to)
+    }
+
+    #[cfg(unix)]
+    fn libc_sigterm() -> i32 {
+        15
+    }
 }
