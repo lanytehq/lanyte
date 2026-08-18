@@ -105,7 +105,10 @@ impl CodexSession {
         });
     }
 
-    pub async fn close(&mut self) -> Result<(), CodexDriverError> {
+    pub async fn close(&mut self) -> Result<std::process::ExitStatus, CodexDriverError> {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Ok(status);
+        }
         if !self.harness_session_id.is_empty() {
             let _ = self
                 .notify(
@@ -115,13 +118,10 @@ impl CodexSession {
                 .await;
         }
         self.child.start_kill()?;
-        let status = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
             .await
-            .map_err(|_| CodexDriverError::Timeout)??;
-        if !status.success() && status.code().is_none() {
-            return Ok(());
-        }
-        Ok(())
+            .map_err(|_| CodexDriverError::Timeout)?
+            .map_err(Into::into)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), CodexDriverError> {
