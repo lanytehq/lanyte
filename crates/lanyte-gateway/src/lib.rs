@@ -60,6 +60,12 @@ impl ClientAuthToken {
         Self(Arc::new(Zeroizing::new(token)))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn from_test_secret(token: impl Into<String>) -> Self {
+        Self::new(token.into())
+    }
+
     #[must_use]
     pub fn expose(&self) -> &str {
         self.0.as_str()

@@ -569,17 +569,27 @@ impl Orchestrator {
         let attempt_id = before
             .current_attempt_id
             .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
-        let prior_exit = {
+        let prior_outcome = {
             let mut sessions = live_sessions().lock().await;
             match sessions.get_mut(&attempt_id) {
-                Some(session) => session
-                    .poll_exit()
-                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                Some(session) => {
+                    if let Some(CloseOutcome::Terminated(status)) = session.retained_close_outcome()
+                    {
+                        Some(CloseOutcome::Terminated(status))
+                    } else {
+                        session
+                            .poll_exit()
+                            .map_err(|err| MissionCommandError::internal(err.to_string()))?
+                            .map(CloseOutcome::AlreadyExited)
+                    }
+                }
                 None => None,
             }
         };
-        let skip_cancelling = already_cancelling || prior_exit.is_some();
-        let from_state = if prior_exit.is_some() && !already_cancelling {
+        let skip_cancelling = already_cancelling || prior_outcome.is_some();
+        let from_state = if matches!(prior_outcome, Some(CloseOutcome::AlreadyExited(_)))
+            && !already_cancelling
+        {
             AttemptState::Running
         } else {
             AttemptState::Cancelling
@@ -625,8 +635,8 @@ impl Orchestrator {
             (cancelling, expected_revision + 1)
         };
         let mut sessions = live_sessions().lock().await;
-        let close_outcome = if let Some(status) = prior_exit {
-            Some(CloseOutcome::AlreadyExited(status))
+        let close_outcome = if let Some(outcome) = prior_outcome {
+            Some(outcome)
         } else if let Some(session) = sessions.get_mut(&attempt_id) {
             Some(
                 session
@@ -650,12 +660,12 @@ impl Orchestrator {
         let attempt_reason = disposition.attempt_reason;
         let operator_killed = disposition.operator_killed;
         let reap_ref = disposition.reap_detail.clone();
-        let reap_evidence = format!("reap/{attempt_id}");
         let mut mission = cancelling.clone();
         mission.revision = terminal_expected + 1;
         mission.updated_at = now;
         mission.phase = phase;
         mission.terminal_reason = Some(terminal_reason);
+        mission.terminal_entry_hash = Some("0".repeat(64));
         mission.current_attempt_id = None;
         if let Some(attempt) = mission
             .attempts
@@ -711,13 +721,7 @@ impl Orchestrator {
                 },
             ),
         ];
-        let mut receipts = chain_receipts(
-            &history,
-            &mission,
-            &caller,
-            payloads,
-            Some(reap_evidence.as_str()),
-        )?;
+        let mut receipts = chain_receipts(&history, &mission, &caller, payloads, None)?;
         if let Some(last) = receipts.last_mut() {
             let digest = last.event.entry_hash.clone();
             if let LifecyclePayload::MissionTerminal {
@@ -738,19 +742,22 @@ impl Orchestrator {
             attempt_id,
         )
         .map_err(MissionCommandError::internal)?;
-        service.persist_update_events(
+        if let Err(err) = service.persist_update_events(
             terminal_expected,
             mission,
             receipts,
             Some(lanyte_state::MissionMutationIdempotency {
-                key: idempotency_key,
+                key: idempotency_key.clone(),
                 request_fingerprint: fingerprint,
                 operation: "mission.close".to_owned(),
                 result_json: serde_json::to_string(&result)
                     .map_err(|err| MissionCommandError::internal(err.to_string()))?,
-                owner_token,
+                owner_token: owner_token.clone(),
             }),
-        )?;
+        ) {
+            let _ = service.release_mutation(&idempotency_key, &owner_token);
+            return Err(err);
+        }
         sessions.remove(&attempt_id);
         reservation_guard.disarm();
         Ok(result)
@@ -792,7 +799,7 @@ fn chain_receipts(
         let evidence_ref = if source_kind == EventSourceKind::KernelObserved {
             kernel_evidence
                 .map(str::to_owned)
-                .or_else(|| Some(caller.trust_ref.clone()))
+                .or_else(|| Some(format!("lifecycle/{event_id}")))
         } else {
             Some(caller.trust_ref.clone())
         };
@@ -1072,6 +1079,7 @@ fn reap_detail(prefix: &str, status: std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod close_disposition_tests {
     use super::*;
+    use crate::mission::SessionVerifier;
 
     #[cfg(unix)]
     fn status_from_raw(raw: i32) -> std::process::ExitStatus {
@@ -1181,5 +1189,221 @@ mod close_disposition_tests {
     #[cfg(unix)]
     fn libc_sigterm() -> i32 {
         15
+    }
+
+    struct TestVerifier;
+
+    impl crate::mission::SessionVerifier for TestVerifier {
+        fn verify(&self, token: &str) -> Result<crate::mission::VerifiedSession, String> {
+            if token != "valid-session-secret" {
+                return Err("invalid attestation".to_owned());
+            }
+            Ok(crate::mission::VerifiedSession {
+                issuer: "lanyte-attest".to_owned(),
+                subject: "operator-subject".to_owned(),
+                session_id: Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+                role: "operator".to_owned(),
+                scope: "lanytehq".to_owned(),
+                jti: Uuid::parse_str("00000000-0000-4000-9000-000000000001").unwrap(),
+                context_sha256: "1".repeat(64),
+                token_sha256: "2".repeat(64),
+                verification_policy_sha256: "3".repeat(64),
+                trust_ref: "lanyte-attest://lanyte-attest/sessions/test".to_owned(),
+            })
+        }
+    }
+
+    fn test_event() -> lanyte_gateway::GatewayEvent {
+        lanyte_gateway::GatewayEvent {
+            peer_id: "peer-1".to_owned(),
+            channel: lanyte_common::channels::COMMAND,
+            payload: Vec::new(),
+            client_auth_token: Some(lanyte_gateway::ClientAuthToken::from_test_secret(
+                "valid-session-secret",
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_retry_keeps_terminated_after_terminal_persist_failure() {
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+
+        use lanyte_mission::{
+            MissionCreateBody, MissionLaunchBody, MissionPhase, RecoveryPolicy,
+            NormalizedHarnessEvent,
+        };
+        use lanyte_state::{StatePaths, StateStore};
+
+        let root = std::env::temp_dir().join(format!("lanyte-close-retry-{}", Uuid::new_v4()));
+        let paths = StatePaths::new(&root);
+        let store = Arc::new(Mutex::new(StateStore::open(paths.clone()).expect("store")));
+        let service = crate::MissionService::new(Arc::clone(&store), Arc::new(TestVerifier));
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        let orchestrator = crate::Orchestrator::new(
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+            lanyte_gateway::PeerResponder::empty_for_tests(),
+            None,
+        )
+        .with_mission_service(service.clone());
+
+        let created = match service
+            .handle(
+                MissionControlRequest::create(
+                    Uuid::new_v4(),
+                    "create:close-retry".to_owned(),
+                    MissionCreateBody {
+                        goal: "Prove close retry keeps operator termination".to_owned(),
+                        policy_id: "policy.local".to_owned(),
+                        deadline_at: None,
+                        recovery_policy: RecoveryPolicy::AskOperator,
+                    },
+                )
+                .expect("create request"),
+                Some("valid-session-secret"),
+            )
+            .expect("create")
+        {
+            MissionControlResult::Record { record, .. } => *record,
+            _ => panic!("expected created record"),
+        };
+
+        let workspace = paths.workspace_root().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let binary = workspace.join("fake-codex");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lanyte-driver-codex/tests/fixtures/fake-codex-app-server.py");
+        std::fs::copy(fixture, &binary).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let launched = orchestrator
+            .launch_codex(
+                &test_event(),
+                MissionControlRequest::launch(
+                    Uuid::new_v4(),
+                    "launch:close-retry".to_owned(),
+                    created.revision,
+                    MissionLaunchBody {
+                        mission_id: created.mission_id,
+                        workspace: workspace.display().to_string(),
+                        binary: Some(binary.display().to_string()),
+                    },
+                )
+                .expect("launch request"),
+            )
+            .await
+            .expect("launch");
+        let launched = match launched {
+            MissionControlResult::Record { record, .. } => *record,
+            _ => panic!("expected launched record"),
+        };
+        assert_eq!(launched.phase, MissionPhase::Active);
+
+        let mut saw_started = false;
+        let mut saw_tool = false;
+        let mut saw_exited = false;
+        for _ in 0..20 {
+            let observed = orchestrator
+                .observe_codex(
+                    &test_event(),
+                    MissionControlRequest::observe(Uuid::new_v4(), created.mission_id)
+                        .expect("observe request"),
+                )
+                .await
+                .expect("observe");
+            if let MissionControlResult::Observe { events, .. } = observed {
+                for event in events {
+                    match event {
+                        NormalizedHarnessEvent::Started { .. } => saw_started = true,
+                        NormalizedHarnessEvent::ToolProposed { .. } => saw_tool = true,
+                        NormalizedHarnessEvent::Exited { .. } => saw_exited = true,
+                    }
+                }
+            }
+            if saw_started && saw_tool && saw_exited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_started && saw_tool && saw_exited);
+
+        service.fail_next_terminal_persist();
+        let first = orchestrator
+            .close_codex(
+                &test_event(),
+                MissionControlRequest::close(
+                    Uuid::new_v4(),
+                    "close:retry-terminated".to_owned(),
+                    launched.revision,
+                    created.mission_id,
+                )
+                .expect("close request"),
+            )
+            .await
+            .expect_err("terminal persist must fail once");
+        assert!(
+            first.message.contains("injected terminal persist failure"),
+            "unexpected first close error: {} ({:?})",
+            first.message,
+            first.code
+        );
+
+        let midway = service
+            .visible_mission(&created.mission_id.to_string(), &TestVerifier.verify("valid-session-secret").unwrap())
+            .expect("midway mission");
+        assert_eq!(midway.phase, MissionPhase::Active);
+        assert_eq!(midway.attempts[0].state, AttemptState::Cancelling);
+
+        let closed = orchestrator
+            .close_codex(
+                &test_event(),
+                MissionControlRequest::close(
+                    Uuid::new_v4(),
+                    "close:retry-terminated".to_owned(),
+                    launched.revision,
+                    created.mission_id,
+                )
+                .expect("retry close"),
+            )
+            .await
+            .expect("retry must keep Terminated");
+        assert!(matches!(closed, MissionControlResult::Close { .. }));
+
+        let finished = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier
+                    .verify("valid-session-secret")
+                    .unwrap(),
+            )
+            .expect("finished mission");
+        assert_eq!(finished.phase, MissionPhase::Cancelled);
+        assert_eq!(
+            finished.terminal_reason,
+            Some(MissionTerminalReason::OperatorCancelled)
+        );
+        assert_eq!(finished.attempts[0].state, AttemptState::Cancelled);
+        assert_eq!(
+            finished.attempts[0].terminal_reason,
+            Some(AttemptTerminalReason::ProcessReaped)
+        );
+
+        let history = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history");
+        assert!(history.iter().any(|event| {
+            event.source.kind == EventSourceKind::KernelObserved
+                && event
+                    .source
+                    .evidence_ref
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("lifecycle/"))
+        }));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{SecondsFormat, Utc};
@@ -128,12 +129,23 @@ impl MissionCommandError {
 pub struct MissionService {
     store: Arc<Mutex<StateStore>>,
     verifier: Arc<dyn SessionVerifier>,
+    fail_next_terminal_persist: Arc<AtomicBool>,
 }
 
 impl MissionService {
     #[must_use]
     pub fn new(store: Arc<Mutex<StateStore>>, verifier: Arc<dyn SessionVerifier>) -> Self {
-        Self { store, verifier }
+        Self {
+            store,
+            verifier,
+            fail_next_terminal_persist: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_terminal_persist(&self) {
+        self.fail_next_terminal_persist
+            .store(true, Ordering::SeqCst);
     }
 
     #[must_use]
@@ -200,6 +212,15 @@ impl MissionService {
                 .event
                 .validate()
                 .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
+        }
+        if mission.phase.is_terminal()
+            && self
+                .fail_next_terminal_persist
+                .swap(false, Ordering::SeqCst)
+        {
+            return Err(MissionCommandError::internal(
+                "injected terminal persist failure",
+            ));
         }
         self.store
             .lock()

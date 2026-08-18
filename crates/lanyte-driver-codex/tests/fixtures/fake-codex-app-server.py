@@ -32,6 +32,10 @@ def main() -> None:
                 )
                 + "\n"
             )
+            sys.stdout.write(
+                json.dumps({"method": "thread/exited", "params": {"threadId": "thr_test"}})
+                + "\n"
+            )
             sys.stdout.flush()
         elif method == "thread/unsubscribe":
             sys.stdout.write(

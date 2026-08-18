@@ -43,21 +43,24 @@ async fn launch_observe_close_against_fake_app_server() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let mut saw_started = false;
     let mut saw_tool = false;
+    let mut saw_exited = false;
     for _ in 0..12 {
         match session.observe().await.expect("observe") {
             Some(NormalizedHarnessEvent::Started { .. }) => saw_started = true,
             Some(NormalizedHarnessEvent::ToolProposed { tool, .. }) if tool == "shell" => {
                 saw_tool = true;
             }
+            Some(NormalizedHarnessEvent::Exited { success: true, .. }) => saw_exited = true,
             _ => {}
         }
-        if saw_started && saw_tool {
+        if saw_started && saw_tool && saw_exited {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(saw_started, "expected a started event");
     assert!(saw_tool, "expected a tool proposal from the fake server");
+    assert!(saw_exited, "expected an exited event from the fake server");
     let outcome = session.close().await.expect("close");
     assert!(
         matches!(outcome, CloseOutcome::Terminated(_)),

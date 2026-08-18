@@ -75,6 +75,7 @@ pub struct CodexSession {
     events: Arc<Mutex<VecDeque<NormalizedHarnessEvent>>>,
     overflowed: Arc<std::sync::atomic::AtomicBool>,
     next_id: AtomicU64,
+    last_close: Option<CloseOutcome>,
 }
 
 impl CodexSession {
@@ -124,9 +125,19 @@ impl CodexSession {
         self.child.try_wait().map_err(Into::into)
     }
 
+    #[must_use]
+    pub fn retained_close_outcome(&self) -> Option<CloseOutcome> {
+        self.last_close
+    }
+
     pub async fn close(&mut self) -> Result<CloseOutcome, CodexDriverError> {
+        if let Some(CloseOutcome::Terminated(status)) = self.last_close {
+            return Ok(CloseOutcome::Terminated(status));
+        }
         if let Ok(Some(status)) = self.child.try_wait() {
-            return Ok(CloseOutcome::AlreadyExited(status));
+            let outcome = CloseOutcome::AlreadyExited(status);
+            self.last_close = Some(outcome);
+            return Ok(outcome);
         }
         if !self.harness_session_id.is_empty() {
             let _ = self
@@ -140,7 +151,9 @@ impl CodexSession {
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
             .await
             .map_err(|_| CodexDriverError::Timeout)??;
-        Ok(CloseOutcome::Terminated(status))
+        let outcome = CloseOutcome::Terminated(status);
+        self.last_close = Some(outcome);
+        Ok(outcome)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), CodexDriverError> {
@@ -237,6 +250,7 @@ impl CodexAppServerDriver {
             events: Arc::new(Mutex::new(VecDeque::new())),
             overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
+            last_close: None,
         };
         if let Err(err) = session
             .request(
