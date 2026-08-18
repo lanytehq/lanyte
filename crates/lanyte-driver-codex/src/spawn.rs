@@ -57,7 +57,7 @@ impl CodexBinary {
         std::fs::create_dir_all(pin_dir)
             .map_err(|err| SpawnError::Exec(pin_dir.display().to_string(), err.to_string()))?;
         let pinned = pin_dir.join(&self.digest);
-        install_executable(&self.path, &pinned)?;
+        install_executable(&self.path, &pinned, &self.digest)?;
         let bytes = std::fs::read(&pinned)
             .map_err(|err| SpawnError::Exec(pinned.display().to_string(), err.to_string()))?;
         let digest = format!("{:x}", Sha256::digest(bytes));
@@ -152,7 +152,7 @@ fn is_text_file_busy(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(26)
 }
 
-fn install_executable(source: &Path, dest: &Path) -> Result<(), SpawnError> {
+fn install_executable(source: &Path, dest: &Path, expected_digest: &str) -> Result<(), SpawnError> {
     if dest.is_file() {
         return Ok(());
     }
@@ -163,14 +163,27 @@ fn install_executable(source: &Path, dest: &Path) -> Result<(), SpawnError> {
     );
     let staging = dest.with_file_name(staging_name);
     write_exclusive_copy(source, &staging)?;
-    if dest.is_file() {
+    let staged = std::fs::read(&staging)
+        .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
+    let staged_digest = format!("{:x}", Sha256::digest(staged));
+    if staged_digest != expected_digest {
         let _ = std::fs::remove_file(&staging);
-        return Ok(());
+        return Err(SpawnError::Exec(
+            staging.display().to_string(),
+            "staging digest does not match the resolved binary".to_owned(),
+        ));
     }
-    match std::fs::rename(&staging, dest) {
-        Ok(()) => Ok(()),
+    publish_exclusive(&staging, dest)
+}
+
+fn publish_exclusive(staging: &Path, dest: &Path) -> Result<(), SpawnError> {
+    match std::fs::hard_link(staging, dest) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(staging);
+            Ok(())
+        }
         Err(err) => {
-            let _ = std::fs::remove_file(&staging);
+            let _ = std::fs::remove_file(staging);
             if dest.is_file() {
                 Ok(())
             } else {
@@ -323,12 +336,24 @@ mod tests {
             results.iter().all(Result::is_ok),
             "concurrent pin_copy must not fail: {results:?}"
         );
-        let published: std::collections::BTreeSet<_> = results
-            .into_iter()
-            .map(|result| result.unwrap().path)
-            .collect();
-        assert_eq!(published.len(), 1);
-        assert_eq!(published.iter().next().unwrap(), &pin_dir.join(&digest));
+        let published: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+        let final_path = pin_dir.join(&digest);
+        assert!(published.iter().all(|pin| pin.path == final_path));
+        let bytes = std::fs::read(&final_path).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), digest);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let inodes: std::collections::BTreeSet<_> = published
+                .iter()
+                .map(|pin| std::fs::metadata(&pin.path).unwrap().ino())
+                .collect();
+            assert_eq!(inodes.len(), 1, "winner inode must not be replaced");
+            assert_eq!(
+                std::fs::metadata(&final_path).unwrap().ino(),
+                *inodes.iter().next().unwrap()
+            );
+        }
         let leftovers: Vec<_> = std::fs::read_dir(&pin_dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -339,6 +364,24 @@ mod tests {
             leftovers.is_empty(),
             "no leftover staging files: {leftovers:?}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pin_copy_rejects_source_that_does_not_match_claimed_digest() {
+        let root = std::env::temp_dir().join(format!("lanyte-pin-digest-{}", uuid_like()));
+        let pin_dir = root.join("pins");
+        std::fs::create_dir_all(&pin_dir).unwrap();
+        let source = root.join("codex-src");
+        std::fs::write(&source, b"claimed").unwrap();
+        let binary = CodexBinary {
+            path: source,
+            version: "fake".to_owned(),
+            digest: "ab".repeat(32),
+        };
+        let err = binary.pin_copy(&pin_dir).expect_err("digest mismatch");
+        assert!(err.to_string().contains("staging digest"));
+        assert!(pin_dir.read_dir().unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 }
