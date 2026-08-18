@@ -22,7 +22,7 @@ license = "MIT OR Apache-2.0"
 base64 = "0.22"
 bytes = "1"
 ipcprims = { git = "https://github.com/3leaps/ipcprims", tag = "v0.2.0", version = "0.2.0", features = ["schema", "peer", "async"] }
-lanyte-attest = { version = "0.1.0", git = "https://github.com/lanytehq/lanyte-attest", rev = "989f31133c4c860b86f172679aaca997393e80eb", default-features = false, features = ["verify"] }
+lanyte-attest = { version = "0.1.0", git = "https://github.com/lanytehq/lanyte-attest", rev = "9645a315a297c77a5005ca57eb11b517f660fabf", default-features = false, features = ["verify"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

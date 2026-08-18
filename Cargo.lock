@@ -1671,7 +1671,7 @@ dependencies = [
 [[package]]
 name = "lanyte-attest"
 version = "0.1.0"
-source = "git+https://github.com/lanytehq/lanyte-attest?rev=989f31133c4c860b86f172679aaca997393e80eb#989f31133c4c860b86f172679aaca997393e80eb"
+source = "git+https://github.com/lanytehq/lanyte-attest?rev=9645a315a297c77a5005ca57eb11b517f660fabf#9645a315a297c77a5005ca57eb11b517f660fabf"
 dependencies = [
  "base64 0.22.1",
  "log",
