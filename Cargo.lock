@@ -1652,6 +1652,7 @@ dependencies = [
  "clap",
  "ipcprims",
  "lanyte-common",
+ "lanyte-driver-codex",
  "lanyte-gateway",
  "lanyte-llm",
  "lanyte-mission",
@@ -1697,6 +1698,20 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+]
+
+[[package]]
+name = "lanyte-driver-codex"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lanyte-mission",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1759,6 +1774,7 @@ dependencies = [
  "ipcprims",
  "lanyte-attest",
  "lanyte-common",
+ "lanyte-driver-codex",
  "lanyte-gateway",
  "lanyte-llm",
  "lanyte-mission",
@@ -1766,6 +1782,7 @@ dependencies = [
  "lanyte-telemetry",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
