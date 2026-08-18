@@ -24,6 +24,7 @@ use rusqlite::{
     params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const LANYTE_STATE_ROOT_ENV: &str = "LANYTE_STATE_ROOT";
 pub const DEFAULT_STATE_ROOT: &str = "/var/lib/lanyte/state";
@@ -372,6 +373,48 @@ impl StateStore {
         SessionEvictor { store: self }
     }
 
+    pub fn completed_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
+        validate_mission_create_idempotency(key, fingerprint)?;
+        let existing: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT request_fingerprint, result_json FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            None => Ok(None),
+            Some((stored, result)) if stored == fingerprint && !result.is_empty() => {
+                Ok(Some(result))
+            }
+            Some((stored, _)) if stored != fingerprint => {
+                Err(StateError::MissionIdempotencyConflict {
+                    key: key.to_owned(),
+                })
+            }
+            Some(_) => Ok(None),
+        }
+    }
+
+    pub fn renew_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
+        let now = Utc::now();
+        let updated = self.connection.execute(
+            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2 AND owner_token = ?3 AND result_json = ''",
+            params![
+                now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                key,
+                owner_token
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidMissionProjection(
+                "mutation lease could not be renewed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn reserve_mutation(
         &mut self,
         mission_id: &str,
@@ -382,11 +425,7 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now();
-        let token = format!(
-            "{:x}-{:x}",
-            now.timestamp_nanos_opt().unwrap_or(0),
-            now.timestamp_subsec_nanos()
-        );
+        let token = Uuid::new_v4().to_string();
         let existing: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT request_fingerprint, result_json, reserved_at FROM mission_mutations WHERE idempotency_key = ?1 LIMIT 1",

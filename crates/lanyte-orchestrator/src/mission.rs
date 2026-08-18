@@ -236,6 +236,37 @@ impl MissionService {
             .collect()
     }
 
+    pub(crate) fn completed_mutation(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<Option<String>, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .completed_mutation(key, fingerprint)
+            .map_err(|err| match err {
+                lanyte_state::StateError::MissionIdempotencyConflict { .. } => {
+                    MissionCommandError::invalid_args(
+                        "idempotency key conflicts with a prior mutation",
+                    )
+                }
+                other => MissionCommandError::internal(other.to_string()),
+            })
+    }
+
+    pub(crate) fn renew_mutation(
+        &self,
+        key: &str,
+        owner_token: &str,
+    ) -> Result<(), MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .renew_mutation(key, owner_token)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))
+    }
+
     pub(crate) fn reserve_mutation(
         &self,
         mission_id: &str,

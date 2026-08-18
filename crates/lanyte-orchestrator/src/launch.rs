@@ -191,6 +191,9 @@ impl Orchestrator {
             }),
         )?;
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
+        if let Some(replayed) = service.completed_mutation(&idempotency_key, &fingerprint)? {
+            return replayed_control_result(&replayed);
+        }
         let before = stored.mission.clone();
         if before.revision != expected_revision {
             return Err(MissionCommandError::invalid_args(format!(
@@ -246,10 +249,12 @@ impl Orchestrator {
             )
             .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         let attempt_id = Uuid::new_v4();
+        service.renew_mutation(&idempotency_key, &owner_token)?;
         let session = driver
             .create(attempt_id)
             .await
             .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        service.renew_mutation(&idempotency_key, &owner_token)?;
         if session.binary.digest != report.validity_condition.executable_sha256 {
             return Err(MissionCommandError::internal(
                 "pinned executable digest does not match the gated capability report",
@@ -516,6 +521,9 @@ impl Orchestrator {
             }),
         )?;
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
+        if let Some(replayed) = service.completed_mutation(&idempotency_key, &fingerprint)? {
+            return replayed_control_result(&replayed);
+        }
         let before = stored.mission.clone();
         let already_cancelling = before.attempts.iter().any(|attempt| {
             attempt.state == AttemptState::Cancelling
@@ -590,37 +598,57 @@ impl Orchestrator {
             (cancelling, expected_revision + 1)
         };
         let mut sessions = live_sessions().lock().await;
-        if let Some(session) = sessions.get_mut(&attempt_id) {
+        let reaped = if let Some(session) = sessions.get_mut(&attempt_id) {
             session
                 .close()
                 .await
                 .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-        } else if !already_cancelling {
+            true
+        } else if already_cancelling {
+            false
+        } else {
             return Err(MissionCommandError::invalid_args(
                 "codex session is not in this kernel; close will not claim cancellation",
             ));
-        }
+        };
 
         let now = Utc::now();
+        let (phase, terminal_reason, attempt_state, attempt_reason, to_state) = if reaped {
+            (
+                MissionPhase::Cancelled,
+                MissionTerminalReason::OperatorCancelled,
+                AttemptState::Cancelled,
+                AttemptTerminalReason::OperatorCancelled,
+                AttemptState::Cancelled,
+            )
+        } else {
+            (
+                MissionPhase::Failed,
+                MissionTerminalReason::InternalError,
+                AttemptState::Lost,
+                AttemptTerminalReason::ConnectivityLost,
+                AttemptState::Lost,
+            )
+        };
         let mut mission = cancelling.clone();
         mission.revision = terminal_expected + 1;
         mission.updated_at = now;
-        mission.phase = MissionPhase::Cancelled;
-        mission.terminal_reason = Some(MissionTerminalReason::OperatorCancelled);
+        mission.phase = phase;
+        mission.terminal_reason = Some(terminal_reason);
         mission.current_attempt_id = None;
         if let Some(attempt) = mission
             .attempts
             .iter_mut()
             .find(|attempt| attempt.attempt_id == attempt_id)
         {
-            attempt.state = AttemptState::Cancelled;
+            attempt.state = attempt_state;
             attempt.ended_at = Some(now);
-            attempt.terminal_reason = Some(AttemptTerminalReason::OperatorCancelled);
+            attempt.terminal_reason = Some(attempt_reason);
         }
         MissionTransition {
             expected_revision: terminal_expected,
             from: MissionPhase::Active,
-            to: MissionPhase::Cancelled,
+            to: phase,
         }
         .check(&cancelling, &mission)
         .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
@@ -633,23 +661,31 @@ impl Orchestrator {
                     attempt_id,
                     generation: 1,
                     from: AttemptState::Cancelling,
-                    to: AttemptState::Cancelled,
-                    reason: Some("operator close".to_owned()),
+                    to: to_state,
+                    reason: Some(if reaped {
+                        "operator close".to_owned()
+                    } else {
+                        "session handle lost; process not reaped".to_owned()
+                    }),
                 },
             ),
             (
                 EventSourceKind::OperatorCommand,
                 LifecyclePayload::MissionPhaseChanged {
                     from: MissionPhase::Active,
-                    to: MissionPhase::Cancelled,
-                    reason: Some("operator close".to_owned()),
+                    to: phase,
+                    reason: Some(if reaped {
+                        "operator close".to_owned()
+                    } else {
+                        "uncertain child after handle loss".to_owned()
+                    }),
                 },
             ),
             (
                 EventSourceKind::OperatorCommand,
                 LifecyclePayload::MissionTerminal {
-                    phase: MissionPhase::Cancelled,
-                    reason: MissionTerminalReason::OperatorCancelled,
+                    phase,
+                    reason: terminal_reason,
                     terminal_entry_hash: "0".repeat(64),
                 },
             ),
