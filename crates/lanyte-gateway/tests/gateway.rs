@@ -3,7 +3,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use ipcprims::peer::async_connect;
+use ipcprims::peer::{async_connect, async_connect_with_config, HandshakeConfig};
 use lanyte_common::channels;
 use lanyte_gateway::test_support::{
     spawn_test_gateway, write_all_peer_schemas, write_schema, TempGatewayDir,
@@ -37,6 +37,45 @@ async fn gateway_accepts_peer_and_forwards_validated_frames() {
     assert_eq!(ev.peer_id, "peer-1");
     assert_eq!(ev.channel, channels::MAIL);
     assert_eq!(ev.payload, b"{}".to_vec());
+
+    handle.cancel();
+    handle.wait().await.expect("gateway should exit");
+}
+
+#[tokio::test]
+async fn gateway_forwards_handshake_auth_in_a_redacted_handle() {
+    let dir = TempGatewayDir::new("auth");
+    let (handle, mut events) =
+        spawn_test_gateway(&dir, &[channels::COMMAND]).expect("spawn should succeed");
+    let token = "test-session-token";
+    let handshake = HandshakeConfig {
+        auth_token: Some(token.to_owned()),
+        ..HandshakeConfig::default()
+    };
+    let client = async_connect_with_config(
+        dir.socket_path(),
+        &[channels::COMMAND],
+        &handshake,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("client should connect");
+    let (tx, _rx) = client.into_split();
+
+    tx.send_json(channels::COMMAND, &json!({}))
+        .await
+        .expect("frame should send");
+
+    let event = recv_event(&mut events).await;
+    let auth = event
+        .client_auth_token
+        .as_ref()
+        .expect("gateway should preserve handshake auth");
+    assert_eq!(auth.expose(), token);
+    assert_eq!(format!("{auth:?}"), "ClientAuthToken([REDACTED])");
+    assert!(!format!("{event:?}").contains(token));
 
     handle.cancel();
     handle.wait().await.expect("gateway should exit");

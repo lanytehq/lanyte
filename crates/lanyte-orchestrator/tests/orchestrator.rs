@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::{env, fs};
 
-use ipcprims::peer::async_connect;
+use ipcprims::peer::{async_connect, async_connect_with_config, HandshakeConfig};
 use lanyte_common::{channels, ProviderKind};
 use lanyte_gateway::test_support::{spawn_test_gateway, TempGatewayDir};
 use lanyte_gateway::{PeerResponse, PeerSendError};
@@ -14,16 +14,43 @@ use lanyte_llm::{
     BackendCapabilities, CompletionRequest, CompletionResponse, HealthStatus, LlmBackend, LlmError,
     LlmStream, Usage,
 };
-use lanyte_orchestrator::{ConfiguredBackends, Orchestrator};
+use lanyte_mission::{MissionControlRequest, MissionCreateBody, MissionListBody, RecoveryPolicy};
+use lanyte_orchestrator::{
+    ConfiguredBackends, MissionService, Orchestrator, SessionVerifier, VerifiedSession,
+};
 use lanyte_state::{StatePaths, StateStore};
 use lanyte_telemetry::AuditRecordKind;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct FixedBackend {
     name: &'static str,
     response: CompletionResponse,
+}
+
+struct FixedSessionVerifier;
+
+impl SessionVerifier for FixedSessionVerifier {
+    fn verify(&self, token: &str) -> Result<VerifiedSession, String> {
+        if token != "valid-session-token" {
+            return Err("attestation denied".to_owned());
+        }
+        Ok(VerifiedSession {
+            issuer: "lanyte-attest".to_owned(),
+            subject: "operator-subject".to_owned(),
+            session_id: Uuid::parse_str("10000000-0000-4000-8000-000000000001")
+                .expect("session UUID"),
+            role: "operator".to_owned(),
+            scope: "lanytehq".to_owned(),
+            jti: Uuid::parse_str("20000000-0000-4000-9000-000000000002").expect("jti UUID"),
+            context_sha256: "1".repeat(64),
+            token_sha256: "2".repeat(64),
+            verification_policy_sha256: "3".repeat(64),
+            trust_ref: "lanyte-attest://lanyte-attest/sessions/test".to_owned(),
+        })
+    }
 }
 
 fn configured_backends(
@@ -695,6 +722,198 @@ async fn llm_complete_command_appends_runtime_audit_records() {
     assert_eq!(records[0].kind, AuditRecordKind::Effect);
     assert_eq!(records[1].kind, AuditRecordKind::Outcome);
     assert_eq!(records[1].prev_hash, records[0].entry_hash);
+
+    cancel.cancel();
+    gateway.cancel();
+    orchestrator_task
+        .await
+        .expect("orchestrator task should join")
+        .expect("orchestrator should exit cleanly");
+    gateway.wait().await.expect("gateway should exit");
+    let _ = fs::remove_dir_all(&state_root);
+}
+
+#[tokio::test]
+async fn mission_command_requires_handshake_auth_and_survives_client_disconnect() {
+    let dir = TempGatewayDir::new("orchestrator-mission");
+    let (gateway, events) =
+        spawn_test_gateway(&dir, &[channels::COMMAND]).expect("gateway should spawn");
+    let state_root = temp_state_root("mission");
+    let store = Arc::new(Mutex::new(
+        StateStore::open(StatePaths::new(&state_root)).expect("state store should open"),
+    ));
+    let mission_service = MissionService::new(store, Arc::new(FixedSessionVerifier));
+    let cancel = CancellationToken::new();
+    let orchestrator = Orchestrator::new(events, cancel.clone(), gateway.responder(), None)
+        .with_mission_service(mission_service);
+    let orchestrator_task = tokio::spawn(orchestrator.run());
+
+    let denied_request = MissionControlRequest::create(
+        Uuid::new_v4(),
+        "mission:denied-create".to_owned(),
+        MissionCreateBody {
+            goal: "Must not persist".to_owned(),
+            policy_id: "policy.local".to_owned(),
+            deadline_at: None,
+            recovery_policy: RecoveryPolicy::AskOperator,
+        },
+    )
+    .expect("valid denied request");
+    let denied_client = async_connect(dir.socket_path(), &[channels::COMMAND])
+        .await
+        .expect("unauthenticated client should connect");
+    let (denied_tx, mut denied_rx) = denied_client.into_split();
+    denied_tx
+        .send_json(
+            channels::COMMAND,
+            &serde_json::json!({
+                "type": "invoke",
+                "request_id": denied_request.request_id(),
+                "command": denied_request.operation(),
+                "args": denied_request,
+            }),
+        )
+        .await
+        .expect("denied command should send");
+    let denied_frame = tokio::time::timeout(Duration::from_secs(2), denied_rx.recv())
+        .await
+        .expect("denial should arrive")
+        .expect("denial frame");
+    let denied: serde_json::Value =
+        serde_json::from_slice(denied_frame.payload.as_ref()).expect("denial JSON");
+    assert_eq!(denied["type"], "invoke_error");
+    assert_eq!(denied["error_code"], "permission_denied");
+    drop(denied_tx);
+    drop(denied_rx);
+
+    let handshake = HandshakeConfig {
+        auth_token: Some("valid-session-token".to_owned()),
+        ..HandshakeConfig::default()
+    };
+    let create_request = MissionControlRequest::create(
+        Uuid::new_v4(),
+        "mission:persistent".to_owned(),
+        MissionCreateBody {
+            goal: "Retain the record after this client exits".to_owned(),
+            policy_id: "policy.local".to_owned(),
+            deadline_at: None,
+            recovery_policy: RecoveryPolicy::AskOperator,
+        },
+    )
+    .expect("valid create request");
+    let create_client = async_connect_with_config(
+        dir.socket_path(),
+        &[channels::COMMAND],
+        &handshake,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("authenticated client should connect");
+    let (create_tx, mut create_rx) = create_client.into_split();
+    create_tx
+        .send_json(
+            channels::COMMAND,
+            &serde_json::json!({
+                "type": "invoke",
+                "request_id": create_request.request_id(),
+                "command": create_request.operation(),
+                "args": create_request,
+            }),
+        )
+        .await
+        .expect("create command should send");
+    let created_frame = tokio::time::timeout(Duration::from_secs(2), create_rx.recv())
+        .await
+        .expect("create result should arrive")
+        .expect("create result frame");
+    let created: serde_json::Value =
+        serde_json::from_slice(created_frame.payload.as_ref()).expect("create result JSON");
+    assert_eq!(created["type"], "invoke_result");
+    let mission_id = created["result"]["body"]["record"]["mission_id"]
+        .as_str()
+        .expect("mission id")
+        .to_owned();
+    drop(create_tx);
+    drop(create_rx);
+
+    let mission_id = Uuid::parse_str(&mission_id).expect("mission UUID");
+    let show_request =
+        MissionControlRequest::show(Uuid::new_v4(), mission_id).expect("valid show request");
+    let list_request = MissionControlRequest::list(
+        Uuid::new_v4(),
+        MissionListBody {
+            phases: Vec::new(),
+            limit: 10,
+            cursor: None,
+        },
+    )
+    .expect("valid list request");
+    let query_client = async_connect_with_config(
+        dir.socket_path(),
+        &[channels::COMMAND],
+        &handshake,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("fresh authenticated client should connect");
+    let (query_tx, mut query_rx) = query_client.into_split();
+
+    query_tx
+        .send_json(
+            channels::COMMAND,
+            &serde_json::json!({
+                "type": "invoke",
+                "request_id": show_request.request_id(),
+                "command": show_request.operation(),
+                "args": show_request,
+            }),
+        )
+        .await
+        .expect("show command should send");
+    let shown_frame = tokio::time::timeout(Duration::from_secs(2), query_rx.recv())
+        .await
+        .expect("show result should arrive")
+        .expect("show result frame");
+    let shown: serde_json::Value =
+        serde_json::from_slice(shown_frame.payload.as_ref()).expect("show result JSON");
+    assert_eq!(
+        shown["result"]["body"]["record"]["mission_id"],
+        mission_id.to_string()
+    );
+
+    query_tx
+        .send_json(
+            channels::COMMAND,
+            &serde_json::json!({
+                "type": "invoke",
+                "request_id": list_request.request_id(),
+                "command": list_request.operation(),
+                "args": list_request,
+            }),
+        )
+        .await
+        .expect("list command should send");
+    let list_frame = tokio::time::timeout(Duration::from_secs(2), query_rx.recv())
+        .await
+        .expect("list result should arrive")
+        .expect("list result frame");
+    let listed: serde_json::Value =
+        serde_json::from_slice(list_frame.payload.as_ref()).expect("list result JSON");
+    assert_eq!(
+        listed["result"]["body"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        listed["result"]["body"]["records"][0]["mission_id"],
+        mission_id.to_string()
+    );
 
     cancel.cancel();
     gateway.cancel();

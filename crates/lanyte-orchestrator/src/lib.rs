@@ -1,5 +1,6 @@
 //! Event-loop skeleton for the Lanyte orchestrator.
 
+mod mission;
 mod model;
 
 use std::collections::BTreeMap;
@@ -22,6 +23,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+pub use mission::{
+    AttestationSessionVerifier, MissionCommandError, MissionCommandErrorCode, MissionService,
+    SessionVerifier, VerifiedSession,
+};
 pub use model::{
     ActionError, ActionOutcome, ActionStatus, ContentPart, EntityMessage, EntityRef, Envelope,
     GateDecision, GateProposal, MessageIntent, OrchestratorEffect, OrchestratorEvent, SystemNotice,
@@ -94,6 +99,7 @@ pub struct Orchestrator {
     responder: PeerResponder,
     llm: Option<ConfiguredBackends>,
     audit_store: Option<Arc<Mutex<StateStore>>>,
+    mission_service: Option<MissionService>,
     started_at: Instant,
     #[cfg(any(test, feature = "test-support"))]
     observer: Option<mpsc::UnboundedSender<test_support::HandlerObservation>>,
@@ -113,6 +119,7 @@ impl Orchestrator {
             responder,
             llm,
             audit_store: None,
+            mission_service: None,
             started_at: Instant::now(),
             #[cfg(any(test, feature = "test-support"))]
             observer: None,
@@ -132,6 +139,12 @@ impl Orchestrator {
     #[must_use]
     pub fn with_audit_store(mut self, audit_store: Arc<Mutex<StateStore>>) -> Self {
         self.audit_store = Some(audit_store);
+        self
+    }
+
+    #[must_use]
+    pub fn with_mission_service(mut self, mission_service: MissionService) -> Self {
+        self.mission_service = Some(mission_service);
         self
     }
 
@@ -195,6 +208,11 @@ impl Orchestrator {
                 request_type = %command_request.kind,
                 "command payload logged and dropped"
             );
+            return;
+        }
+
+        if command_request.command.starts_with("mission.") {
+            self.handle_mission_command(event, command_request).await;
             return;
         }
 
@@ -472,6 +490,117 @@ impl Orchestrator {
                 request_id: command_request.request_id,
                 command: command_request.command,
                 result: Self::command_result_payload(&reply_effect, backend_name, &completion),
+            },
+        )
+        .await;
+    }
+
+    async fn handle_mission_command(
+        &self,
+        event: &GatewayEvent,
+        command_request: CommandInvokeRequest,
+    ) {
+        let request: lanyte_mission::MissionControlRequest =
+            match serde_json::from_value(command_request.args.clone()) {
+                Ok(request) => request,
+                Err(err) => {
+                    self.send_command_error(
+                        &event.peer_id,
+                        CommandInvokeError {
+                            kind: "invoke_error",
+                            request_id: command_request.request_id,
+                            command: command_request.command,
+                            error_code: "invalid_args",
+                            message: format!("invalid mission control request: {err}"),
+                            retryable: false,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+        if request.operation() != command_request.command
+            || request.request_id().to_string() != command_request.request_id
+        {
+            self.send_command_error(
+                &event.peer_id,
+                CommandInvokeError {
+                    kind: "invoke_error",
+                    request_id: command_request.request_id,
+                    command: command_request.command,
+                    error_code: "invalid_args",
+                    message: "outer command/request_id must match the mission control payload"
+                        .to_owned(),
+                    retryable: false,
+                },
+            )
+            .await;
+            return;
+        }
+        let Some(service) = &self.mission_service else {
+            self.send_command_error(
+                &event.peer_id,
+                CommandInvokeError {
+                    kind: "invoke_error",
+                    request_id: command_request.request_id,
+                    command: command_request.command,
+                    error_code: "internal_error",
+                    message: "mission service is not configured".to_owned(),
+                    retryable: false,
+                },
+            )
+            .await;
+            return;
+        };
+        let result = match service.handle(
+            request,
+            event
+                .client_auth_token
+                .as_ref()
+                .map(lanyte_gateway::ClientAuthToken::expose),
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id,
+                        command: command_request.command,
+                        error_code: err.code.as_str(),
+                        message: err.message,
+                        retryable: false,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+        let result = match serde_json::to_value(result) {
+            Ok(result) => result,
+            Err(err) => {
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id,
+                        command: command_request.command,
+                        error_code: "internal_error",
+                        message: format!("failed to encode mission result: {err}"),
+                        retryable: false,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+        self.send_command_result(
+            &event.peer_id,
+            CommandInvokeResult {
+                kind: "invoke_result",
+                request_id: command_request.request_id,
+                command: command_request.command,
+                result,
             },
         )
         .await;
@@ -1146,6 +1275,7 @@ mod tests {
                 peer_id: "peer-1".to_owned(),
                 channel: channels::MAIL,
                 payload: b"{}".to_vec(),
+                client_auth_token: None,
             })
             .await;
 
@@ -1174,6 +1304,7 @@ mod tests {
                     .to_payload(),
                 )
                 .expect("payload should serialize"),
+                client_auth_token: None,
             })
             .await;
 
@@ -1192,6 +1323,7 @@ mod tests {
                 peer_id: "peer-1".to_owned(),
                 channel: 999,
                 payload: Vec::new(),
+                client_auth_token: None,
             })
             .await;
 
@@ -1244,6 +1376,7 @@ mod tests {
                     "request_id": "550e8400-e29b-41d4-a716-446655440000"
                 }))
                 .expect("request should serialize"),
+                client_auth_token: None,
             })
             .await;
 

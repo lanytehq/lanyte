@@ -6,6 +6,7 @@ rust-version = "1.85.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lanyte-common = { path = "../lanyte-common", version = "0.1.0" }
 lanyte-mission = { path = "../lanyte-mission", version = "0.1.0" }
