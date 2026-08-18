@@ -17,6 +17,20 @@ fn overflow_fixture_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex-overflow.py")
 }
 
+fn install_fixture(source: PathBuf, dest: &std::path::Path) {
+    let staging = dest.with_extension("partial");
+    std::fs::copy(source, &staging).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    if let Ok(file) = std::fs::File::open(&staging) {
+        let _ = file.sync_all();
+    }
+    std::fs::rename(staging, dest).unwrap();
+}
+
 #[tokio::test]
 async fn launch_observe_close_against_fake_app_server() {
     let root = std::env::temp_dir().join(format!("lanyte-fake-root-{}", Uuid::new_v4()));
@@ -24,22 +38,14 @@ async fn launch_observe_close_against_fake_app_server() {
     let pin_dir = root.join("pins");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&pin_dir).unwrap();
-    std::fs::copy(fixture_binary(), workspace.join("fake-codex")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            workspace.join("fake-codex"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-    }
+    let binary = workspace.join("fake-codex");
+    install_fixture(fixture_binary(), &binary);
 
     let driver = CodexAppServerDriver::new(CodexLaunchSpec {
         workspace: workspace.clone(),
         allowed_root: root.clone(),
         pin_dir,
-        binary_path: Some(workspace.join("fake-codex")),
+        binary_path: Some(binary),
     });
     let mut session = driver.create(Uuid::new_v4()).await.expect("create");
     assert!(!session.harness_session_id.is_empty());
@@ -80,22 +86,14 @@ async fn close_reports_already_exited_when_child_has_left() {
     let pin_dir = root.join("pins");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&pin_dir).unwrap();
-    std::fs::copy(exit_fixture_binary(), workspace.join("fake-codex")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            workspace.join("fake-codex"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-    }
+    let binary = workspace.join("fake-codex");
+    install_fixture(exit_fixture_binary(), &binary);
 
     let driver = CodexAppServerDriver::new(CodexLaunchSpec {
         workspace: workspace.clone(),
         allowed_root: root.clone(),
         pin_dir,
-        binary_path: Some(workspace.join("fake-codex")),
+        binary_path: Some(binary),
     });
     let mut session = driver.create(Uuid::new_v4()).await.expect("create");
     let mut saw_exit = false;
@@ -122,22 +120,14 @@ async fn observation_overflow_is_not_a_complete_stream() {
     let pin_dir = root.join("pins");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&pin_dir).unwrap();
-    std::fs::copy(overflow_fixture_binary(), workspace.join("fake-codex")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            workspace.join("fake-codex"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-    }
+    let binary = workspace.join("fake-codex");
+    install_fixture(overflow_fixture_binary(), &binary);
 
     let driver = CodexAppServerDriver::new(CodexLaunchSpec {
         workspace: workspace.clone(),
         allowed_root: root.clone(),
         pin_dir,
-        binary_path: Some(workspace.join("fake-codex")),
+        binary_path: Some(binary),
     });
     let mut session = driver.create(Uuid::new_v4()).await.expect("create");
     let mut overflowed = false;

@@ -38,12 +38,7 @@ impl CodexBinary {
             return Err(SpawnError::MissingBinary(path.display().to_string()));
         }
         let path = resolve_native_executable(&path)?;
-        let output = Command::new(&path)
-            .arg("--version")
-            .env_clear()
-            .envs(scrub_child_env(workspace))
-            .output()
-            .map_err(|err| SpawnError::Exec(path.display().to_string(), err.to_string()))?;
+        let output = run_version_probe(&path, workspace)?;
         let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let bytes = std::fs::read(&path)
             .map_err(|err| SpawnError::Exec(path.display().to_string(), err.to_string()))?;
@@ -60,15 +55,7 @@ impl CodexBinary {
             .map_err(|err| SpawnError::Exec(pin_dir.display().to_string(), err.to_string()))?;
         let pinned = pin_dir.join(&self.digest);
         if !pinned.is_file() {
-            std::fs::copy(&self.path, &pinned)
-                .map_err(|err| SpawnError::Exec(pinned.display().to_string(), err.to_string()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&pinned, std::fs::Permissions::from_mode(0o500)).map_err(
-                    |err| SpawnError::Exec(pinned.display().to_string(), err.to_string()),
-                )?;
-            }
+            install_executable(&self.path, &pinned)?;
         }
         let bytes = std::fs::read(&pinned)
             .map_err(|err| SpawnError::Exec(pinned.display().to_string(), err.to_string()))?;
@@ -129,6 +116,57 @@ pub fn scrub_child_env(workspace: &Path) -> BTreeMap<String, String> {
     env.insert("TERM".to_owned(), "dumb".to_owned());
     env.insert("LANG".to_owned(), "C".to_owned());
     env
+}
+
+fn run_version_probe(path: &Path, workspace: &Path) -> Result<std::process::Output, SpawnError> {
+    let mut last = None;
+    for attempt in 0..8 {
+        match Command::new(path)
+            .arg("--version")
+            .env_clear()
+            .envs(scrub_child_env(workspace))
+            .output()
+        {
+            Ok(output) => return Ok(output),
+            Err(err) if is_text_file_busy(&err) && attempt + 1 < 8 => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1) as u64));
+                last = Some(err);
+            }
+            Err(err) => {
+                return Err(SpawnError::Exec(
+                    path.display().to_string(),
+                    err.to_string(),
+                ));
+            }
+        }
+    }
+    Err(SpawnError::Exec(
+        path.display().to_string(),
+        last.map(|err| err.to_string())
+            .unwrap_or_else(|| "version probe failed".to_owned()),
+    ))
+}
+
+fn is_text_file_busy(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(26)
+}
+
+fn install_executable(source: &Path, dest: &Path) -> Result<(), SpawnError> {
+    let staging = dest.with_extension("partial");
+    std::fs::copy(source, &staging)
+        .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o500))
+            .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
+    }
+    if let Ok(file) = std::fs::File::open(&staging) {
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&staging, dest)
+        .map_err(|err| SpawnError::Exec(dest.display().to_string(), err.to_string()))?;
+    Ok(())
 }
 
 fn resolve_native_executable(path: &Path) -> Result<PathBuf, SpawnError> {

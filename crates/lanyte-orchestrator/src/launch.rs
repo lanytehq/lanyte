@@ -1277,12 +1277,17 @@ mod close_disposition_tests {
         let binary = workspace.join("fake-codex");
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../lanyte-driver-codex/tests/fixtures/fake-codex-app-server.py");
-        std::fs::copy(fixture, &binary).unwrap();
+        let staging = binary.with_extension("partial");
+        std::fs::copy(fixture, &staging).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        if let Ok(file) = std::fs::File::open(&staging) {
+            let _ = file.sync_all();
+        }
+        std::fs::rename(staging, &binary).unwrap();
 
         let launched = orchestrator
             .launch_codex(
