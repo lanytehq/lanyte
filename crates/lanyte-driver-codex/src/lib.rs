@@ -76,6 +76,25 @@ pub struct CodexSession {
     overflowed: Arc<std::sync::atomic::AtomicBool>,
     next_id: AtomicU64,
     last_close: Option<CloseOutcome>,
+    pub process_tree_ref: Option<String>,
+    active_turn_id: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptAttempt {
+    Unavailable,
+    RequestAccepted { thread_id: String, turn_id: String },
+    Interrupted { thread_id: String, turn_id: String },
+    Timeout { thread_id: String, turn_id: String },
+    Failed { detail: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTreeKill {
+    KillDispatched,
+    Cleared,
+    Survivors,
+    Unknown,
 }
 
 impl CodexSession {
@@ -98,6 +117,7 @@ impl CodexSession {
         };
         let events = Arc::clone(&self.events);
         let overflowed = Arc::clone(&self.overflowed);
+        let active_turn_id = Arc::clone(&self.active_turn_id);
         let attempt_id = self.attempt_id;
         tokio::spawn(async move {
             let mut stdout = stdout.lock().await;
@@ -107,6 +127,17 @@ impl CodexSession {
                     Ok(0) => break,
                     Ok(_) => {
                         if let Some(event) = map_notification(attempt_id, line.trim_end()) {
+                            if let NormalizedHarnessEvent::TurnProgress {
+                                turn_id, status, ..
+                            } = &event
+                            {
+                                let mut turn = active_turn_id.lock().await;
+                                if status == "started" {
+                                    *turn = Some(turn_id.clone());
+                                } else if status == "interrupted" || status == "completed" {
+                                    *turn = None;
+                                }
+                            }
                             let mut queue = events.lock().await;
                             if queue.len() >= 256 {
                                 queue.pop_front();
@@ -154,6 +185,79 @@ impl CodexSession {
         let outcome = CloseOutcome::Terminated(status);
         self.last_close = Some(outcome);
         Ok(outcome)
+    }
+
+    pub async fn active_turn_id(&self) -> Option<String> {
+        self.active_turn_id.lock().await.clone()
+    }
+
+    pub async fn interrupt_active_turn(&mut self) -> InterruptAttempt {
+        let Some(turn_id) = self.active_turn_id().await else {
+            return InterruptAttempt::Unavailable;
+        };
+        if self.harness_session_id.is_empty() {
+            return InterruptAttempt::Unavailable;
+        }
+        let thread_id = self.harness_session_id.clone();
+        if let Err(err) = self
+            .notify(
+                "turn/interrupt",
+                json!({ "threadId": thread_id, "turnId": turn_id }),
+            )
+            .await
+        {
+            return InterruptAttempt::Failed {
+                detail: err.to_string(),
+            };
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return InterruptAttempt::Timeout { thread_id, turn_id };
+            }
+            let maybe = self.events.lock().await.iter().rev().find_map(|event| {
+                if let NormalizedHarnessEvent::TurnProgress {
+                    turn_id: event_turn,
+                    status,
+                    ..
+                } = event
+                {
+                    if event_turn == &turn_id && status == "interrupted" {
+                        return Some(());
+                    }
+                }
+                None
+            });
+            if maybe.is_some() {
+                return InterruptAttempt::Interrupted { thread_id, turn_id };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    pub fn kill_process_tree(&mut self) -> ProcessTreeKill {
+        let Some(pid) = self.child.id() else {
+            return ProcessTreeKill::Unknown;
+        };
+        #[cfg(unix)]
+        {
+            let status = std::process::Command::new("kill")
+                .args(["-KILL", &format!("-{pid}")])
+                .status();
+            if !status.map(|value| value.success()).unwrap_or(false) {
+                let _ = self.child.start_kill();
+                return ProcessTreeKill::KillDispatched;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.start_kill();
+        }
+        match self.child.try_wait() {
+            Ok(Some(_)) => ProcessTreeKill::Cleared,
+            Ok(None) => ProcessTreeKill::KillDispatched,
+            Err(_) => ProcessTreeKill::Unknown,
+        }
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), CodexDriverError> {
@@ -228,7 +332,12 @@ impl CodexAppServerDriver {
             .kill_on_drop(true)
             .env_clear()
             .envs(scrub_child_env(&workspace));
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
         let mut child = command.spawn()?;
+        let process_tree_ref = child.id().map(|pid| format!("pgid:{pid}"));
         let stdin = child.stdin.take().ok_or(CodexDriverError::StdinClosed)?;
         let stdout = child.stdout.take().ok_or(CodexDriverError::StdoutClosed)?;
         if let Some(stderr) = child.stderr.take() {
@@ -251,6 +360,8 @@ impl CodexAppServerDriver {
             overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
             last_close: None,
+            process_tree_ref,
+            active_turn_id: Arc::new(Mutex::new(None)),
         };
         if let Err(err) = session
             .request(

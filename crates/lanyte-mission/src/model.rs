@@ -480,6 +480,8 @@ pub enum LifecyclePayload {
         from: AttemptState,
         to: AttemptState,
         reason: Option<String>,
+        #[serde(default)]
+        cause: Option<AttemptStateCause>,
     },
     DriverCapabilityEvaluated {
         attempt_id: Uuid,
@@ -502,6 +504,61 @@ pub enum LifecyclePayload {
         reason: MissionTerminalReason,
         terminal_entry_hash: String,
     },
+    CancelRequested {
+        attempt_id: Option<Uuid>,
+        generation: Option<u64>,
+        lease_generation: Option<u64>,
+    },
+    ProtocolCancelAttempted {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        outcome: crate::ProtocolCancelOutcome,
+    },
+    ProcessTerminationAttempted {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        outcome: crate::FallbackCancelOutcome,
+    },
+    LeaseStarted {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        lease_expires_at: DateTime<Utc>,
+        deadman_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        observation_source: ObservationSource,
+    },
+    LeaseTick {
+        attempt_id: Uuid,
+        generation: u64,
+        kind: LeaseTickKind,
+        prior_lease_generation: u64,
+        result_lease_generation: u64,
+        prior_lease_expires_at: DateTime<Utc>,
+        prior_deadman_at: DateTime<Utc>,
+        result_lease_expires_at: DateTime<Utc>,
+        result_deadman_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        observation_source: ObservationSource,
+    },
+    RestartReconciled {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        overdue: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseTickKind {
+    Renewed,
+    DeadmanFired,
+    Expired,
 }
 
 impl LifecyclePayload {
@@ -517,6 +574,12 @@ impl LifecyclePayload {
             Self::RecoveryRequested { .. } => "recovery_requested",
             Self::RecoveryPointRecorded { .. } => "recovery_point_recorded",
             Self::MissionTerminal { .. } => "mission_terminal",
+            Self::CancelRequested { .. } => "cancel_requested",
+            Self::ProtocolCancelAttempted { .. } => "protocol_cancel_attempted",
+            Self::ProcessTerminationAttempted { .. } => "process_termination_attempted",
+            Self::LeaseStarted { .. } => "lease_started",
+            Self::LeaseTick { .. } => "lease_tick",
+            Self::RestartReconciled { .. } => "restart_reconciled",
         }
     }
 }

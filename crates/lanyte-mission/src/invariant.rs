@@ -770,7 +770,13 @@ pub fn validate_history(
             }
             LifecyclePayload::RecoveryRequested { .. }
             | LifecyclePayload::RecoveryPointRecorded { .. }
-            | LifecyclePayload::MissionTerminal { .. } => {}
+            | LifecyclePayload::MissionTerminal { .. }
+            | LifecyclePayload::CancelRequested { .. }
+            | LifecyclePayload::ProtocolCancelAttempted { .. }
+            | LifecyclePayload::ProcessTerminationAttempted { .. }
+            | LifecyclePayload::LeaseStarted { .. }
+            | LifecyclePayload::LeaseTick { .. }
+            | LifecyclePayload::RestartReconciled { .. } => {}
         }
         previous_hash = Some(event.entry_hash.clone());
         previous_occurred_at = Some(event.occurred_at);
@@ -900,6 +906,7 @@ fn validate_lifecycle_payload(payload: &LifecyclePayload) -> Result<(), Invarian
             from,
             to,
             reason,
+            cause: _,
         } => {
             if !is_uuid_v4(*attempt_id) || *generation == 0 {
                 return Err(InvariantError::new(
@@ -977,7 +984,13 @@ fn validate_lifecycle_payload(payload: &LifecyclePayload) -> Result<(), Invarian
             }
             Ok(())
         }
-        LifecyclePayload::MissionCreated { .. } => Ok(()),
+        LifecyclePayload::MissionCreated { .. }
+        | LifecyclePayload::CancelRequested { .. }
+        | LifecyclePayload::ProtocolCancelAttempted { .. }
+        | LifecyclePayload::ProcessTerminationAttempted { .. }
+        | LifecyclePayload::LeaseStarted { .. }
+        | LifecyclePayload::LeaseTick { .. }
+        | LifecyclePayload::RestartReconciled { .. } => Ok(()),
     }
 }
 

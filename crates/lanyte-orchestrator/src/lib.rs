@@ -7,7 +7,7 @@ mod model;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use lanyte_common::{channels, ChannelId, ProviderKind};
@@ -150,11 +150,21 @@ impl Orchestrator {
     }
 
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut startup = true;
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
                     tracing::info!("orchestrator shutting down");
                     return Ok(());
+                }
+                _ = ticker.tick() => {
+                    if startup {
+                        self.reconcile_restarts().await;
+                        startup = false;
+                    }
+                    self.tick_leases().await;
                 }
                 event = self.events.recv() => {
                     let event = match event {
@@ -222,6 +232,10 @@ impl Orchestrator {
         }
         if command_request.command == "mission.close" {
             self.handle_mission_close(event, command_request).await;
+            return;
+        }
+        if command_request.command == "mission.cancel" {
+            self.handle_mission_cancel(event, command_request).await;
             return;
         }
 

@@ -236,6 +236,20 @@ impl MissionService {
             })
     }
 
+    pub(crate) fn supervised_missions(
+        &self,
+    ) -> Result<Vec<lanyte_mission::MissionRecord>, MissionCommandError> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .list_supervised_missions()
+            .map_err(map_state_error)?
+            .into_iter()
+            .map(|projection| projection.mission)
+            .collect())
+    }
+
     pub(crate) fn lifecycle_history(
         &self,
         mission_id: &str,
@@ -679,7 +693,8 @@ mod tests {
             }
             MissionControlResult::List { .. }
             | MissionControlResult::Observe { .. }
-            | MissionControlResult::Close { .. } => panic!("expected record result"),
+            | MissionControlResult::Close { .. }
+            | MissionControlResult::Cancel { .. } => panic!("expected record result"),
         }
     }
 
@@ -776,7 +791,8 @@ mod tests {
             }
             MissionControlResult::Record { .. }
             | MissionControlResult::Observe { .. }
-            | MissionControlResult::Close { .. } => panic!("expected list result"),
+            | MissionControlResult::Close { .. }
+            | MissionControlResult::Cancel { .. } => panic!("expected list result"),
         }
 
         let hidden = service
@@ -810,7 +826,8 @@ mod tests {
             }
             MissionControlResult::List { .. }
             | MissionControlResult::Observe { .. }
-            | MissionControlResult::Close { .. } => panic!("expected record result"),
+            | MissionControlResult::Close { .. }
+            | MissionControlResult::Cancel { .. } => panic!("expected record result"),
         }
 
         let database = std::fs::read(paths.hot_db_path()).expect("read hot database");

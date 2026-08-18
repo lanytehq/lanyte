@@ -3,16 +3,19 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use lanyte_driver_codex::{
     confine_workspace, CloseOutcome, CodexAppServerDriver, CodexLaunchSpec, CodexSession,
+    InterruptAttempt, ProcessTreeKill,
 };
 use lanyte_gateway::GatewayEvent;
 use lanyte_mission::{
-    AttemptRecord, AttemptState, AttemptTerminalReason, CapabilityName, EventSource,
-    EventSourceKind, HarnessDriver, HarnessSelection, LifecycleEvent, LifecyclePayload,
+    AttemptRecord, AttemptState, AttemptStateCause, AttemptTerminalReason, CancelProgress,
+    CapabilityName, EventSource, EventSourceKind, FallbackCancelOutcome, FallbackCancelProgress,
+    HarnessDriver, HarnessSelection, LeasePolicy, LeaseTickKind, LifecycleEvent, LifecyclePayload,
     MissionControlRequest, MissionControlResult, MissionPhase, MissionTerminalReason,
-    MissionTransition, ObservationLevel, PrincipalRef, RecoveryRelation, LIFECYCLE_EVENT_SCHEMA,
+    MissionTransition, ObservationLevel, ObservationSource, PrincipalRef, ProtocolCancelOutcome,
+    ProtocolCancelProgress, RecoveryRelation, LIFECYCLE_EVENT_SCHEMA,
 };
 use lanyte_state::NewMissionProjectionReceipt;
 use lanyte_telemetry::AuditEnvelopeRef;
@@ -79,6 +82,24 @@ impl Orchestrator {
                     event,
                     command_request,
                     self.close_codex(event, request).await,
+                )
+                .await
+            }
+            Err(err) => self.reply_control_error(event, command_request, err).await,
+        }
+    }
+
+    pub(super) async fn handle_mission_cancel(
+        &self,
+        event: &GatewayEvent,
+        command_request: CommandInvokeRequest,
+    ) {
+        match self.parse_control(&command_request) {
+            Ok(request) => {
+                self.reply_control(
+                    event,
+                    command_request,
+                    self.cancel_mission(event, request).await,
                 )
                 .await
             }
@@ -268,6 +289,17 @@ impl Orchestrator {
         let now = Utc::now();
         let authorizer = caller_principal(&caller);
         let mut mission = before.clone();
+        if !mission.lease_policy.enabled {
+            mission.lease_policy = LeasePolicy {
+                enabled: true,
+                lease_seconds: Some(600),
+                deadman_seconds: Some(300),
+            };
+        }
+        let lease_seconds = mission.lease_policy.lease_seconds.unwrap_or(600);
+        let deadman_seconds = mission.lease_policy.deadman_seconds.unwrap_or(300);
+        let lease_expires_at = now + Duration::seconds(lease_seconds as i64);
+        let deadman_at = now + Duration::seconds(deadman_seconds as i64);
         mission.revision = expected_revision + 1;
         mission.updated_at = now;
         mission.phase = MissionPhase::Active;
@@ -298,14 +330,14 @@ impl Orchestrator {
                 "codex:{}:{}",
                 session.binary.version, session.binary.digest
             )),
-            lease_expires_at: None,
-            deadman_at: None,
-            last_observed_at: None,
-            last_observation_source: None,
-            lease_generation: None,
-            process_tree_ref: None,
-            ownership_established_at: None,
-            harness_thread_id: None,
+            lease_expires_at: Some(lease_expires_at),
+            deadman_at: Some(deadman_at),
+            last_observed_at: Some(now),
+            last_observation_source: Some(ObservationSource::DriverEvent),
+            lease_generation: Some(1),
+            process_tree_ref: session.process_tree_ref.clone(),
+            ownership_established_at: Some(now),
+            harness_thread_id: Some(session.harness_session_id.clone()),
             harness_turn_id: None,
         });
         if let Err(err) = (MissionTransition {
@@ -355,6 +387,18 @@ impl Orchestrator {
                     generation: 1,
                     recovery_relation: RecoveryRelation::Initial,
                     predecessor_attempt_id: None,
+                },
+            ),
+            (
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::LeaseStarted {
+                    attempt_id,
+                    generation: 1,
+                    lease_generation: 1,
+                    lease_expires_at,
+                    deadman_at,
+                    observed_at: now,
+                    observation_source: ObservationSource::DriverEvent,
                 },
             ),
             (
@@ -413,6 +457,7 @@ impl Orchestrator {
                     from: AttemptState::Starting,
                     to: AttemptState::Running,
                     reason: Some("thread/start".to_owned()),
+                    cause: Some(lanyte_mission::AttemptStateCause::HarnessCompleted),
                 },
             ),
         ];
@@ -451,6 +496,640 @@ impl Orchestrator {
         live_sessions().lock().await.insert(attempt_id, session);
         reservation_guard.disarm();
         Ok(result)
+    }
+
+    async fn cancel_mission(
+        &self,
+        event: &GatewayEvent,
+        request: MissionControlRequest,
+    ) -> Result<MissionControlResult, MissionCommandError> {
+        let MissionControlRequest::Cancel {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            body,
+        } = request
+        else {
+            return Err(MissionCommandError::internal(
+                "cancel handler received a non-cancel control request",
+            ));
+        };
+        let Some(service) = &self.mission_service else {
+            return Err(MissionCommandError::internal(
+                "mission service is not configured",
+            ));
+        };
+        let caller = service.authenticate(
+            event
+                .client_auth_token
+                .as_ref()
+                .map(lanyte_gateway::ClientAuthToken::expose),
+        )?;
+        let fingerprint = mutation_fingerprint(
+            "mission.cancel",
+            &caller,
+            &serde_json::json!({
+                "expected_revision": expected_revision,
+                "mission_id": body.mission_id,
+            }),
+        )?;
+        let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
+        if let Some(replayed) = service.completed_mutation(&idempotency_key, &fingerprint)? {
+            return replayed_control_result(&replayed);
+        }
+        let before = stored.mission.clone();
+        if before.phase == MissionPhase::Cancelled {
+            return Ok(MissionControlResult::Cancel {
+                request_id,
+                idempotency_key,
+                expected_revision,
+                record: Box::new(before),
+                progress: CancelProgress {
+                    requested: true,
+                    protocol: None,
+                    fallback: None,
+                },
+            });
+        }
+        if before.phase.is_terminal() {
+            return Err(MissionCommandError::invalid_args(
+                "mission is already terminal",
+            ));
+        }
+        if before.revision != expected_revision {
+            return Err(MissionCommandError::invalid_args(format!(
+                "stale mission revision: expected {expected_revision}, actual {}",
+                before.revision
+            )));
+        }
+        let reservation = lanyte_state::MissionMutationIdempotency {
+            key: idempotency_key.clone(),
+            request_fingerprint: fingerprint.clone(),
+            operation: "mission.cancel".to_owned(),
+            result_json: String::new(),
+            owner_token: String::new(),
+        };
+        let owner_token =
+            match service.reserve_mutation(&body.mission_id.to_string(), &reservation)? {
+                lanyte_state::MutationReserve::Replay(replayed) => {
+                    return replayed_control_result(&replayed);
+                }
+                lanyte_state::MutationReserve::Owned(token) => token,
+            };
+        let mut reservation_guard = ReservationGuard::new(service, &idempotency_key, &owner_token);
+
+        if before.attempts.is_empty() && before.phase == MissionPhase::Created {
+            let now = Utc::now();
+            let mut mission = before.clone();
+            mission.revision = expected_revision + 1;
+            mission.updated_at = now;
+            mission.phase = MissionPhase::Cancelled;
+            mission.terminal_reason = Some(MissionTerminalReason::OperatorCancelled);
+            mission.terminal_entry_hash = Some("0".repeat(64));
+            let payloads = vec![
+                (
+                    EventSourceKind::OperatorCommand,
+                    LifecyclePayload::CancelRequested {
+                        attempt_id: None,
+                        generation: None,
+                        lease_generation: None,
+                    },
+                ),
+                (
+                    EventSourceKind::OperatorCommand,
+                    LifecyclePayload::MissionPhaseChanged {
+                        from: MissionPhase::Created,
+                        to: MissionPhase::Cancelled,
+                        reason: Some("operator cancel".to_owned()),
+                    },
+                ),
+                (
+                    EventSourceKind::KernelObserved,
+                    LifecyclePayload::MissionTerminal {
+                        phase: MissionPhase::Cancelled,
+                        reason: MissionTerminalReason::OperatorCancelled,
+                        terminal_entry_hash: "0".repeat(64),
+                    },
+                ),
+            ];
+            let mut receipts = chain_receipts(
+                &service.lifecycle_history(&body.mission_id.to_string())?,
+                &mission,
+                &caller,
+                payloads,
+                None,
+            )?;
+            if let Some(hash) = receipts
+                .last()
+                .map(|receipt| receipt.event.entry_hash.clone())
+            {
+                mission.terminal_entry_hash = Some(hash.clone());
+                if let Some(LifecyclePayload::MissionTerminal {
+                    terminal_entry_hash,
+                    ..
+                }) = receipts
+                    .last_mut()
+                    .map(|receipt| &mut receipt.event.payload)
+                {
+                    *terminal_entry_hash = hash;
+                }
+            }
+            let progress = CancelProgress {
+                requested: true,
+                protocol: None,
+                fallback: None,
+            };
+            let result = MissionControlResult::Cancel {
+                request_id,
+                idempotency_key: idempotency_key.clone(),
+                expected_revision,
+                record: Box::new(mission.clone()),
+                progress,
+            };
+            service.persist_update_events(
+                expected_revision,
+                mission,
+                receipts,
+                Some(lanyte_state::MissionMutationIdempotency {
+                    key: idempotency_key,
+                    request_fingerprint: fingerprint,
+                    operation: "mission.cancel".to_owned(),
+                    result_json: serde_json::to_string(&result)
+                        .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                    owner_token,
+                }),
+            )?;
+            reservation_guard.disarm();
+            return Ok(result);
+        }
+
+        let attempt_id = before
+            .current_attempt_id
+            .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
+        let attempt = before
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == attempt_id)
+            .cloned()
+            .ok_or_else(|| MissionCommandError::invalid_args("current attempt is missing"))?;
+        let lease_generation = attempt.lease_generation.unwrap_or(1);
+        let now = Utc::now();
+        let mut cancelling = before.clone();
+        cancelling.revision = expected_revision + 1;
+        cancelling.updated_at = now;
+        if let Some(live) = cancelling
+            .attempts
+            .iter_mut()
+            .find(|item| item.attempt_id == attempt_id)
+        {
+            live.state = AttemptState::Cancelling;
+        }
+        let receipts = chain_receipts(
+            &service.lifecycle_history(&body.mission_id.to_string())?,
+            &cancelling,
+            &caller,
+            vec![
+                (
+                    EventSourceKind::OperatorCommand,
+                    LifecyclePayload::CancelRequested {
+                        attempt_id: Some(attempt_id),
+                        generation: Some(attempt.generation),
+                        lease_generation: Some(lease_generation),
+                    },
+                ),
+                (
+                    EventSourceKind::OperatorCommand,
+                    LifecyclePayload::AttemptStateChanged {
+                        attempt_id,
+                        generation: attempt.generation,
+                        from: attempt.state,
+                        to: AttemptState::Cancelling,
+                        reason: Some("operator cancel".to_owned()),
+                        cause: Some(AttemptStateCause::OperatorCancel),
+                    },
+                ),
+            ],
+            None,
+        )?;
+        service.persist_update_events(expected_revision, cancelling.clone(), receipts, None)?;
+
+        let protocol = {
+            let mut sessions = live_sessions().lock().await;
+            match sessions.get_mut(&attempt_id) {
+                Some(session) => Some(session.interrupt_active_turn().await),
+                None => None,
+            }
+        };
+        let protocol_progress = match protocol {
+            None => ProtocolCancelProgress {
+                outcome: ProtocolCancelOutcome::Unavailable,
+                thread_id: attempt.harness_thread_id.clone(),
+                turn_id: attempt.harness_turn_id.clone(),
+            },
+            Some(InterruptAttempt::Unavailable) => ProtocolCancelProgress {
+                outcome: ProtocolCancelOutcome::Unavailable,
+                thread_id: attempt.harness_thread_id.clone(),
+                turn_id: None,
+            },
+            Some(InterruptAttempt::RequestAccepted { thread_id, turn_id }) => {
+                ProtocolCancelProgress {
+                    outcome: ProtocolCancelOutcome::RequestAccepted,
+                    thread_id: Some(thread_id),
+                    turn_id: Some(turn_id),
+                }
+            }
+            Some(InterruptAttempt::Timeout { thread_id, turn_id }) => ProtocolCancelProgress {
+                outcome: ProtocolCancelOutcome::Timeout,
+                thread_id: Some(thread_id),
+                turn_id: Some(turn_id),
+            },
+            Some(InterruptAttempt::Interrupted { thread_id, turn_id }) => ProtocolCancelProgress {
+                outcome: ProtocolCancelOutcome::Interrupted,
+                thread_id: Some(thread_id),
+                turn_id: Some(turn_id),
+            },
+            Some(InterruptAttempt::Failed { detail }) => ProtocolCancelProgress {
+                outcome: ProtocolCancelOutcome::Failed,
+                thread_id: attempt.harness_thread_id.clone(),
+                turn_id: Some(detail),
+            },
+        };
+        let interrupted = protocol_progress.outcome == ProtocolCancelOutcome::Interrupted;
+        let fallback = if interrupted {
+            None
+        } else {
+            let mut sessions = live_sessions().lock().await;
+            sessions
+                .get_mut(&attempt_id)
+                .map(CodexSession::kill_process_tree)
+        };
+        let fallback_progress = fallback.map(|outcome| FallbackCancelProgress {
+            outcome: match outcome {
+                ProcessTreeKill::Cleared => FallbackCancelOutcome::Cleared,
+                ProcessTreeKill::KillDispatched => FallbackCancelOutcome::KillDispatched,
+                ProcessTreeKill::Survivors => FallbackCancelOutcome::Survivors,
+                ProcessTreeKill::Unknown => FallbackCancelOutcome::Unknown,
+            },
+        });
+        let cleared = fallback_progress
+            .as_ref()
+            .is_some_and(|progress| progress.outcome == FallbackCancelOutcome::Cleared);
+        let mut evidence = vec![(
+            EventSourceKind::DriverReported,
+            LifecyclePayload::ProtocolCancelAttempted {
+                attempt_id,
+                generation: attempt.generation,
+                lease_generation,
+                thread_id: protocol_progress.thread_id.clone(),
+                turn_id: protocol_progress.turn_id.clone(),
+                outcome: protocol_progress.outcome.clone(),
+            },
+        )];
+        if let Some(fallback_progress) = &fallback_progress {
+            evidence.push((
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::ProcessTerminationAttempted {
+                    attempt_id,
+                    generation: attempt.generation,
+                    lease_generation,
+                    outcome: fallback_progress.outcome.clone(),
+                },
+            ));
+        }
+
+        let now = Utc::now();
+        let mut mission = cancelling.clone();
+        mission.revision += 1;
+        mission.updated_at = now;
+        if interrupted || cleared {
+            mission.phase = MissionPhase::Cancelled;
+            mission.terminal_reason = Some(MissionTerminalReason::OperatorCancelled);
+            mission.current_attempt_id = None;
+            if let Some(live) = mission
+                .attempts
+                .iter_mut()
+                .find(|item| item.attempt_id == attempt_id)
+            {
+                live.state = AttemptState::Cancelled;
+                live.ended_at = Some(now);
+                live.terminal_reason = Some(if interrupted {
+                    AttemptTerminalReason::ProtocolCancelled
+                } else {
+                    AttemptTerminalReason::ProcessReaped
+                });
+            }
+            evidence.push((
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::AttemptStateChanged {
+                    attempt_id,
+                    generation: attempt.generation,
+                    from: AttemptState::Cancelling,
+                    to: AttemptState::Cancelled,
+                    reason: Some("cancel confirmed".to_owned()),
+                    cause: Some(if interrupted {
+                        AttemptStateCause::ProtocolInterrupt
+                    } else {
+                        AttemptStateCause::ProcessExit
+                    }),
+                },
+            ));
+            evidence.push((
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::MissionTerminal {
+                    phase: MissionPhase::Cancelled,
+                    reason: MissionTerminalReason::OperatorCancelled,
+                    terminal_entry_hash: "0".repeat(64),
+                },
+            ));
+            if interrupted || cleared {
+                live_sessions().lock().await.remove(&attempt_id);
+            }
+        }
+        let mut receipts = chain_receipts(
+            &service.lifecycle_history(&body.mission_id.to_string())?,
+            &mission,
+            &caller,
+            evidence,
+            None,
+        )?;
+        if mission.phase == MissionPhase::Cancelled {
+            if let Some(hash) = receipts
+                .last()
+                .map(|receipt| receipt.event.entry_hash.clone())
+            {
+                mission.terminal_entry_hash = Some(hash.clone());
+                if let Some(LifecyclePayload::MissionTerminal {
+                    terminal_entry_hash,
+                    ..
+                }) = receipts
+                    .last_mut()
+                    .map(|receipt| &mut receipt.event.payload)
+                {
+                    *terminal_entry_hash = hash;
+                }
+            }
+        }
+        let progress = CancelProgress {
+            requested: true,
+            protocol: Some(protocol_progress),
+            fallback: fallback_progress,
+        };
+        let result = MissionControlResult::Cancel {
+            request_id,
+            idempotency_key: idempotency_key.clone(),
+            expected_revision,
+            record: Box::new(mission.clone()),
+            progress,
+        };
+        service.persist_update_events(
+            cancelling.revision,
+            mission,
+            receipts,
+            Some(lanyte_state::MissionMutationIdempotency {
+                key: idempotency_key,
+                request_fingerprint: fingerprint,
+                operation: "mission.cancel".to_owned(),
+                result_json: serde_json::to_string(&result)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                owner_token,
+            }),
+        )?;
+        reservation_guard.disarm();
+        Ok(result)
+    }
+
+    pub(super) async fn reconcile_restarts(&self) {
+        self.apply_supervisor_clock(Utc::now(), true).await;
+    }
+
+    pub(super) async fn tick_leases(&self) {
+        self.apply_supervisor_clock(Utc::now(), false).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn tick_leases_at(&self, now: chrono::DateTime<Utc>) {
+        self.apply_supervisor_clock(now, false).await;
+    }
+
+    async fn apply_supervisor_clock(&self, now: chrono::DateTime<Utc>, restart: bool) {
+        let Some(service) = &self.mission_service else {
+            return;
+        };
+        let missions = match service.supervised_missions() {
+            Ok(missions) => missions,
+            Err(err) => {
+                tracing::warn!(error = %err.message, "supervisor scan failed");
+                return;
+            }
+        };
+        for mission in missions {
+            if let Err(err) = self.fold_supervisor_clock(service, mission, now, restart) {
+                tracing::warn!(error = %err.message, "supervisor clock fold failed");
+            }
+        }
+    }
+
+    fn fold_supervisor_clock(
+        &self,
+        service: &MissionService,
+        before: lanyte_mission::MissionRecord,
+        now: chrono::DateTime<Utc>,
+        restart: bool,
+    ) -> Result<(), MissionCommandError> {
+        if !before.lease_policy.enabled || before.phase.is_terminal() {
+            return Ok(());
+        }
+        let Some(attempt_id) = before.current_attempt_id else {
+            return Ok(());
+        };
+        let Some(attempt) = before
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == attempt_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if !attempt.state.is_live() {
+            return Ok(());
+        }
+        let Some(lease_generation) = attempt.lease_generation else {
+            return Ok(());
+        };
+        let Some(lease_expires_at) = attempt.lease_expires_at else {
+            return Ok(());
+        };
+        let Some(deadman_at) = attempt.deadman_at else {
+            return Ok(());
+        };
+        let history = service.lifecycle_history(&before.mission_id.to_string())?;
+        let mut payloads = Vec::new();
+        if restart
+            && !history.iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    LifecyclePayload::RestartReconciled {
+                        attempt_id: id,
+                        lease_generation: generation,
+                        ..
+                    } if *id == attempt_id && *generation == lease_generation
+                )
+            })
+        {
+            payloads.push((
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::RestartReconciled {
+                    attempt_id,
+                    generation: attempt.generation,
+                    lease_generation,
+                    overdue: now >= deadman_at || now >= lease_expires_at,
+                },
+            ));
+        }
+        let mut next_state = attempt.state;
+        if now >= deadman_at
+            && !history_has_timer_edge(
+                &history,
+                attempt_id,
+                LeaseTickKind::DeadmanFired,
+                deadman_at,
+            )
+        {
+            payloads.push((
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::LeaseTick {
+                    attempt_id,
+                    generation: attempt.generation,
+                    kind: LeaseTickKind::DeadmanFired,
+                    prior_lease_generation: lease_generation,
+                    result_lease_generation: lease_generation,
+                    prior_lease_expires_at: lease_expires_at,
+                    prior_deadman_at: deadman_at,
+                    result_lease_expires_at: lease_expires_at,
+                    result_deadman_at: deadman_at,
+                    observed_at: now,
+                    observation_source: ObservationSource::KernelClock,
+                },
+            ));
+            if matches!(next_state, AttemptState::Running | AttemptState::Waiting) {
+                payloads.push((
+                    EventSourceKind::KernelObserved,
+                    LifecyclePayload::AttemptStateChanged {
+                        attempt_id,
+                        generation: attempt.generation,
+                        from: next_state,
+                        to: AttemptState::Unresponsive,
+                        reason: Some("deadman fired".to_owned()),
+                        cause: Some(AttemptStateCause::DeadmanSilence),
+                    },
+                ));
+                next_state = AttemptState::Unresponsive;
+            }
+        }
+        let expire = now >= lease_expires_at
+            && !history_has_timer_edge(
+                &history,
+                attempt_id,
+                LeaseTickKind::Expired,
+                lease_expires_at,
+            );
+        if expire {
+            payloads.push((
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::LeaseTick {
+                    attempt_id,
+                    generation: attempt.generation,
+                    kind: LeaseTickKind::Expired,
+                    prior_lease_generation: lease_generation,
+                    result_lease_generation: lease_generation,
+                    prior_lease_expires_at: lease_expires_at,
+                    prior_deadman_at: deadman_at,
+                    result_lease_expires_at: lease_expires_at,
+                    result_deadman_at: deadman_at,
+                    observed_at: now,
+                    observation_source: ObservationSource::KernelClock,
+                },
+            ));
+            if next_state.is_live() {
+                payloads.push((
+                    EventSourceKind::KernelObserved,
+                    LifecyclePayload::AttemptStateChanged {
+                        attempt_id,
+                        generation: attempt.generation,
+                        from: next_state,
+                        to: AttemptState::TimedOut,
+                        reason: Some("lease expired".to_owned()),
+                        cause: Some(AttemptStateCause::LeaseExpired),
+                    },
+                ));
+                payloads.push((
+                    EventSourceKind::KernelObserved,
+                    LifecyclePayload::MissionPhaseChanged {
+                        from: before.phase,
+                        to: MissionPhase::DeadlineExceeded,
+                        reason: Some("lease expired".to_owned()),
+                    },
+                ));
+                payloads.push((
+                    EventSourceKind::KernelObserved,
+                    LifecyclePayload::MissionTerminal {
+                        phase: MissionPhase::DeadlineExceeded,
+                        reason: MissionTerminalReason::MissionDeadlineExceeded,
+                        terminal_entry_hash: "0".repeat(64),
+                    },
+                ));
+                next_state = AttemptState::TimedOut;
+            }
+        }
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let mut mission = before.clone();
+        mission.revision = before.revision + 1;
+        mission.updated_at = now;
+        if let Some(live) = mission
+            .attempts
+            .iter_mut()
+            .find(|item| item.attempt_id == attempt_id)
+        {
+            live.state = next_state;
+            if next_state == AttemptState::TimedOut {
+                live.ended_at = Some(now);
+                live.terminal_reason = Some(AttemptTerminalReason::AttemptTimedOut);
+            }
+        }
+        if next_state == AttemptState::TimedOut {
+            mission.phase = MissionPhase::DeadlineExceeded;
+            mission.terminal_reason = Some(MissionTerminalReason::MissionDeadlineExceeded);
+            mission.current_attempt_id = None;
+        }
+        let mut receipts = chain_receipts_from(
+            &history,
+            &mission,
+            &mission.supervisor.subject,
+            Some("lanyte://kernel/supervisor"),
+            payloads,
+            Some("lease/supervisor"),
+        )?;
+        if mission.phase == MissionPhase::DeadlineExceeded {
+            if let Some(hash) = receipts
+                .last()
+                .map(|receipt| receipt.event.entry_hash.clone())
+            {
+                mission.terminal_entry_hash = Some(hash.clone());
+                if let Some(LifecyclePayload::MissionTerminal {
+                    terminal_entry_hash,
+                    ..
+                }) = receipts
+                    .last_mut()
+                    .map(|receipt| &mut receipt.event.payload)
+                {
+                    *terminal_entry_hash = hash;
+                }
+            }
+        }
+        service.persist_update_events(before.revision, mission, receipts, None)?;
+        Ok(())
     }
 
     async fn observe_codex(
@@ -501,8 +1180,102 @@ impl Orchestrator {
                 break;
             }
         }
+        drop(sessions);
+        if !events.is_empty() {
+            self.fold_driver_observation(&caller, &mission, attempt_id, &events)?;
+        }
         MissionControlResult::observe(request_id, body.mission_id, attempt_id, events)
             .map_err(MissionCommandError::internal)
+    }
+
+    fn fold_driver_observation(
+        &self,
+        caller: &crate::mission::VerifiedSession,
+        before: &lanyte_mission::MissionRecord,
+        attempt_id: Uuid,
+        events: &[lanyte_mission::NormalizedHarnessEvent],
+    ) -> Result<(), MissionCommandError> {
+        let Some(service) = &self.mission_service else {
+            return Ok(());
+        };
+        if !before.lease_policy.enabled {
+            return Ok(());
+        }
+        let Some(attempt) = before
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == attempt_id)
+        else {
+            return Ok(());
+        };
+        let Some(prior_generation) = attempt.lease_generation else {
+            return Ok(());
+        };
+        let Some(prior_lease) = attempt.lease_expires_at else {
+            return Ok(());
+        };
+        let Some(prior_deadman) = attempt.deadman_at else {
+            return Ok(());
+        };
+        let now = events
+            .iter()
+            .map(observation_time)
+            .max()
+            .unwrap_or_else(Utc::now);
+        let lease_seconds = before.lease_policy.lease_seconds.unwrap_or(600);
+        let deadman_seconds = before.lease_policy.deadman_seconds.unwrap_or(300);
+        let result_lease = now + Duration::seconds(lease_seconds as i64);
+        let result_deadman = now + Duration::seconds(deadman_seconds as i64);
+        if result_deadman <= prior_deadman && result_lease <= prior_lease {
+            return Ok(());
+        }
+        let turn_id = events.iter().rev().find_map(|event| match event {
+            lanyte_mission::NormalizedHarnessEvent::TurnProgress { turn_id, .. } => {
+                Some(turn_id.clone())
+            }
+            _ => None,
+        });
+        let mut mission = before.clone();
+        mission.revision = before.revision + 1;
+        mission.updated_at = now;
+        if let Some(live) = mission
+            .attempts
+            .iter_mut()
+            .find(|item| item.attempt_id == attempt_id)
+        {
+            live.lease_generation = Some(prior_generation + 1);
+            live.lease_expires_at = Some(result_lease);
+            live.deadman_at = Some(result_deadman);
+            live.last_observed_at = Some(now);
+            live.last_observation_source = Some(ObservationSource::DriverEvent);
+            if let Some(turn_id) = turn_id {
+                live.harness_turn_id = Some(turn_id);
+            }
+        }
+        let receipts = chain_receipts(
+            &service.lifecycle_history(&before.mission_id.to_string())?,
+            &mission,
+            caller,
+            vec![(
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::LeaseTick {
+                    attempt_id,
+                    generation: attempt.generation,
+                    kind: LeaseTickKind::Renewed,
+                    prior_lease_generation: prior_generation,
+                    result_lease_generation: prior_generation + 1,
+                    prior_lease_expires_at: prior_lease,
+                    prior_deadman_at: prior_deadman,
+                    result_lease_expires_at: result_lease,
+                    result_deadman_at: result_deadman,
+                    observed_at: now,
+                    observation_source: ObservationSource::DriverEvent,
+                },
+            )],
+            None,
+        )?;
+        service.persist_update_events(before.revision, mission, receipts, None)?;
+        Ok(())
     }
 
     async fn close_codex(
@@ -630,6 +1403,7 @@ impl Orchestrator {
                         from: AttemptState::Running,
                         to: AttemptState::Cancelling,
                         reason: Some("operator close".to_owned()),
+                        cause: Some(lanyte_mission::AttemptStateCause::OperatorCancel),
                     },
                 )],
                 None,
@@ -703,6 +1477,7 @@ impl Orchestrator {
                     from: from_state,
                     to: attempt_state,
                     reason: reap_ref.clone(),
+                    cause: Some(lanyte_mission::AttemptStateCause::OperatorCancel),
                 },
             ),
             (
@@ -792,10 +1567,59 @@ fn hash_lifecycle(event: &LifecycleEvent) -> Result<String, MissionCommandError>
     ))
 }
 
+fn observation_time(event: &lanyte_mission::NormalizedHarnessEvent) -> chrono::DateTime<Utc> {
+    match event {
+        lanyte_mission::NormalizedHarnessEvent::Started { occurred_at, .. }
+        | lanyte_mission::NormalizedHarnessEvent::ToolProposed { occurred_at, .. }
+        | lanyte_mission::NormalizedHarnessEvent::Exited { occurred_at, .. }
+        | lanyte_mission::NormalizedHarnessEvent::TurnProgress { occurred_at, .. } => *occurred_at,
+    }
+}
+
+fn history_has_timer_edge(
+    history: &[LifecycleEvent],
+    attempt_id: Uuid,
+    kind: LeaseTickKind,
+    deadline: chrono::DateTime<Utc>,
+) -> bool {
+    history.iter().any(|event| match &event.payload {
+        LifecyclePayload::LeaseTick {
+            attempt_id: id,
+            kind: tick_kind,
+            prior_deadman_at,
+            prior_lease_expires_at,
+            ..
+        } if *id == attempt_id && *tick_kind == kind => match kind {
+            LeaseTickKind::DeadmanFired => *prior_deadman_at == deadline,
+            LeaseTickKind::Expired => *prior_lease_expires_at == deadline,
+            LeaseTickKind::Renewed => false,
+        },
+        _ => false,
+    })
+}
+
 fn chain_receipts(
     history: &[LifecycleEvent],
     mission: &lanyte_mission::MissionRecord,
     caller: &crate::mission::VerifiedSession,
+    payloads: Vec<(EventSourceKind, LifecyclePayload)>,
+    kernel_evidence: Option<&str>,
+) -> Result<Vec<NewMissionProjectionReceipt>, MissionCommandError> {
+    chain_receipts_from(
+        history,
+        mission,
+        &caller.subject,
+        Some(caller.trust_ref.as_str()),
+        payloads,
+        kernel_evidence,
+    )
+}
+
+fn chain_receipts_from(
+    history: &[LifecycleEvent],
+    mission: &lanyte_mission::MissionRecord,
+    subject: &str,
+    trust_ref: Option<&str>,
     payloads: Vec<(EventSourceKind, LifecyclePayload)>,
     kernel_evidence: Option<&str>,
 ) -> Result<Vec<NewMissionProjectionReceipt>, MissionCommandError> {
@@ -810,7 +1634,7 @@ fn chain_receipts(
                 .map(str::to_owned)
                 .or_else(|| Some(format!("lifecycle/{event_id}")))
         } else {
-            Some(caller.trust_ref.clone())
+            trust_ref.map(str::to_owned)
         };
         let mut event = LifecycleEvent {
             event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
@@ -824,7 +1648,7 @@ fn chain_receipts(
             event_type: payload.event_type().to_owned(),
             source: EventSource {
                 kind: source_kind,
-                subject: caller.subject.clone(),
+                subject: subject.to_owned(),
                 producer_version: env!("CARGO_PKG_VERSION").to_owned(),
                 assurance: ObservationLevel::KernelObserved,
                 evidence_ref,
@@ -839,7 +1663,7 @@ fn chain_receipts(
             envelope: AuditEnvelopeRef {
                 action_id: Some(event_id.to_string()),
                 correlation_id: Some(mission.mission_id.to_string()),
-                trust_ref: Some(caller.trust_ref.clone()),
+                trust_ref: trust_ref.map(str::to_owned),
                 ..AuditEnvelopeRef::default()
             },
             verification: None,
@@ -876,6 +1700,38 @@ fn replayed_control_result(json: &str) -> Result<MissionControlResult, MissionCo
                 .unwrap_or(0);
             MissionControlResult::launch(request_id, key, expected, record)
                 .map_err(MissionCommandError::internal)
+        }
+        Some("mission.cancel") => {
+            let record = serde_json::from_value(
+                value
+                    .pointer("/body/record")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+            let progress = serde_json::from_value(
+                value
+                    .pointer("/body/progress")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+            let key = value
+                .get("idempotency_key")
+                .and_then(|value| value.as_str())
+                .unwrap_or("replayed-cancel-key")
+                .to_owned();
+            let expected = value
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            Ok(MissionControlResult::Cancel {
+                request_id,
+                idempotency_key: key,
+                expected_revision: expected,
+                record: Box::new(record),
+                progress,
+            })
         }
         Some("mission.close") => {
             let mission_id = value
@@ -1339,6 +2195,7 @@ mod close_disposition_tests {
                         NormalizedHarnessEvent::Started { .. } => saw_started = true,
                         NormalizedHarnessEvent::ToolProposed { .. } => saw_tool = true,
                         NormalizedHarnessEvent::Exited { .. } => saw_exited = true,
+                        NormalizedHarnessEvent::TurnProgress { .. } => {}
                     }
                 }
             }
@@ -1349,6 +2206,14 @@ mod close_disposition_tests {
         }
         assert!(saw_started && saw_tool && saw_exited);
 
+        let latest = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("latest mission");
+        let close_revision = latest.revision;
+
         service.fail_next_terminal_persist();
         let first = orchestrator
             .close_codex(
@@ -1356,7 +2221,7 @@ mod close_disposition_tests {
                 MissionControlRequest::close(
                     Uuid::new_v4(),
                     "close:retry-terminated".to_owned(),
-                    launched.revision,
+                    close_revision,
                     created.mission_id,
                 )
                 .expect("close request"),
@@ -1517,5 +2382,160 @@ mod close_disposition_tests {
             .expect("audit after replay");
         assert_eq!(audit_after.len(), audit.len());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancel_created_mission_without_attempt() {
+        let (root, orchestrator, service, created, _) = launched_fixture(false).await;
+        let cancelled = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:created-no-attempt".to_owned(),
+                    created.revision,
+                    created.mission_id,
+                )
+                .expect("cancel request"),
+            )
+            .await
+            .expect("cancel created");
+        let MissionControlResult::Cancel {
+            record, progress, ..
+        } = cancelled
+        else {
+            panic!("expected cancel result");
+        };
+        assert_eq!(record.phase, MissionPhase::Cancelled);
+        assert!(progress.requested);
+        assert!(progress.protocol.is_none());
+        let history = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history");
+        lanyte_mission::validate_history(&record, &history).expect("history must validate");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn supervisor_clock_marks_deadman_then_expiry() {
+        let (root, orchestrator, service, created, launched) = launched_fixture(true).await;
+        let started = launched.attempts[0].started_at.expect("started");
+        orchestrator
+            .tick_leases_at(started + Duration::seconds(301))
+            .await;
+        let after_deadman = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("after deadman");
+        assert_eq!(after_deadman.attempts[0].state, AttemptState::Unresponsive);
+        assert_eq!(after_deadman.phase, MissionPhase::Active);
+        orchestrator
+            .tick_leases_at(started + Duration::seconds(601))
+            .await;
+        let after_expire = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("after expire");
+        assert_eq!(after_expire.phase, MissionPhase::DeadlineExceeded);
+        assert_eq!(after_expire.attempts[0].state, AttemptState::TimedOut);
+        let history = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history");
+        lanyte_mission::validate_history(&after_expire, &history).expect("history must validate");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn launched_fixture(
+        launch: bool,
+    ) -> (
+        std::path::PathBuf,
+        crate::Orchestrator,
+        crate::MissionService,
+        lanyte_mission::MissionRecord,
+        lanyte_mission::MissionRecord,
+    ) {
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+
+        use lanyte_mission::{MissionCreateBody, MissionLaunchBody, RecoveryPolicy};
+        use lanyte_state::{StatePaths, StateStore};
+
+        let root = std::env::temp_dir().join(format!("lanyte-wave3-{}", Uuid::new_v4()));
+        let paths = StatePaths::new(&root);
+        let store = Arc::new(Mutex::new(StateStore::open(paths.clone()).expect("store")));
+        let service = crate::MissionService::new(Arc::clone(&store), Arc::new(TestVerifier));
+        let (_tx, rx) = tokio::sync::mpsc::channel(4);
+        let orchestrator = crate::Orchestrator::new(
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+            lanyte_gateway::PeerResponder::empty_for_tests(),
+            None,
+        )
+        .with_mission_service(service.clone());
+        let created = match service
+            .handle(
+                MissionControlRequest::create(
+                    Uuid::new_v4(),
+                    format!("create:wave3:{}", Uuid::new_v4()),
+                    MissionCreateBody {
+                        goal: "Exercise lease and cancel".to_owned(),
+                        policy_id: "policy.local".to_owned(),
+                        deadline_at: None,
+                        recovery_policy: RecoveryPolicy::AskOperator,
+                    },
+                )
+                .expect("create request"),
+                Some("valid-session-secret"),
+            )
+            .expect("create")
+        {
+            MissionControlResult::Record { record, .. } => *record,
+            _ => panic!("expected created record"),
+        };
+        if !launch {
+            return (root, orchestrator, service, created.clone(), created);
+        }
+        let workspace = paths.workspace_root().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let binary = workspace.join("fake-codex");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lanyte-driver-codex/tests/fixtures/fake-codex-app-server.py");
+        let staging = binary.with_extension("partial");
+        std::fs::copy(fixture, &staging).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        if let Ok(file) = std::fs::File::open(&staging) {
+            let _ = file.sync_all();
+        }
+        std::fs::rename(staging, &binary).unwrap();
+        let launched = orchestrator
+            .launch_codex(
+                &test_event(),
+                MissionControlRequest::launch(
+                    Uuid::new_v4(),
+                    format!("launch:wave3:{}", Uuid::new_v4()),
+                    created.revision,
+                    MissionLaunchBody {
+                        mission_id: created.mission_id,
+                        workspace: workspace.display().to_string(),
+                        binary: Some(binary.display().to_string()),
+                    },
+                )
+                .expect("launch request"),
+            )
+            .await
+            .expect("launch");
+        let launched = match launched {
+            MissionControlResult::Record { record, .. } => *record,
+            _ => panic!("expected launched record"),
+        };
+        (root, orchestrator, service, created, launched)
     }
 }

@@ -1023,6 +1023,52 @@ impl StateStore {
         })
     }
 
+    /// Kernel-only scan of non-terminal missions. Not caller-scoped.
+    pub fn list_supervised_missions(&self) -> Result<Vec<StoredMissionProjection>> {
+        let mut statement = self.connection.prepare(
+            "SELECT mission_id, revision, phase, operating_role, operating_scope, record_json, receipt_entry_id, receipt_entry_hash \
+             FROM missions WHERE phase IN ('active', 'waiting', 'recovery_pending', 'suspended') \
+             ORDER BY created_at ASC, mission_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(
+                |(
+                    mission_id,
+                    revision,
+                    phase,
+                    operating_role,
+                    operating_scope,
+                    projection_json,
+                    audit_entry_id,
+                    audit_entry_hash,
+                )| {
+                    stored_mission_projection_from_row(
+                        &mission_id,
+                        revision,
+                        &phase,
+                        &projection_json,
+                        audit_entry_id,
+                        audit_entry_hash,
+                        Some((&operating_role, &operating_scope)),
+                    )
+                },
+            )
+            .collect()
+    }
+
     pub fn append_audit_record(&mut self, record: NewAuditRecord) -> Result<AuditRecord> {
         let tx = self
             .connection

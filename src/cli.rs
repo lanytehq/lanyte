@@ -48,6 +48,7 @@ pub enum MissionCommand {
     Launch(LaunchArgs),
     Observe(ObserveArgs),
     Close(CloseArgs),
+    Cancel(CancelArgs),
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +110,17 @@ pub struct ObserveArgs {
 
 #[derive(Debug, Args)]
 pub struct CloseArgs {
+    mission_id: String,
+    #[arg(long, default_value_t = 1)]
+    expected_revision: u64,
+    #[arg(long)]
+    idempotency_key: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CancelArgs {
     mission_id: String,
     #[arg(long, default_value_t = 1)]
     expected_revision: u64,
@@ -347,6 +359,20 @@ fn build_request(command: MissionCommand) -> Result<(MissionControlRequest, bool
                 .idempotency_key
                 .unwrap_or_else(|| format!("mission-close:{request_id}"));
             let request = MissionControlRequest::close(
+                request_id,
+                idempotency_key,
+                args.expected_revision,
+                mission_id,
+            )
+            .map_err(ClientError::InvalidArgument)?;
+            Ok((request, args.json))
+        }
+        MissionCommand::Cancel(args) => {
+            let mission_id = parse_canonical_uuid_v4(&args.mission_id)?;
+            let idempotency_key = args
+                .idempotency_key
+                .unwrap_or_else(|| format!("mission-cancel:{request_id}"));
+            let request = MissionControlRequest::cancel(
                 request_id,
                 idempotency_key,
                 args.expected_revision,
