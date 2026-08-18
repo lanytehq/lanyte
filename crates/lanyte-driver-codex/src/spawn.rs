@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use uuid::Uuid;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -54,9 +57,7 @@ impl CodexBinary {
         std::fs::create_dir_all(pin_dir)
             .map_err(|err| SpawnError::Exec(pin_dir.display().to_string(), err.to_string()))?;
         let pinned = pin_dir.join(&self.digest);
-        if !pinned.is_file() {
-            install_executable(&self.path, &pinned)?;
-        }
+        install_executable(&self.path, &pinned)?;
         let bytes = std::fs::read(&pinned)
             .map_err(|err| SpawnError::Exec(pinned.display().to_string(), err.to_string()))?;
         let digest = format!("{:x}", Sha256::digest(bytes));
@@ -152,20 +153,59 @@ fn is_text_file_busy(err: &std::io::Error) -> bool {
 }
 
 fn install_executable(source: &Path, dest: &Path) -> Result<(), SpawnError> {
-    let staging = dest.with_extension("partial");
-    std::fs::copy(source, &staging)
+    if dest.is_file() {
+        return Ok(());
+    }
+    let staging_name = format!(
+        "{}.{}.partial",
+        dest.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4()
+    );
+    let staging = dest.with_file_name(staging_name);
+    write_exclusive_copy(source, &staging)?;
+    if dest.is_file() {
+        let _ = std::fs::remove_file(&staging);
+        return Ok(());
+    }
+    match std::fs::rename(&staging, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&staging);
+            if dest.is_file() {
+                Ok(())
+            } else {
+                Err(SpawnError::Exec(
+                    dest.display().to_string(),
+                    err.to_string(),
+                ))
+            }
+        }
+    }
+}
+
+fn write_exclusive_copy(source: &Path, staging: &Path) -> Result<(), SpawnError> {
+    let mut input = std::fs::File::open(source)
+        .map_err(|err| SpawnError::Exec(source.display().to_string(), err.to_string()))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staging)
         .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
+    io::copy(&mut input, &mut output)
+        .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
+    output
+        .flush()
+        .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
+    output
+        .sync_all()
+        .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
+    drop(output);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o500))
+        std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o500))
             .map_err(|err| SpawnError::Exec(staging.display().to_string(), err.to_string()))?;
     }
-    if let Ok(file) = std::fs::File::open(&staging) {
-        let _ = file.sync_all();
-    }
-    std::fs::rename(&staging, dest)
-        .map_err(|err| SpawnError::Exec(dest.display().to_string(), err.to_string()))?;
     Ok(())
 }
 
@@ -250,5 +290,55 @@ mod tests {
 
     fn uuid_like() -> String {
         format!("{}", std::process::id())
+    }
+
+    #[test]
+    fn pin_copy_concurrent_same_digest_publishes_once() {
+        let root = std::env::temp_dir().join(format!("lanyte-pin-race-{}", uuid_like()));
+        let pin_dir = root.join("pins");
+        std::fs::create_dir_all(&pin_dir).unwrap();
+        let source = root.join("codex-src");
+        std::fs::write(&source, b"#!/bin/sh\necho fake-codex\n").unwrap();
+        let digest = format!("{:x}", Sha256::digest(std::fs::read(&source).unwrap()));
+        let binary = CodexBinary {
+            path: source,
+            version: "fake".to_owned(),
+            digest: digest.clone(),
+        };
+
+        let results: Vec<_> = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    let binary = binary.clone();
+                    let pin_dir = pin_dir.clone();
+                    scope.spawn(move || binary.pin_copy(&pin_dir))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+
+        assert!(
+            results.iter().all(Result::is_ok),
+            "concurrent pin_copy must not fail: {results:?}"
+        );
+        let published: std::collections::BTreeSet<_> = results
+            .into_iter()
+            .map(|result| result.unwrap().path)
+            .collect();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published.iter().next().unwrap(), &pin_dir.join(&digest));
+        let leftovers: Vec<_> = std::fs::read_dir(&pin_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no leftover staging files: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
