@@ -102,7 +102,7 @@ pub struct MissionCommandError {
 }
 
 impl MissionCommandError {
-    fn invalid_args(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_args(message: impl Into<String>) -> Self {
         Self {
             code: MissionCommandErrorCode::InvalidArgs,
             message: message.into(),
@@ -257,17 +257,17 @@ impl MissionService {
                 )
                 .map_err(MissionCommandError::internal)
             }
+            MissionControlRequest::Launch { .. }
+            | MissionControlRequest::Observe { .. }
+            | MissionControlRequest::Close { .. } => Err(MissionCommandError::invalid_args(
+                "launch, observe, and close are kernel-owned and cannot use the sync control path",
+            )),
         }
     }
 }
 
-fn build_created_mission(
-    caller: &VerifiedSession,
-    body: lanyte_mission::MissionCreateBody,
-) -> Result<(MissionRecord, NewMissionProjectionReceipt), String> {
-    let now = Utc::now();
-    let mission_id = Uuid::new_v4();
-    let principal = Principal {
+pub(crate) fn caller_principal(caller: &VerifiedSession) -> Principal {
+    Principal {
         kind: PrincipalKind::AttestedSession,
         subject: caller.subject.clone(),
         role: Some(caller.role.clone()),
@@ -281,7 +281,16 @@ fn build_created_mission(
             verification_policy_sha256: caller.verification_policy_sha256.clone(),
             trust_ref: caller.trust_ref.clone(),
         }),
-    };
+    }
+}
+
+fn build_created_mission(
+    caller: &VerifiedSession,
+    body: lanyte_mission::MissionCreateBody,
+) -> Result<(MissionRecord, NewMissionProjectionReceipt), String> {
+    let now = Utc::now();
+    let mission_id = Uuid::new_v4();
+    let principal = caller_principal(caller);
     let mission = MissionRecord {
         mission_schema: MISSION_RECORD_SCHEMA.to_owned(),
         mission_id,
@@ -521,7 +530,9 @@ mod tests {
                 assert_eq!(operation, "mission.create");
                 *record
             }
-            MissionControlResult::List { .. } => panic!("expected record result"),
+            MissionControlResult::List { .. }
+            | MissionControlResult::Observe { .. }
+            | MissionControlResult::Close { .. } => panic!("expected record result"),
         }
     }
 
@@ -616,7 +627,9 @@ mod tests {
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].mission_id, created.mission_id);
             }
-            MissionControlResult::Record { .. } => panic!("expected list result"),
+            MissionControlResult::Record { .. }
+            | MissionControlResult::Observe { .. }
+            | MissionControlResult::Close { .. } => panic!("expected list result"),
         }
 
         let hidden = service
@@ -648,7 +661,9 @@ mod tests {
                 assert_eq!(operation, "mission.show");
                 assert_eq!(*record, created);
             }
-            MissionControlResult::List { .. } => panic!("expected record result"),
+            MissionControlResult::List { .. }
+            | MissionControlResult::Observe { .. }
+            | MissionControlResult::Close { .. } => panic!("expected record result"),
         }
 
         let database = std::fs::read(paths.hot_db_path()).expect("read hot database");

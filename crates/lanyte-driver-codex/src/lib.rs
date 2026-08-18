@@ -122,11 +122,14 @@ impl CodexSession {
         let mut stdout = self.stdout.lock().await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if tokio::time::Instant::now() > deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(CodexDriverError::Timeout);
             }
             let mut line = String::new();
-            let n = stdout.read_line(&mut line).await?;
+            let n = tokio::time::timeout(remaining, stdout.read_line(&mut line))
+                .await
+                .map_err(|_| CodexDriverError::Timeout)??;
             if n == 0 {
                 return Err(CodexDriverError::StdoutClosed);
             }
@@ -155,7 +158,7 @@ impl CodexAppServerDriver {
     }
 
     pub async fn create(&self, attempt_id: Uuid) -> Result<CodexSession, CodexDriverError> {
-        let binary = CodexBinary::resolve(&self.spec.binary_path)?;
+        let binary = CodexBinary::resolve(&self.spec.binary_path, &self.spec.workspace)?;
         let mut command = Command::new(&binary.path);
         command
             .args(["app-server"])
@@ -163,11 +166,21 @@ impl CodexAppServerDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .env_clear()
             .envs(scrub_child_env(&self.spec.workspace));
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().ok_or(CodexDriverError::StdinClosed)?;
         let stdout = child.stdout.take().ok_or(CodexDriverError::StdoutClosed)?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    line.clear();
+                }
+            });
+        }
         let session = CodexSession {
             attempt_id,
             harness_session_id: String::new(),
@@ -178,7 +191,7 @@ impl CodexAppServerDriver {
             pending: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
         };
-        let _ = session
+        if let Err(err) = session
             .request(
                 "initialize",
                 json!({
@@ -189,14 +202,31 @@ impl CodexAppServerDriver {
                     }
                 }),
             )
-            .await?;
-        session.notify("initialized", json!({})).await?;
-        let started = session
+            .await
+        {
+            let mut session = session;
+            let _ = session.close().await;
+            return Err(err);
+        }
+        if let Err(err) = session.notify("initialized", json!({})).await {
+            let mut session = session;
+            let _ = session.close().await;
+            return Err(err);
+        }
+        let started = match session
             .request(
                 "thread/start",
                 json!({ "cwd": self.spec.workspace.display().to_string() }),
             )
-            .await?;
+            .await
+        {
+            Ok(started) => started,
+            Err(err) => {
+                let mut session = session;
+                let _ = session.close().await;
+                return Err(err);
+            }
+        };
         let thread_id = started
             .get("thread")
             .and_then(|thread| thread.get("id"))
@@ -235,7 +265,7 @@ impl HarnessDriver for CodexAppServerDriver {
 
     fn capabilities(&self) -> DriverCapabilityReport {
         let now = Utc::now();
-        let binary = CodexBinary::resolve(&self.spec.binary_path).ok();
+        let binary = CodexBinary::resolve(&self.spec.binary_path, &self.spec.workspace).ok();
         let version = binary
             .as_ref()
             .map(|bin| bin.version.clone())
@@ -278,7 +308,10 @@ impl HarnessDriver for CodexAppServerDriver {
                 kind: "executable-version-platform-match".to_owned(),
                 executable_version: version,
                 executable_sha256: digest,
-                configuration_sha256: format!("{:x}", Sha256::digest(path_bytes(&self.spec.workspace))),
+                configuration_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(path_bytes(&self.spec.workspace))
+                ),
                 platform: std::env::consts::OS.to_owned(),
                 probe_ref: "probes/codex-app-server".to_owned(),
             },

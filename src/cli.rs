@@ -9,7 +9,8 @@ use ipcprims::peer::handshake::async_handshake_client_with_config;
 use ipcprims::peer::HandshakeConfig;
 use lanyte_common::channels;
 use lanyte_mission::{
-    MissionControlRequest, MissionCreateBody, MissionListBody, MissionPhase, RecoveryPolicy,
+    MissionControlRequest, MissionCreateBody, MissionLaunchBody, MissionListBody, MissionPhase,
+    RecoveryPolicy,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -91,6 +92,10 @@ pub struct LaunchArgs {
     workspace: String,
     #[arg(long)]
     binary: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    expected_revision: u64,
+    #[arg(long)]
+    idempotency_key: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -105,6 +110,10 @@ pub struct ObserveArgs {
 #[derive(Debug, Args)]
 pub struct CloseArgs {
     mission_id: String,
+    #[arg(long, default_value_t = 1)]
+    expected_revision: u64,
+    #[arg(long)]
+    idempotency_key: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -206,60 +215,10 @@ pub async fn run_mission(command: MissionCommand, socket: &Path) -> Result<(), C
         .filter(|value| !value.is_empty())
         .map(Zeroizing::new)
         .ok_or(ClientError::MissingSessionToken)?;
-    let (request_id, operation, args, json) = match command {
-        MissionCommand::Launch(args) => {
-            let request_id = Uuid::new_v4().to_string();
-            (
-                request_id.clone(),
-                "mission.launch".to_owned(),
-                control_envelope(
-                    &request_id,
-                    "mission.launch",
-                    serde_json::json!({
-                        "mission_id": args.mission_id,
-                        "workspace": args.workspace,
-                        "binary": args.binary,
-                    }),
-                    true,
-                ),
-                args.json,
-            )
-        }
-        MissionCommand::Observe(args) => {
-            let request_id = Uuid::new_v4().to_string();
-            (
-                request_id.clone(),
-                "mission.observe".to_owned(),
-                control_envelope(
-                    &request_id,
-                    "mission.observe",
-                    serde_json::json!({ "mission_id": args.mission_id }),
-                    false,
-                ),
-                args.json,
-            )
-        }
-        MissionCommand::Close(args) => {
-            let request_id = Uuid::new_v4().to_string();
-            (
-                request_id.clone(),
-                "mission.close".to_owned(),
-                control_envelope(
-                    &request_id,
-                    "mission.close",
-                    serde_json::json!({ "mission_id": args.mission_id }),
-                    true,
-                ),
-                args.json,
-            )
-        }
-        other => {
-            let (request, json) = build_request(other)?;
-            let request_id = request.request_id().to_string();
-            let operation = request.operation().to_owned();
-            (request_id, operation, serde_json::to_value(&request)?, json)
-        }
-    };
+    let (request, json) = build_request(command)?;
+    let request_id = request.request_id().to_string();
+    let operation = request.operation().to_owned();
+    let args = serde_json::to_value(&request)?;
     let envelope = serde_json::json!({
         "type": "invoke",
         "request_id": request_id,
@@ -358,10 +317,43 @@ async fn read_frame(
 fn build_request(command: MissionCommand) -> Result<(MissionControlRequest, bool), ClientError> {
     let request_id = Uuid::new_v4();
     match command {
-        MissionCommand::Launch(_) | MissionCommand::Observe(_) | MissionCommand::Close(_) => {
-            Err(ClientError::InvalidArgument(
-                "launch, observe, and close use a dedicated invoke path".to_owned(),
-            ))
+        MissionCommand::Launch(args) => {
+            let mission_id = parse_canonical_uuid_v4(&args.mission_id)?;
+            let idempotency_key = args
+                .idempotency_key
+                .unwrap_or_else(|| format!("mission-launch:{request_id}"));
+            let request = MissionControlRequest::launch(
+                request_id,
+                idempotency_key,
+                args.expected_revision,
+                MissionLaunchBody {
+                    mission_id,
+                    workspace: args.workspace,
+                    binary: args.binary,
+                },
+            )
+            .map_err(ClientError::InvalidArgument)?;
+            Ok((request, args.json))
+        }
+        MissionCommand::Observe(args) => {
+            let mission_id = parse_canonical_uuid_v4(&args.mission_id)?;
+            let request = MissionControlRequest::observe(request_id, mission_id)
+                .map_err(ClientError::InvalidArgument)?;
+            Ok((request, args.json))
+        }
+        MissionCommand::Close(args) => {
+            let mission_id = parse_canonical_uuid_v4(&args.mission_id)?;
+            let idempotency_key = args
+                .idempotency_key
+                .unwrap_or_else(|| format!("mission-close:{request_id}"));
+            let request = MissionControlRequest::close(
+                request_id,
+                idempotency_key,
+                args.expected_revision,
+                mission_id,
+            )
+            .map_err(ClientError::InvalidArgument)?;
+            Ok((request, args.json))
         }
         MissionCommand::Create(args) => {
             let deadline_at = args
@@ -406,18 +398,6 @@ fn build_request(command: MissionCommand) -> Result<(MissionControlRequest, bool
             Ok((request, args.json))
         }
     }
-}
-
-fn control_envelope(request_id: &str, operation: &str, body: Value, mutating: bool) -> Value {
-    serde_json::json!({
-        "control_schema": "https://schemas.3leaps.dev/agentic/mission/v0/mission-control.schema.json",
-        "kind": "request",
-        "request_id": request_id,
-        "idempotency_key": mutating.then(|| format!("{operation}:{request_id}")),
-        "expected_revision": if mutating { Value::from(0) } else { Value::Null },
-        "operation": operation,
-        "body": body,
-    })
 }
 
 fn parse_canonical_uuid_v4(value: &str) -> Result<Uuid, ClientError> {

@@ -21,8 +21,11 @@ pub struct CodexBinary {
 }
 
 impl CodexBinary {
-    pub fn resolve(explicit: &Option<PathBuf>) -> Result<Self, SpawnError> {
+    pub fn resolve(explicit: &Option<PathBuf>, workspace: &Path) -> Result<Self, SpawnError> {
         let path = if let Some(path) = explicit {
+            if !path.is_absolute() {
+                return Err(SpawnError::MissingBinary(path.display().to_string()));
+            }
             path.clone()
         } else {
             which("codex").ok_or_else(|| SpawnError::MissingBinary("codex".to_owned()))?
@@ -32,11 +35,11 @@ impl CodexBinary {
         }
         let output = Command::new(&path)
             .arg("--version")
+            .env_clear()
+            .envs(scrub_child_env(workspace))
             .output()
             .map_err(|err| SpawnError::Exec(path.display().to_string(), err.to_string()))?;
-        let version = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_owned();
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let bytes = std::fs::read(&path)
             .map_err(|err| SpawnError::Exec(path.display().to_string(), err.to_string()))?;
         Ok(Self {
