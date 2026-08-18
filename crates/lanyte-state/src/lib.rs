@@ -8,13 +8,21 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
 use lanyte_common::env as common_env;
+use lanyte_mission::{
+    validate_history, EventSourceKind, LifecycleEvent, LifecyclePayload, MissionPhase,
+    MissionRecord, Validate,
+};
 use lanyte_telemetry::{
     genesis_prev_hash, AuditEnvelopeRef, AuditRecord, AuditRecordKind, AuditSeverity,
     NewAuditRecord,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use thiserror::Error;
 
 pub const LANYTE_STATE_ROOT_ENV: &str = "LANYTE_STATE_ROOT";
@@ -32,7 +40,21 @@ const MIGRATION_003: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/003_warm_exports.sql"
 ));
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_001), (2, MIGRATION_002), (3, MIGRATION_003)];
+const MIGRATION_004: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/004_missions.sql"
+));
+const MIGRATION_005: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/005_mission_requests.sql"
+));
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, MIGRATION_001),
+    (2, MIGRATION_002),
+    (3, MIGRATION_003),
+    (4, MIGRATION_004),
+    (5, MIGRATION_005),
+];
 
 const HOT_TIER_DIR: &str = "hot";
 const WARM_TIER_DIR: &str = "warm";
@@ -41,6 +63,8 @@ const HOT_TIER_DB_FILE: &str = "memory.sqlite3";
 const WARM_EXPORT_FORMAT_VERSION: &str = "1.0";
 const AUDIT_RECORDS_NO_DELETE_TRIGGER_SQL: &str = "CREATE TRIGGER IF NOT EXISTS audit_records_no_delete\nBEFORE DELETE ON audit_records\nWHEN COALESCE((SELECT value FROM state_metadata WHERE key = 'allow_audit_delete'), '0') != '1'\nBEGIN\n    SELECT RAISE(FAIL, 'audit_records is append-only');\nEND;";
 pub const DEFAULT_HOT_RETENTION_DAYS: u64 = 30;
+pub const MAX_MISSION_LIST_LIMIT: u16 = 200;
+const MISSION_LIST_CURSOR_VERSION: u8 = 1;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -55,6 +79,15 @@ pub enum StateError {
 
     #[error("invalid audit record: {0}")]
     InvalidAuditRecord(String),
+
+    #[error("invalid mission projection: {0}")]
+    InvalidMissionProjection(String),
+
+    #[error("mission create idempotency conflict for key {key}")]
+    MissionIdempotencyConflict { key: String },
+
+    #[error("invalid mission list request: {0}")]
+    InvalidMissionList(String),
 
     #[error("failed to encode audit JSON: {0}")]
     AuditJson(#[from] serde_json::Error),
@@ -181,6 +214,67 @@ pub struct EvictedSession {
     pub export: WarmExportMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewMissionProjectionReceipt {
+    pub event: LifecycleEvent,
+    pub envelope: AuditEnvelopeRef,
+    pub verification: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredMissionProjection {
+    pub mission: MissionRecord,
+    pub audit_entry_id: String,
+    pub audit_entry_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissionProjectionWrite {
+    pub projection: StoredMissionProjection,
+    pub receipt: AuditRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionCreateIdempotency {
+    pub key: String,
+    pub request_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdempotentMissionWrite {
+    pub write: MissionProjectionWrite,
+    pub replayed: bool,
+}
+
+/// An opaque, filter-bound position in one caller-scoped mission listing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MissionListCursor {
+    version: u8,
+    created_at: String,
+    mission_id: String,
+    snapshot_sequence: i64,
+    operating_role: String,
+    operating_scope: String,
+    phases: Vec<String>,
+}
+
+/// Caller-scoped mission query. An empty phase list includes every phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionListFilter {
+    pub operating_role: String,
+    pub operating_scope: String,
+    pub phases: Vec<MissionPhase>,
+    pub limit: u16,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissionListPage {
+    pub projections: Vec<StoredMissionProjection>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WarmChainHeader {
     #[serde(rename = "_type")]
@@ -254,67 +348,307 @@ impl StateStore {
         Ok(version)
     }
 
+    pub fn create_mission(
+        &mut self,
+        mission: MissionRecord,
+        receipt: NewMissionProjectionReceipt,
+    ) -> Result<MissionProjectionWrite> {
+        Ok(self.create_mission_inner(mission, receipt, None)?.write)
+    }
+
+    /// Persist an initial mission projection, receipt, and idempotency binding atomically.
+    /// A replay with the same key and fingerprint returns the original write; a changed
+    /// fingerprint for an existing key fails before any new receipt can be appended.
+    pub fn create_mission_idempotent(
+        &mut self,
+        mission: MissionRecord,
+        receipt: NewMissionProjectionReceipt,
+        idempotency: MissionCreateIdempotency,
+    ) -> Result<IdempotentMissionWrite> {
+        validate_mission_create_idempotency(&idempotency.key, &idempotency.request_fingerprint)?;
+        let outcome = self.create_mission_inner(
+            mission,
+            receipt,
+            Some((&idempotency.key, &idempotency.request_fingerprint)),
+        )?;
+        Ok(outcome)
+    }
+
+    fn create_mission_inner(
+        &mut self,
+        mission: MissionRecord,
+        receipt: NewMissionProjectionReceipt,
+        idempotency: Option<(&str, &str)>,
+    ) -> Result<IdempotentMissionWrite> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((idempotency_key, request_fingerprint)) = idempotency {
+            let existing: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT request_fingerprint, mission_id FROM mission_requests WHERE idempotency_key = ?1 LIMIT 1",
+                    (idempotency_key,),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((stored_fingerprint, stored_mission_id)) = existing {
+                if stored_fingerprint != request_fingerprint {
+                    return Err(StateError::MissionIdempotencyConflict {
+                        key: idempotency_key.to_owned(),
+                    });
+                }
+                let projection =
+                    load_mission_projection_tx(&tx, &stored_mission_id)?.ok_or_else(|| {
+                        StateError::InvalidMissionProjection(
+                            "idempotency binding references a missing mission projection"
+                                .to_owned(),
+                        )
+                    })?;
+                let receipt =
+                    load_audit_record_tx(&tx, &projection.audit_entry_id)?.ok_or_else(|| {
+                        StateError::InvalidMissionProjection(
+                            "idempotency binding references a missing mission receipt".to_owned(),
+                        )
+                    })?;
+                validate_projection_receipt_binding(&projection, &receipt)?;
+                tx.commit()?;
+                return Ok(IdempotentMissionWrite {
+                    write: MissionProjectionWrite {
+                        projection,
+                        receipt,
+                    },
+                    replayed: true,
+                });
+            }
+        }
+        mission
+            .validate()
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        if mission.phase != MissionPhase::Created || mission.revision != 0 {
+            return Err(StateError::InvalidMissionProjection(
+                "initial projection must be a revision-zero created mission".to_owned(),
+            ));
+        }
+        if !matches!(
+            &receipt.event.payload,
+            LifecyclePayload::MissionCreated { revision: 0 }
+        ) || !matches!(
+            receipt.event.source.kind,
+            EventSourceKind::VerifiedAttestation | EventSourceKind::OperatorCommand
+        ) {
+            return Err(StateError::InvalidMissionProjection(
+                "initial receipt must be an authoritative mission_created event at revision zero"
+                    .to_owned(),
+            ));
+        }
+        validate_history(&mission, std::slice::from_ref(&receipt.event))
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+
+        let mission_id = mission.mission_id.to_string();
+        let projection_json = serde_json::to_string(&mission)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        let event_json = serde_json::to_value(&receipt.event)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        let audit_input = NewAuditRecord {
+            entry_id: receipt.event.event_id.to_string(),
+            session_id: mission_id.clone(),
+            timestamp: receipt
+                .event
+                .recorded_at
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            kind: AuditRecordKind::MissionEvent,
+            action: receipt.event.event_type.clone(),
+            severity: AuditSeverity::Notice,
+            envelope: receipt.envelope,
+            payload: event_json,
+            verification: receipt.verification,
+        };
+
+        let chain_exists: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit_records WHERE session_id = ?1)",
+            (&mission_id,),
+            |row| row.get(0),
+        )?;
+        if chain_exists != 0 {
+            return Err(StateError::InvalidMissionProjection(
+                "mission creation requires an empty receipt chain".to_owned(),
+            ));
+        }
+        let audit = append_audit_record_tx(&tx, audit_input)?;
+        tx.execute(
+            "INSERT INTO missions(mission_id, mission_schema, revision, goal, policy_id, phase, operating_role, operating_scope, created_at, updated_at, evidence_chain_id, record_json, receipt_entry_id, receipt_entry_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                &mission_id,
+                &mission.mission_schema,
+                i64::try_from(mission.revision).map_err(|_| {
+                    StateError::InvalidMissionProjection(
+                        "mission revision exceeds SQLite integer range".to_owned(),
+                    )
+                })?,
+                &mission.goal,
+                &mission.policy_id,
+                mission_phase_name(mission.phase),
+                &mission.operating_role.role,
+                &mission.operating_role.scope,
+                mission
+                    .created_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                mission
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                mission.evidence_chain_id.to_string(),
+                &projection_json,
+                &audit.entry_id,
+                &audit.entry_hash,
+            ],
+        )?;
+        if let Some((idempotency_key, request_fingerprint)) = idempotency {
+            tx.execute(
+                "INSERT INTO mission_requests(idempotency_key, request_fingerprint, mission_id) VALUES (?1, ?2, ?3)",
+                params![idempotency_key, request_fingerprint, &mission_id],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(IdempotentMissionWrite {
+            write: MissionProjectionWrite {
+                projection: StoredMissionProjection {
+                    mission,
+                    audit_entry_id: audit.entry_id.clone(),
+                    audit_entry_hash: audit.entry_hash.clone(),
+                },
+                receipt: audit,
+            },
+            replayed: false,
+        })
+    }
+
+    pub fn mission(&self, mission_id: &str) -> Result<Option<StoredMissionProjection>> {
+        load_mission_projection(&self.connection, mission_id)
+    }
+
+    /// List projections only within the caller's operating role and scope.
+    /// Ordering by `(created_at, mission_id)` gives each returned cursor a stable boundary.
+    pub fn list_missions(&self, request: MissionListFilter) -> Result<MissionListPage> {
+        validate_mission_list_request(&request)?;
+        let cursor = request
+            .cursor
+            .as_deref()
+            .map(|value| parse_mission_list_cursor(value, &request))
+            .transpose()?;
+        let snapshot_sequence = match cursor.as_ref() {
+            Some(cursor) => cursor.snapshot_sequence,
+            None => match mission_list_snapshot_boundary(&self.connection, &request)? {
+                Some(snapshot_sequence) => snapshot_sequence,
+                None => {
+                    return Ok(MissionListPage {
+                        projections: Vec::new(),
+                        next_cursor: None,
+                    });
+                }
+            },
+        };
+
+        let mut sql = String::from(
+            "SELECT mission_id, revision, phase, operating_role, operating_scope, record_json, receipt_entry_id, receipt_entry_hash \
+             FROM missions WHERE operating_role = ? AND operating_scope = ?",
+        );
+        let mut values = vec![
+            rusqlite::types::Value::Text(request.operating_role.clone()),
+            rusqlite::types::Value::Text(request.operating_scope.clone()),
+        ];
+        if !request.phases.is_empty() {
+            sql.push_str(" AND phase IN (");
+            for (index, phase) in request.phases.iter().enumerate() {
+                if index != 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                values.push(rusqlite::types::Value::Text(
+                    mission_phase_name(*phase).to_owned(),
+                ));
+            }
+            sql.push(')');
+        }
+        if let Some(cursor) = cursor {
+            sql.push_str(" AND (created_at > ? OR (created_at = ? AND mission_id > ?))");
+            values.push(rusqlite::types::Value::Text(cursor.created_at.clone()));
+            values.push(rusqlite::types::Value::Text(cursor.created_at));
+            values.push(rusqlite::types::Value::Text(cursor.mission_id));
+        }
+        sql.push_str(" AND rowid <= ?");
+        values.push(rusqlite::types::Value::Integer(snapshot_sequence));
+        sql.push_str(" ORDER BY created_at ASC, mission_id ASC LIMIT ?");
+        values.push(rusqlite::types::Value::Integer(
+            i64::from(request.limit) + 1,
+        ));
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut missions = rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(
+                |(
+                    mission_id,
+                    revision,
+                    phase,
+                    operating_role,
+                    operating_scope,
+                    projection_json,
+                    audit_entry_id,
+                    audit_entry_hash,
+                )| {
+                    stored_mission_projection_from_row(
+                        &mission_id,
+                        revision,
+                        &phase,
+                        &projection_json,
+                        audit_entry_id,
+                        audit_entry_hash,
+                        Some((&operating_role, &operating_scope)),
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        let has_more = missions.len() > usize::from(request.limit);
+        if has_more {
+            let _extra = missions.pop().expect("length was checked");
+            // The next request starts after the last item returned, not the look-ahead row.
+            let next_cursor = missions
+                .last()
+                .map(|last| format_mission_list_cursor(&last.mission, &request, snapshot_sequence))
+                .expect("a look-ahead implies a returned item");
+            return Ok(MissionListPage {
+                projections: missions,
+                next_cursor: Some(next_cursor),
+            });
+        }
+        Ok(MissionListPage {
+            projections: missions,
+            next_cursor: None,
+        })
+    }
+
     pub fn append_audit_record(&mut self, record: NewAuditRecord) -> Result<AuditRecord> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let latest: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT chain_index, entry_hash FROM audit_records WHERE session_id = ?1 ORDER BY chain_index DESC LIMIT 1",
-                (&record.session_id,),
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let (chain_index, prev_hash) = match latest {
-            Some((chain_index, entry_hash)) => (chain_index + 1, entry_hash),
-            None => (0, genesis_prev_hash(&record.session_id)),
-        };
-        let record = record.finalize(prev_hash);
-        record
-            .validate()
-            .map_err(|err| StateError::InvalidAuditRecord(err.to_owned()))?;
-        let session_id = record.session_id.clone();
-        let payload_json = serde_json::to_string(&record.payload)?;
-        let verification_json = record
-            .verification
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-
-        tx.execute(
-            "INSERT INTO audit_records(entry_id, session_id, chain_index, timestamp, record_kind, action, severity, conversation_id, turn_id, action_id, causation_id, correlation_id, external_ref, trust_ref, gate_ref, payload_json, verification_json, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            params![
-                &record.entry_id,
-                &record.session_id,
-                chain_index,
-                &record.timestamp,
-                audit_record_kind_name(record.kind),
-                &record.action,
-                audit_severity_name(record.severity),
-                &record.envelope.conversation_id,
-                &record.envelope.turn_id,
-                &record.envelope.action_id,
-                &record.envelope.causation_id,
-                &record.envelope.correlation_id,
-                &record.envelope.external_ref,
-                &record.envelope.trust_ref,
-                &record.envelope.gate_ref,
-                payload_json,
-                verification_json,
-                &record.prev_hash,
-                &record.entry_hash,
-            ],
-        )?;
+        let record = append_audit_record_tx(&tx, record)?;
         tx.commit()?;
-
-        self.audit_records(&session_id)?
-            .into_iter()
-            .last()
-            .ok_or_else(|| {
-                StateError::InvalidAuditRecord(
-                    "appended audit record missing after commit".to_owned(),
-                )
-            })
+        Ok(record)
     }
 
     pub fn audit_records(&self, session_id: &str) -> Result<Vec<AuditRecord>> {
@@ -407,7 +741,12 @@ impl StateStore {
 
     fn eviction_candidates(&self, cutoff: &str) -> Result<Vec<String>> {
         let mut stmt = self.connection.prepare(
-            "SELECT session_id FROM audit_records GROUP BY session_id HAVING MAX(timestamp) < ?1 ORDER BY MAX(timestamp) ASC",
+            "SELECT records.session_id \
+             FROM audit_records AS records \
+             WHERE NOT EXISTS (SELECT 1 FROM missions WHERE missions.mission_id = records.session_id) \
+             GROUP BY records.session_id \
+             HAVING MAX(records.timestamp) < ?1 \
+             ORDER BY MAX(records.timestamp) ASC",
         )?;
         let rows = stmt.query_map((cutoff,), |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -534,6 +873,413 @@ impl SessionEvictor<'_> {
     }
 }
 
+fn load_mission_projection(
+    connection: &Connection,
+    mission_id: &str,
+) -> Result<Option<StoredMissionProjection>> {
+    let stored = connection
+        .query_row(
+            "SELECT revision, phase, record_json, receipt_entry_id, receipt_entry_hash \
+             FROM missions WHERE mission_id = ?1 LIMIT 1",
+            (mission_id,),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored
+        .map(
+            |(revision, phase, projection_json, audit_entry_id, audit_entry_hash)| {
+                stored_mission_projection_from_row(
+                    mission_id,
+                    revision,
+                    &phase,
+                    &projection_json,
+                    audit_entry_id,
+                    audit_entry_hash,
+                    None,
+                )
+            },
+        )
+        .transpose()
+}
+
+fn load_mission_projection_tx(
+    tx: &Transaction<'_>,
+    mission_id: &str,
+) -> Result<Option<StoredMissionProjection>> {
+    let stored = tx
+        .query_row(
+            "SELECT revision, phase, record_json, receipt_entry_id, receipt_entry_hash \
+             FROM missions WHERE mission_id = ?1 LIMIT 1",
+            (mission_id,),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored
+        .map(
+            |(revision, phase, projection_json, audit_entry_id, audit_entry_hash)| {
+                stored_mission_projection_from_row(
+                    mission_id,
+                    revision,
+                    &phase,
+                    &projection_json,
+                    audit_entry_id,
+                    audit_entry_hash,
+                    None,
+                )
+            },
+        )
+        .transpose()
+}
+
+fn stored_mission_projection_from_row(
+    mission_id: &str,
+    revision: i64,
+    phase: &str,
+    projection_json: &str,
+    audit_entry_id: String,
+    audit_entry_hash: String,
+    operating_scope: Option<(&str, &str)>,
+) -> Result<StoredMissionProjection> {
+    let mission: MissionRecord = serde_json::from_str(projection_json)
+        .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+    mission
+        .validate()
+        .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+    if mission.mission_id.to_string() != mission_id
+        || i64::try_from(mission.revision).ok() != Some(revision)
+        || mission_phase_name(mission.phase) != phase
+    {
+        return Err(StateError::InvalidMissionProjection(
+            "indexed mission fields do not match stored projection".to_owned(),
+        ));
+    }
+    if let Some((role, scope)) = operating_scope {
+        if mission.operating_role.role != role || mission.operating_role.scope != scope {
+            return Err(StateError::InvalidMissionProjection(
+                "caller-scope fields do not match stored projection".to_owned(),
+            ));
+        }
+    }
+    Ok(StoredMissionProjection {
+        mission,
+        audit_entry_id,
+        audit_entry_hash,
+    })
+}
+
+fn load_audit_record_tx(tx: &Transaction<'_>, entry_id: &str) -> Result<Option<AuditRecord>> {
+    tx.query_row(
+        "SELECT entry_id, session_id, timestamp, record_kind, action, severity, conversation_id, turn_id, action_id, causation_id, correlation_id, external_ref, trust_ref, gate_ref, payload_json, verification_json, prev_hash, entry_hash FROM audit_records WHERE entry_id = ?1 LIMIT 1",
+        (entry_id,),
+        |row| {
+            let payload_json: String = row.get(14)?;
+            let verification_json: Option<String> = row.get(15)?;
+            Ok::<_, rusqlite::Error>(AuditRecord {
+                entry_id: row.get(0)?,
+                session_id: row.get(1)?,
+                timestamp: row.get(2)?,
+                kind: parse_audit_record_kind(&row.get::<_, String>(3)?)?,
+                action: row.get(4)?,
+                severity: parse_audit_severity(&row.get::<_, String>(5)?)?,
+                envelope: AuditEnvelopeRef {
+                    conversation_id: row.get(6)?,
+                    turn_id: row.get(7)?,
+                    action_id: row.get(8)?,
+                    causation_id: row.get(9)?,
+                    correlation_id: row.get(10)?,
+                    external_ref: row.get(11)?,
+                    trust_ref: row.get(12)?,
+                    gate_ref: row.get(13)?,
+                },
+                payload: parse_json_value(&payload_json)?,
+                verification: verification_json
+                    .as_deref()
+                    .map(parse_json_value)
+                    .transpose()?,
+                prev_hash: row.get(16)?,
+                entry_hash: row.get(17)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StateError::from)
+}
+
+fn validate_projection_receipt_binding(
+    projection: &StoredMissionProjection,
+    receipt: &AuditRecord,
+) -> Result<()> {
+    receipt
+        .validate()
+        .map_err(|err| StateError::InvalidAuditRecord(err.to_owned()))?;
+    if receipt.entry_id != projection.audit_entry_id
+        || receipt.entry_hash != projection.audit_entry_hash
+        || receipt.session_id != projection.mission.mission_id.to_string()
+        || receipt.kind != AuditRecordKind::MissionEvent
+    {
+        return Err(StateError::InvalidMissionProjection(
+            "mission projection receipt binding is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mission_create_idempotency(key: &str, fingerprint: &str) -> Result<()> {
+    let valid_key = (16..=256).contains(&key.len())
+        && key.bytes().enumerate().all(|(index, byte)| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b':' | b'-' => index > 0,
+            _ => false,
+        });
+    if !valid_key {
+        return Err(StateError::InvalidMissionProjection(
+            "idempotency key does not match the mission contract".to_owned(),
+        ));
+    }
+    if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StateError::InvalidMissionProjection(
+            "request fingerprint must be a 64-character hexadecimal SHA-256 digest".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mission_list_request(request: &MissionListFilter) -> Result<()> {
+    if request.operating_role.is_empty() || request.operating_scope.is_empty() {
+        return Err(StateError::InvalidMissionList(
+            "operating role and scope are required".to_owned(),
+        ));
+    }
+    if request.limit == 0 || request.limit > MAX_MISSION_LIST_LIMIT {
+        return Err(StateError::InvalidMissionList(format!(
+            "limit must be in 1..={MAX_MISSION_LIST_LIMIT}"
+        )));
+    }
+    if request.phases.len() > 10 {
+        return Err(StateError::InvalidMissionList(
+            "phases must contain at most 10 values".to_owned(),
+        ));
+    }
+    for (index, phase) in request.phases.iter().enumerate() {
+        if request.phases[..index].contains(phase) {
+            return Err(StateError::InvalidMissionList(
+                "phases must be unique".to_owned(),
+            ));
+        }
+    }
+    request
+        .cursor
+        .as_deref()
+        .map(|value| parse_mission_list_cursor(value, request))
+        .transpose()?;
+    Ok(())
+}
+
+fn mission_list_snapshot_boundary(
+    connection: &Connection,
+    request: &MissionListFilter,
+) -> Result<Option<i64>> {
+    let mut sql = String::from(
+        "SELECT MAX(rowid) FROM missions \
+         WHERE operating_role = ? AND operating_scope = ?",
+    );
+    let mut values = vec![
+        rusqlite::types::Value::Text(request.operating_role.clone()),
+        rusqlite::types::Value::Text(request.operating_scope.clone()),
+    ];
+    if !request.phases.is_empty() {
+        sql.push_str(" AND phase IN (");
+        for (index, phase) in request.phases.iter().enumerate() {
+            if index != 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+            values.push(rusqlite::types::Value::Text(
+                mission_phase_name(*phase).to_owned(),
+            ));
+        }
+        sql.push(')');
+    }
+    connection
+        .query_row(&sql, params_from_iter(values), |row| row.get(0))
+        .map_err(StateError::from)
+}
+
+fn format_mission_list_cursor(
+    mission: &MissionRecord,
+    request: &MissionListFilter,
+    snapshot_sequence: i64,
+) -> String {
+    let cursor = MissionListCursor {
+        version: MISSION_LIST_CURSOR_VERSION,
+        created_at: mission
+            .created_at
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        mission_id: mission.mission_id.to_string(),
+        snapshot_sequence,
+        operating_role: request.operating_role.clone(),
+        operating_scope: request.operating_scope.clone(),
+        phases: canonical_mission_phase_names(&request.phases),
+    };
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&cursor).expect("mission list cursor contains only serializable fields"),
+    )
+}
+
+fn parse_mission_list_cursor(
+    value: &str,
+    request: &MissionListFilter,
+) -> Result<MissionListCursor> {
+    if value.is_empty() || value.len() > 1024 {
+        return Err(StateError::InvalidMissionList(
+            "cursor must contain 1..=1024 characters".to_owned(),
+        ));
+    }
+    let encoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| StateError::InvalidMissionList("cursor encoding is invalid".to_owned()))?;
+    let cursor: MissionListCursor = serde_json::from_slice(&encoded)
+        .map_err(|_| StateError::InvalidMissionList("cursor payload is invalid".to_owned()))?;
+    if cursor.version != MISSION_LIST_CURSOR_VERSION {
+        return Err(StateError::InvalidMissionList(
+            "cursor version is unsupported".to_owned(),
+        ));
+    }
+    if !is_canonical_mission_cursor_position(&cursor.created_at, &cursor.mission_id) {
+        return Err(StateError::InvalidMissionList(
+            "cursor must contain a canonical millisecond timestamp and UUIDv4 mission ID"
+                .to_owned(),
+        ));
+    }
+    if cursor.snapshot_sequence <= 0 {
+        return Err(StateError::InvalidMissionList(
+            "cursor snapshot sequence must be positive".to_owned(),
+        ));
+    }
+    if cursor.operating_role != request.operating_role
+        || cursor.operating_scope != request.operating_scope
+        || cursor.phases != canonical_mission_phase_names(&request.phases)
+    {
+        return Err(StateError::InvalidMissionList(
+            "cursor does not match the mission list filters".to_owned(),
+        ));
+    }
+    Ok(cursor)
+}
+
+fn is_canonical_mission_cursor_position(created_at: &str, mission_id: &str) -> bool {
+    DateTime::parse_from_rfc3339(created_at).is_ok_and(|timestamp| {
+        timestamp
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+            == created_at
+    }) && is_uuid_v4(mission_id)
+}
+
+fn canonical_mission_phase_names(phases: &[MissionPhase]) -> Vec<String> {
+    let mut names = phases
+        .iter()
+        .map(|phase| mission_phase_name(*phase).to_owned())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+fn is_uuid_v4(value: &str) -> bool {
+    value.len() == 36
+        && value.as_bytes().get(8) == Some(&b'-')
+        && value.as_bytes().get(13) == Some(&b'-')
+        && value.as_bytes().get(18) == Some(&b'-')
+        && value.as_bytes().get(23) == Some(&b'-')
+        && value.as_bytes().get(14) == Some(&b'4')
+        && matches!(value.as_bytes().get(19), Some(b'8' | b'9' | b'a' | b'b'))
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit())
+}
+
+fn append_audit_record_tx(tx: &Transaction<'_>, record: NewAuditRecord) -> Result<AuditRecord> {
+    let latest: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT chain_index, entry_hash FROM audit_records WHERE session_id = ?1 ORDER BY chain_index DESC LIMIT 1",
+            (&record.session_id,),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (chain_index, prev_hash) = match latest {
+        Some((chain_index, entry_hash)) => (chain_index + 1, entry_hash),
+        None => (0, genesis_prev_hash(&record.session_id)),
+    };
+    let record = record.finalize(prev_hash);
+    record
+        .validate()
+        .map_err(|err| StateError::InvalidAuditRecord(err.to_owned()))?;
+    let payload_json = serde_json::to_string(&record.payload)?;
+    let verification_json = record
+        .verification
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    tx.execute(
+        "INSERT INTO audit_records(entry_id, session_id, chain_index, timestamp, record_kind, action, severity, conversation_id, turn_id, action_id, causation_id, correlation_id, external_ref, trust_ref, gate_ref, payload_json, verification_json, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![
+            &record.entry_id,
+            &record.session_id,
+            chain_index,
+            &record.timestamp,
+            audit_record_kind_name(record.kind),
+            &record.action,
+            audit_severity_name(record.severity),
+            &record.envelope.conversation_id,
+            &record.envelope.turn_id,
+            &record.envelope.action_id,
+            &record.envelope.causation_id,
+            &record.envelope.correlation_id,
+            &record.envelope.external_ref,
+            &record.envelope.trust_ref,
+            &record.envelope.gate_ref,
+            payload_json,
+            verification_json,
+            &record.prev_hash,
+            &record.entry_hash,
+        ],
+    )?;
+    Ok(record)
+}
+
+const fn mission_phase_name(phase: MissionPhase) -> &'static str {
+    match phase {
+        MissionPhase::Created => "created",
+        MissionPhase::Active => "active",
+        MissionPhase::Waiting => "waiting",
+        MissionPhase::RecoveryPending => "recovery_pending",
+        MissionPhase::Suspended => "suspended",
+        MissionPhase::Completed => "completed",
+        MissionPhase::Cancelled => "cancelled",
+        MissionPhase::Failed => "failed",
+        MissionPhase::DeadlineExceeded => "deadline_exceeded",
+        MissionPhase::BudgetExhausted => "budget_exhausted",
+    }
+}
+
 fn audit_record_kind_name(kind: AuditRecordKind) -> &'static str {
     match kind {
         AuditRecordKind::Effect => "effect",
@@ -541,6 +1287,7 @@ fn audit_record_kind_name(kind: AuditRecordKind) -> &'static str {
         AuditRecordKind::GateDecision => "gate_decision",
         AuditRecordKind::Verification => "verification",
         AuditRecordKind::SessionAttestation => "session_attestation",
+        AuditRecordKind::MissionEvent => "mission_event",
     }
 }
 
@@ -560,6 +1307,7 @@ fn parse_audit_record_kind(input: &str) -> rusqlite::Result<AuditRecordKind> {
         "gate_decision" => Ok(AuditRecordKind::GateDecision),
         "verification" => Ok(AuditRecordKind::Verification),
         "session_attestation" => Ok(AuditRecordKind::SessionAttestation),
+        "mission_event" => Ok(AuditRecordKind::MissionEvent),
         other => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
@@ -848,6 +1596,143 @@ mod tests {
     const TEST_ENTRY_ID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
     const TEST_ENTRY_ID_B: &str = "550e8400-e29b-41d4-a716-446655440001";
     const TEST_SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440002";
+
+    fn created_mission() -> MissionRecord {
+        serde_json::from_value(serde_json::json!({
+            "mission_schema": lanyte_mission::MISSION_RECORD_SCHEMA,
+            "mission_id": TEST_SESSION_ID,
+            "revision": 0,
+            "goal": "Persist one mission projection",
+            "policy_id": "policy.default",
+            "created_at": "2026-08-17T20:00:00Z",
+            "updated_at": "2026-08-17T20:00:00Z",
+            "initiator": {
+                "kind": "attested_session",
+                "subject": "operator-1",
+                "role": "entarch",
+                "scope": "lanytehq",
+                "attestation": {
+                    "issuer": "lanyte-attest",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440003",
+                    "jti": "550e8400-e29b-41d4-a716-446655440004",
+                    "context_sha256": "a".repeat(64),
+                    "token_sha256": "b".repeat(64),
+                    "verification_policy_sha256": "c".repeat(64),
+                    "trust_ref": "attestations/1"
+                }
+            },
+            "authorizer": null,
+            "authorization_ref": null,
+            "supervisor": {
+                "kind": "service",
+                "subject": "lanyte",
+                "role": null,
+                "scope": null,
+                "attestation": null
+            },
+            "operating_role": {
+                "role": "entarch",
+                "scope": "lanytehq"
+            },
+            "phase": "created",
+            "terminal_reason": null,
+            "deadline_at": null,
+            "lease_policy": {
+                "enabled": false,
+                "lease_seconds": null,
+                "deadman_seconds": null
+            },
+            "budget_policy": {
+                "wall_clock_seconds": null,
+                "token_limit": null,
+                "cost_micros": null,
+                "action_limit": null
+            },
+            "harness_selection": null,
+            "recovery_policy": "ask_operator",
+            "recovery_point_ref": null,
+            "attempts": [],
+            "current_attempt_id": null,
+            "evidence_chain_id": TEST_SESSION_ID,
+            "terminal_entry_hash": null
+        }))
+        .expect("mission fixture should deserialize")
+    }
+
+    fn created_mission_receipt(entry_id: &str) -> NewMissionProjectionReceipt {
+        let event = serde_json::from_value(serde_json::json!({
+            "event_schema": lanyte_mission::LIFECYCLE_EVENT_SCHEMA,
+            "event_id": entry_id,
+            "mission_id": TEST_SESSION_ID,
+            "sequence": 1,
+            "previous_entry_hash": null,
+            "entry_hash": "d".repeat(64),
+            "occurred_at": "2026-08-17T20:00:00Z",
+            "recorded_at": "2026-08-17T20:00:00Z",
+            "event_type": "mission_created",
+            "source": {
+                "kind": "verified_attestation",
+                "subject": "operator-1",
+                "producer_version": "0.1.0",
+                "assurance": "resource_attested",
+                "evidence_ref": "attestations/1"
+            },
+            "payload": {
+                "type": "mission_created",
+                "revision": 0
+            }
+        }))
+        .expect("lifecycle fixture should deserialize");
+        NewMissionProjectionReceipt {
+            event,
+            envelope: AuditEnvelopeRef {
+                action_id: Some(entry_id.to_owned()),
+                correlation_id: Some(TEST_SESSION_ID.to_owned()),
+                trust_ref: Some("attestations/1".to_owned()),
+                ..AuditEnvelopeRef::default()
+            },
+            verification: None,
+        }
+    }
+
+    fn created_mission_for(
+        mission_id: &str,
+        operating_role: &str,
+        operating_scope: &str,
+        timestamp: &str,
+    ) -> MissionRecord {
+        let mut value = serde_json::to_value(created_mission()).expect("fixture should encode");
+        value["mission_id"] = serde_json::json!(mission_id);
+        value["evidence_chain_id"] = serde_json::json!(mission_id);
+        value["created_at"] = serde_json::json!(timestamp);
+        value["updated_at"] = serde_json::json!(timestamp);
+        value["operating_role"]["role"] = serde_json::json!(operating_role);
+        value["operating_role"]["scope"] = serde_json::json!(operating_scope);
+        serde_json::from_value(value).expect("mission fixture should deserialize")
+    }
+
+    fn created_mission_receipt_for(
+        mission_id: &str,
+        entry_id: &str,
+        timestamp: &str,
+    ) -> NewMissionProjectionReceipt {
+        let receipt = created_mission_receipt(entry_id);
+        let mut event = serde_json::to_value(receipt.event).expect("fixture should encode");
+        event["mission_id"] = serde_json::json!(mission_id);
+        event["occurred_at"] = serde_json::json!(timestamp);
+        event["recorded_at"] = serde_json::json!(timestamp);
+        NewMissionProjectionReceipt {
+            event: serde_json::from_value(event).expect("receipt fixture should deserialize"),
+            envelope: AuditEnvelopeRef {
+                action_id: Some(entry_id.to_owned()),
+                correlation_id: Some(mission_id.to_owned()),
+                trust_ref: Some("attestations/1".to_owned()),
+                ..AuditEnvelopeRef::default()
+            },
+            verification: None,
+        }
+    }
+
     const TEST_ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -900,7 +1785,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store should open");
 
         assert!(paths.hot_db_path().exists());
-        assert_eq!(store.schema_version().expect("schema version query"), 3);
+        assert_eq!(store.schema_version().expect("schema version query"), 5);
     }
 
     #[test]
@@ -909,10 +1794,462 @@ mod tests {
         let paths = StatePaths::new(&root);
 
         let store_a = StateStore::open(paths.clone()).expect("state store should open");
-        assert_eq!(store_a.schema_version().expect("schema version query"), 3);
+        assert_eq!(store_a.schema_version().expect("schema version query"), 5);
 
         let store_b = StateStore::open(paths).expect("state store should open again");
-        assert_eq!(store_b.schema_version().expect("schema version query"), 3);
+        assert_eq!(store_b.schema_version().expect("schema version query"), 5);
+    }
+
+    #[test]
+    fn version_three_store_upgrades_to_mission_projection_schema() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        drop(StateStore::open(paths.clone()).expect("state store should open"));
+
+        let connection =
+            Connection::open(paths.hot_db_path()).expect("database should reopen directly");
+        connection
+            .execute_batch(
+                "DROP TABLE missions; \
+                 UPDATE state_metadata SET value = 3 WHERE key = 'schema_version';",
+            )
+            .expect("version-three fixture should prepare");
+        drop(connection);
+
+        let mut store = StateStore::open(paths).expect("version-three store should upgrade");
+        assert_eq!(store.schema_version().expect("schema version query"), 5);
+        store
+            .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("upgraded store should persist missions");
+    }
+
+    #[test]
+    fn version_four_store_upgrades_to_mission_request_schema() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        drop(StateStore::open(paths.clone()).expect("state store should open"));
+
+        let connection =
+            Connection::open(paths.hot_db_path()).expect("database should reopen directly");
+        connection
+            .execute_batch(
+                "DROP TABLE mission_requests; \
+                 UPDATE state_metadata SET value = 4 WHERE key = 'schema_version';",
+            )
+            .expect("version-four fixture should prepare");
+        drop(connection);
+
+        let mut store = StateStore::open(paths).expect("version-four store should upgrade");
+        assert_eq!(store.schema_version().expect("schema version query"), 5);
+        store
+            .create_mission_idempotent(
+                created_mission(),
+                created_mission_receipt(TEST_ENTRY_ID_A),
+                MissionCreateIdempotency {
+                    key: "mission-create-upgrade-key".to_owned(),
+                    request_fingerprint: "a".repeat(64),
+                },
+            )
+            .expect("upgraded store should persist idempotent missions");
+    }
+
+    #[test]
+    fn mission_projection_and_receipt_commit_atomically() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let mission = created_mission();
+
+        let write = store
+            .create_mission(mission.clone(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("mission and receipt should commit");
+
+        assert_eq!(write.projection.mission, mission);
+        assert_eq!(write.receipt.kind, AuditRecordKind::MissionEvent);
+        assert_eq!(write.receipt.session_id, TEST_SESSION_ID);
+        assert_eq!(write.projection.audit_entry_hash, write.receipt.entry_hash);
+
+        let stored = store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .expect("mission should exist");
+        assert_eq!(stored, write.projection);
+        let records = store
+            .audit_records(TEST_SESSION_ID)
+            .expect("mission receipt chain should load");
+        assert_eq!(records, vec![write.receipt]);
+    }
+
+    #[test]
+    fn duplicate_projection_does_not_append_a_receipt() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let mission = created_mission();
+        store
+            .create_mission(mission.clone(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("first mission should commit");
+
+        let result = store.create_mission(mission, created_mission_receipt(TEST_ENTRY_ID_B));
+        assert!(result.is_err(), "duplicate mission must fail");
+
+        let records = store
+            .audit_records(TEST_SESSION_ID)
+            .expect("mission receipt chain should remain valid");
+        assert_eq!(records.len(), 1, "failed projection must roll back receipt");
+        assert_eq!(records[0].entry_id, TEST_ENTRY_ID_A);
+    }
+
+    #[test]
+    fn idempotent_create_replays_original_write_and_rejects_conflicts() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let idempotency = MissionCreateIdempotency {
+            key: "mission-create-replay-key".to_owned(),
+            request_fingerprint: "a".repeat(64),
+        };
+
+        let initial = store
+            .create_mission_idempotent(
+                created_mission(),
+                created_mission_receipt(TEST_ENTRY_ID_A),
+                idempotency.clone(),
+            )
+            .expect("initial create should commit");
+        assert!(!initial.replayed);
+
+        let replay = store
+            .create_mission_idempotent(
+                created_mission(),
+                created_mission_receipt(TEST_ENTRY_ID_B),
+                idempotency.clone(),
+            )
+            .expect("matching replay should return original write");
+        assert!(replay.replayed);
+        assert_eq!(replay.write, initial.write);
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("mission receipt chain should load")
+                .len(),
+            1,
+            "matching replay must not append another receipt"
+        );
+
+        let conflict = store.create_mission_idempotent(
+            created_mission(),
+            created_mission_receipt(TEST_ENTRY_ID_B),
+            MissionCreateIdempotency {
+                key: idempotency.key,
+                request_fingerprint: "b".repeat(64),
+            },
+        );
+        assert!(matches!(
+            conflict,
+            Err(StateError::MissionIdempotencyConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("mission receipt chain should remain valid")
+                .len(),
+            1,
+            "conflict must not append another receipt"
+        );
+    }
+
+    #[test]
+    fn list_missions_is_caller_scoped_filtered_and_cursor_stable() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let first_id = "550e8400-e29b-41d4-a716-446655440010";
+        let second_id = "550e8400-e29b-41d4-a716-446655440011";
+        let other_id = "550e8400-e29b-41d4-a716-446655440012";
+        let inserted_after_snapshot_id = "00000000-0000-4000-8000-000000000013";
+        store
+            .create_mission(
+                created_mission_for(first_id, "entarch", "lanytehq", "2026-08-17T20:00:00Z"),
+                created_mission_receipt_for(
+                    first_id,
+                    "550e8400-e29b-41d4-a716-446655440020",
+                    "2026-08-17T20:00:00Z",
+                ),
+            )
+            .expect("first mission should persist");
+        store
+            .create_mission(
+                created_mission_for(second_id, "entarch", "lanytehq", "2026-08-17T20:01:00Z"),
+                created_mission_receipt_for(
+                    second_id,
+                    "550e8400-e29b-41d4-a716-446655440021",
+                    "2026-08-17T20:01:00Z",
+                ),
+            )
+            .expect("second mission should persist");
+        store
+            .create_mission(
+                created_mission_for(other_id, "other", "scope", "2026-08-17T20:00:30Z"),
+                created_mission_receipt_for(
+                    other_id,
+                    "550e8400-e29b-41d4-a716-446655440022",
+                    "2026-08-17T20:00:30Z",
+                ),
+            )
+            .expect("other caller mission should persist");
+
+        let first_page = store
+            .list_missions(MissionListFilter {
+                operating_role: "entarch".to_owned(),
+                operating_scope: "lanytehq".to_owned(),
+                phases: vec![MissionPhase::Created],
+                limit: 1,
+                cursor: None,
+            })
+            .expect("first page should load");
+        assert_eq!(first_page.projections.len(), 1);
+        assert_eq!(
+            first_page.projections[0].mission.mission_id.to_string(),
+            first_id
+        );
+        let cursor = first_page
+            .next_cursor
+            .clone()
+            .expect("first page should have a cursor");
+        assert!(!cursor.contains('|'), "cursor must be opaque");
+        store
+            .create_mission(
+                created_mission_for(
+                    inserted_after_snapshot_id,
+                    "entarch",
+                    "lanytehq",
+                    "2026-08-17T20:01:00Z",
+                ),
+                created_mission_receipt_for(
+                    inserted_after_snapshot_id,
+                    "550e8400-e29b-41d4-a716-446655440023",
+                    "2026-08-17T20:01:00Z",
+                ),
+            )
+            .expect("post-snapshot mission should persist");
+        let second_page = store
+            .list_missions(MissionListFilter {
+                operating_role: "entarch".to_owned(),
+                operating_scope: "lanytehq".to_owned(),
+                phases: vec![MissionPhase::Created],
+                limit: 1,
+                cursor: Some(cursor.clone()),
+            })
+            .expect("second page should load");
+        assert_eq!(second_page.projections.len(), 1);
+        assert_eq!(
+            second_page.projections[0].mission.mission_id.to_string(),
+            second_id
+        );
+        assert!(
+            second_page.next_cursor.is_none(),
+            "a mission inserted after the first page must not enter that snapshot"
+        );
+
+        for mismatched in [
+            MissionListFilter {
+                operating_role: "entarch".to_owned(),
+                operating_scope: "other-scope".to_owned(),
+                phases: vec![MissionPhase::Created],
+                limit: 1,
+                cursor: Some(cursor.clone()),
+            },
+            MissionListFilter {
+                operating_role: "entarch".to_owned(),
+                operating_scope: "lanytehq".to_owned(),
+                phases: vec![MissionPhase::Active],
+                limit: 1,
+                cursor: Some(cursor.clone()),
+            },
+        ] {
+            assert!(matches!(
+                store.list_missions(mismatched),
+                Err(StateError::InvalidMissionList(_))
+            ));
+        }
+
+        let hidden = store
+            .list_missions(MissionListFilter {
+                operating_role: "entarch".to_owned(),
+                operating_scope: "lanytehq".to_owned(),
+                phases: vec![MissionPhase::Active],
+                limit: 1,
+                cursor: None,
+            })
+            .expect("phase-filtered page should load");
+        assert!(hidden.projections.is_empty());
+        let other_caller = store
+            .list_missions(MissionListFilter {
+                operating_role: "other".to_owned(),
+                operating_scope: "scope".to_owned(),
+                phases: Vec::new(),
+                limit: 1,
+                cursor: None,
+            })
+            .expect("other caller page should load");
+        assert_eq!(other_caller.projections.len(), 1);
+        assert_eq!(
+            other_caller.projections[0].mission.mission_id.to_string(),
+            other_id
+        );
+
+        let invalid_limit = store.list_missions(MissionListFilter {
+            operating_role: "entarch".to_owned(),
+            operating_scope: "lanytehq".to_owned(),
+            phases: Vec::new(),
+            limit: MAX_MISSION_LIST_LIMIT + 1,
+            cursor: None,
+        });
+        assert!(matches!(
+            invalid_limit,
+            Err(StateError::InvalidMissionList(_))
+        ));
+
+        store
+            .connection
+            .execute(
+                "UPDATE missions SET record_json = '{}' WHERE mission_id = ?1",
+                (first_id,),
+            )
+            .expect("fixture corruption should apply");
+        let corrupted = store.list_missions(MissionListFilter {
+            operating_role: "entarch".to_owned(),
+            operating_scope: "lanytehq".to_owned(),
+            phases: Vec::new(),
+            limit: 10,
+            cursor: None,
+        });
+        assert!(matches!(
+            corrupted,
+            Err(StateError::InvalidMissionProjection(_))
+        ));
+    }
+
+    #[test]
+    fn projection_insert_failure_rolls_back_audit_append() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_mission_insert \
+                 BEFORE INSERT ON missions \
+                 BEGIN \
+                     SELECT RAISE(FAIL, 'forced mission insert failure'); \
+                 END;",
+            )
+            .expect("failure trigger should install");
+
+        let result =
+            store.create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A));
+        assert!(result.is_err(), "forced projection failure must surface");
+        assert!(store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .is_none());
+        assert!(store
+            .audit_records(TEST_SESSION_ID)
+            .expect("receipt chain query should succeed")
+            .is_empty());
+    }
+
+    #[test]
+    fn claimed_create_receipt_cannot_persist_a_projection() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        let mut receipt = created_mission_receipt(TEST_ENTRY_ID_A);
+        receipt.event.source.kind = EventSourceKind::DriverReported;
+        receipt.event.source.assurance = lanyte_mission::ObservationLevel::DriverObserved;
+        receipt.event.source.evidence_ref = None;
+
+        let result = store.create_mission(created_mission(), receipt);
+        assert!(matches!(
+            result,
+            Err(StateError::InvalidMissionProjection(_))
+        ));
+        assert!(store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .is_none());
+        assert!(store
+            .audit_records(TEST_SESSION_ID)
+            .expect("empty receipt chain should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn mission_projection_survives_reopen_with_receipt_binding() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mission = created_mission();
+        let expected_hash = {
+            let mut store = StateStore::open(paths.clone()).expect("state store should open");
+            store
+                .create_mission(mission.clone(), created_mission_receipt(TEST_ENTRY_ID_A))
+                .expect("mission should commit")
+                .receipt
+                .entry_hash
+        };
+
+        let store = StateStore::open(paths).expect("state store should reopen");
+        let stored = store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .expect("mission should survive reopen");
+        assert_eq!(stored.mission, mission);
+        assert_eq!(stored.audit_entry_hash, expected_hash);
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("receipt chain should survive reopen")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn mission_receipt_chain_is_not_generic_session_eviction() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        store
+            .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("mission should commit");
+
+        let evicted = store
+            .session_evictor()
+            .evict_older_than(
+                DateTime::parse_from_rfc3339("2026-10-01T00:00:00.000Z")
+                    .expect("valid time")
+                    .with_timezone(&Utc),
+                &AgeBasedEvictionPolicy::default(),
+            )
+            .expect("eviction should succeed");
+
+        assert!(evicted.is_empty());
+        assert!(store
+            .mission(TEST_SESSION_ID)
+            .expect("mission query should succeed")
+            .is_some());
+        assert_eq!(
+            store
+                .audit_records(TEST_SESSION_ID)
+                .expect("mission receipt chain should remain hot")
+                .len(),
+            1
+        );
+        assert!(store
+            .warm_export_metadata(TEST_SESSION_ID)
+            .expect("warm metadata query should succeed")
+            .is_none());
     }
 
     #[test]

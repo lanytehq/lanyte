@@ -1,7 +1,11 @@
+mod cli;
+mod runtime;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::{env, path::PathBuf};
 
+use clap::Parser;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +21,10 @@ enum MainError {
     Gateway(#[from] lanyte_gateway::GatewayError),
     #[error(transparent)]
     State(#[from] lanyte_state::StateError),
+    #[error(transparent)]
+    Client(#[from] cli::ClientError),
+    #[error(transparent)]
+    Runtime(#[from] runtime::RuntimeSocketError),
     #[error("failed to resolve local audit state root: {0}")]
     StateBootstrap(String),
     #[error(transparent)]
@@ -30,12 +38,27 @@ enum MainError {
 #[tokio::main]
 async fn main() -> Result<(), MainError> {
     lanyte_telemetry::init_tracing()?;
+    let cli = cli::Cli::parse();
 
+    match cli.command {
+        cli::Command::Serve => serve().await,
+        cli::Command::Mission { command } => {
+            let loaded_cfg = lanyte_common::LanyteConfig::load_with_provenance()?;
+            let socket = runtime::resolve_control_socket(&loaded_cfg.config.gateway.socket_path)?;
+            cli::run_mission(command, &socket).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn serve() -> Result<(), MainError> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "lanyte starting");
 
     let loaded_cfg = lanyte_common::LanyteConfig::load_with_provenance()?;
     tracing::debug!(provenance = ?loaded_cfg.provenance, "resolved configuration provenance");
-    let cfg = loaded_cfg.config;
+    let mut cfg = loaded_cfg.config;
+    cfg.gateway.socket_path = runtime::resolve_control_socket(&cfg.gateway.socket_path)?;
+    let _socket_lock = runtime::prepare_server_socket(&cfg.gateway.socket_path)?;
     let sock = cfg.gateway.socket_path.clone();
     let schemas = cfg.gateway.crucible_schemas_dir.clone();
 
@@ -58,6 +81,7 @@ async fn main() -> Result<(), MainError> {
     }
 
     let (gateway, events) = lanyte_gateway::spawn(cfg.gateway)?;
+    runtime::verify_client_socket(&sock)?;
     let orchestrator_cancel = CancellationToken::new();
     let orchestrator = lanyte_orchestrator::Orchestrator::new(
         events,
@@ -65,7 +89,8 @@ async fn main() -> Result<(), MainError> {
         gateway.responder(),
         llm,
     )
-    .with_audit_store(audit_store);
+    .with_audit_store(Arc::clone(&audit_store))
+    .with_mission_service(lanyte_orchestrator::MissionService::production(audit_store));
     let mut gateway = Some(gateway);
     let orchestrator_task = tokio::spawn(orchestrator.run());
     tokio::pin!(orchestrator_task);

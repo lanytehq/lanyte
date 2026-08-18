@@ -12,6 +12,7 @@
 pub mod test_support;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -25,6 +26,7 @@ use lanyte_common::{channels, ChannelId, GatewayConfig};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -47,6 +49,27 @@ pub struct GatewayEvent {
     pub peer_id: String,
     pub channel: ChannelId,
     pub payload: Vec<u8>,
+    pub client_auth_token: Option<ClientAuthToken>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientAuthToken(Arc<Zeroizing<String>>);
+
+impl ClientAuthToken {
+    fn new(token: String) -> Self {
+        Self(Arc::new(Zeroizing::new(token)))
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for ClientAuthToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClientAuthToken([REDACTED])")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +321,11 @@ async fn accept_loop_with_listener<L: GatewayListener>(
                 // TODO(CRT-009): switch to opaque connection IDs if these escape gateway internals.
                 let connection_id = format!("peer-{next_connection_id}");
                 next_connection_id += 1;
+                let client_auth_token = peer
+                    .handshake_result()
+                    .client_auth_token
+                    .clone()
+                    .map(ClientAuthToken::new);
                 tracing::info!(
                     peer_id = %connection_id,
                     core_peer_id = %core_peer_id,
@@ -307,6 +335,7 @@ async fn accept_loop_with_listener<L: GatewayListener>(
                 tokio::spawn(peer_reader(
                     connection_id,
                     peer,
+                    client_auth_token,
                     cancel.clone(),
                     events_tx.clone(),
                     Arc::clone(&peers),
@@ -360,6 +389,7 @@ async fn run_gateway(
 async fn peer_reader(
     connection_id: String,
     peer: AsyncPeer,
+    client_auth_token: Option<ClientAuthToken>,
     cancel: CancellationToken,
     events_tx: mpsc::Sender<GatewayEvent>,
     peers: Arc<Mutex<HashMap<String, AsyncPeerTx>>>,
@@ -388,7 +418,9 @@ async fn peer_reader(
             }
         };
 
-        if let Err(err) = forward_frame(&connection_id, frame, &events_tx).await {
+        if let Err(err) =
+            forward_frame(&connection_id, frame, client_auth_token.clone(), &events_tx).await
+        {
             tracing::warn!(peer_id = %connection_id, error = %err, "failed to forward gateway event");
             // If downstream is gone, there's no reason to keep accepting traffic.
             cancel.cancel();
@@ -406,6 +438,7 @@ async fn peer_reader(
 async fn forward_frame(
     peer_id: &str,
     frame: Frame,
+    client_auth_token: Option<ClientAuthToken>,
     events_tx: &mpsc::Sender<GatewayEvent>,
 ) -> Result<(), &'static str> {
     let channel: ChannelId = frame.channel;
@@ -413,6 +446,7 @@ async fn forward_frame(
         peer_id: peer_id.to_owned(),
         channel,
         payload: frame.payload.as_ref().to_vec(),
+        client_auth_token,
     };
     events_tx
         .send(event)

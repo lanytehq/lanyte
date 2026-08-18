@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 
 [[bin]]
 name = "mock_mlvoy"
