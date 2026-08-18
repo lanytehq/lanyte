@@ -159,13 +159,20 @@ impl MissionService {
         mission_id: &str,
         caller: &VerifiedSession,
     ) -> Result<lanyte_mission::MissionRecord, MissionCommandError> {
+        Ok(self.visible_projection(mission_id, caller)?.mission)
+    }
+
+    pub(crate) fn visible_projection(
+        &self,
+        mission_id: &str,
+        caller: &VerifiedSession,
+    ) -> Result<lanyte_state::StoredMissionProjection, MissionCommandError> {
         self.store
             .lock()
             .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
             .mission(mission_id)
             .map_err(map_state_error)?
             .filter(|projection| visible_to(&projection.mission, caller))
-            .map(|projection| projection.mission)
             .ok_or_else(MissionCommandError::permission_denied)
     }
 
@@ -175,6 +182,10 @@ impl MissionService {
         mission: lanyte_mission::MissionRecord,
         receipt: lanyte_state::NewMissionProjectionReceipt,
     ) -> Result<lanyte_state::MissionProjectionWrite, MissionCommandError> {
+        receipt
+            .event
+            .validate()
+            .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         self.store
             .lock()
             .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?

@@ -182,7 +182,8 @@ impl Orchestrator {
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
         )?;
-        let before = service.visible_mission(&body.mission_id.to_string(), &caller)?;
+        let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
+        let before = stored.mission.clone();
         if before.revision != expected_revision {
             return Err(MissionCommandError::invalid_args(format!(
                 "stale mission revision: expected {expected_revision}, actual {}",
@@ -262,7 +263,7 @@ impl Orchestrator {
             event_id,
             mission_id: mission.mission_id,
             sequence: 2,
-            previous_entry_hash: None,
+            previous_entry_hash: Some(stored.audit_entry_hash.clone()),
             entry_hash: "0".repeat(64),
             occurred_at: now,
             recorded_at: now,
@@ -381,7 +382,8 @@ impl Orchestrator {
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
         )?;
-        let before = service.visible_mission(&body.mission_id.to_string(), &caller)?;
+        let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
+        let before = stored.mission.clone();
         if before.revision != expected_revision {
             return Err(MissionCommandError::invalid_args(format!(
                 "stale mission revision: expected {expected_revision}, actual {}",
@@ -392,12 +394,15 @@ impl Orchestrator {
             .current_attempt_id
             .ok_or_else(|| MissionCommandError::invalid_args("mission has no live attempt"))?;
         let mut sessions = live_sessions().lock().await;
-        if let Some(mut session) = sessions.remove(&attempt_id) {
-            session
-                .close()
-                .await
-                .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-        }
+        let mut session = sessions.remove(&attempt_id).ok_or_else(|| {
+            MissionCommandError::invalid_args(
+                "codex session is not in this kernel; close will not claim cancellation",
+            )
+        })?;
+        session
+            .close()
+            .await
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
         drop(sessions);
 
         let now = Utc::now();
@@ -422,7 +427,7 @@ impl Orchestrator {
             event_id,
             mission_id: mission.mission_id,
             sequence: 3,
-            previous_entry_hash: None,
+            previous_entry_hash: Some(stored.audit_entry_hash.clone()),
             entry_hash: "0".repeat(64),
             occurred_at: now,
             recorded_at: now,
