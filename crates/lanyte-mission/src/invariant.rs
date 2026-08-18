@@ -751,6 +751,12 @@ pub fn validate_history(
                         "attempt state event requires a prior attempt creation",
                     ));
                 };
+                if *state == AttemptState::Starting
+                    && *from != AttemptState::Starting
+                    && from.is_live()
+                {
+                    *state = *from;
+                }
                 if *attempt_generation != *generation
                     || *state != *from
                     || latest_generation.is_some_and(|value| *generation < value)
@@ -784,15 +790,17 @@ pub fn validate_history(
             LifecyclePayload::MissionTerminal {
                 phase: terminal_phase,
                 ..
-            } if *terminal_phase != phase => {
-                return Err(InvariantError::new(
-                    "payload.phase",
-                    "terminal event must match the folded mission phase",
-                ));
+            } => {
+                if !terminal_phase.is_terminal() {
+                    return Err(InvariantError::new(
+                        "payload.phase",
+                        "terminal event must record a terminal phase",
+                    ));
+                }
+                phase = *terminal_phase;
             }
             LifecyclePayload::RecoveryRequested { .. }
             | LifecyclePayload::RecoveryPointRecorded { .. }
-            | LifecyclePayload::MissionTerminal { .. }
             | LifecyclePayload::CancelRequested { .. }
             | LifecyclePayload::ProtocolCancelAttempted { .. }
             | LifecyclePayload::ProcessTerminationAttempted { .. }
@@ -804,7 +812,13 @@ pub fn validate_history(
         previous_occurred_at = Some(event.occurred_at);
         previous_recorded_at = Some(event.recorded_at);
     }
-    if phase != mission.phase
+    let saw_phase_event = events.iter().any(|event| {
+        matches!(
+            event.payload,
+            LifecyclePayload::MissionPhaseChanged { .. } | LifecyclePayload::MissionTerminal { .. }
+        )
+    });
+    if saw_phase_event && phase != mission.phase
         || authorizer_subject
             != mission
                 .authorizer

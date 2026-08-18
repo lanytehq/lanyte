@@ -29,7 +29,7 @@ pub(crate) fn validate_wave3_semantics(
     let mut protocol_proofs: HashMap<Fence, u64> = HashMap::new();
     let mut process_proofs: HashMap<Fence, u64> = HashMap::new();
     let mut running_leases: HashMap<uuid::Uuid, RunningLease> = HashMap::new();
-    let mut consumed_timer_edges: HashSet<(uuid::Uuid, u64, LeaseTickKind, String)> =
+    let mut consumed_timer_edges: HashSet<(uuid::Uuid, u64, LeaseTickKind, chrono::DateTime<Utc>)> =
         HashSet::new();
     let mut consumed_restarts: HashSet<(uuid::Uuid, u64)> = HashSet::new();
     let mut cancel_state_edges: HashMap<uuid::Uuid, CancelEdge> = HashMap::new();
@@ -38,6 +38,25 @@ pub(crate) fn validate_wave3_semantics(
     for event in events {
         let sequence = event.sequence;
         match &event.payload {
+            LifecyclePayload::AttemptCreated {
+                attempt_id,
+                ordinal,
+                generation,
+                recovery_relation,
+                predecessor_attempt_id,
+            } => {
+                if !attempts.get(attempt_id).is_some_and(|attempt| {
+                    attempt.ordinal == *ordinal
+                        && attempt.generation == *generation
+                        && attempt.recovery_relation == *recovery_relation
+                        && attempt.predecessor_attempt_id == *predecessor_attempt_id
+                }) {
+                    return sem(
+                        "SEM-T09",
+                        "attempt_created must match the attempt record identity",
+                    );
+                }
+            }
             LifecyclePayload::CancelRequested {
                 attempt_id,
                 generation,
@@ -238,6 +257,36 @@ pub(crate) fn validate_wave3_semantics(
                         if *observation_source == ObservationSource::KernelClock {
                             return sem("SEM-L09", "kernel clock cannot renew");
                         }
+                        if *observation_source == ObservationSource::ProcessProbe
+                            && *result_lease_expires_at != *prior_lease_expires_at
+                        {
+                            return sem("SEM-L06", "process probe may move deadman only");
+                        }
+                        if let Some(seconds) = deadman_seconds {
+                            if *result_deadman_at
+                                != *observed_at + Duration::seconds(seconds as i64)
+                            {
+                                return sem(
+                                    "SEM-L06",
+                                    "renewed deadman must derive from observed_at",
+                                );
+                            }
+                        }
+                        if matches!(
+                            *observation_source,
+                            ObservationSource::DriverEvent | ObservationSource::HarnessEvent
+                        ) {
+                            if let Some(seconds) = lease_seconds {
+                                if *result_lease_expires_at
+                                    != *observed_at + Duration::seconds(seconds as i64)
+                                {
+                                    return sem(
+                                        "SEM-L06",
+                                        "renewed lease deadline must derive from observed_at",
+                                    );
+                                }
+                            }
+                        }
                         let moved = *result_deadman_at > *prior_deadman_at
                             || (*observation_source != ObservationSource::ProcessProbe
                                 && *result_lease_expires_at > *prior_lease_expires_at);
@@ -273,12 +322,7 @@ pub(crate) fn validate_wave3_semantics(
                         if event.occurred_at < deadline {
                             return sem("SEM-L07", "fire/expire cannot occur before the deadline");
                         }
-                        let edge = (
-                            *attempt_id,
-                            running.lease_generation,
-                            *kind,
-                            deadline.to_rfc3339(),
-                        );
+                        let edge = (*attempt_id, running.lease_generation, *kind, deadline);
                         if !consumed_timer_edges.insert(edge) {
                             return sem("SEM-L10", "fire/expire edges cannot be emitted twice");
                         }

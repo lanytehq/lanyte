@@ -1,0 +1,371 @@
+{
+  "kind": "mission-history",
+  "mission": {
+    "mission_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/mission-record.schema.json",
+    "mission_id": "11111111-1111-4111-8111-111111111111",
+    "revision": 3,
+    "goal": "Supervise a Codex attempt.",
+    "policy_id": "policy.default",
+    "created_at": "2026-08-18T17:00:00Z",
+    "updated_at": "2026-08-18T17:08:30Z",
+    "initiator": {
+      "kind": "attested_session",
+      "subject": "operator-1",
+      "role": "entarch",
+      "scope": "lanytehq",
+      "attestation": {
+        "issuer": "lanyte-attest",
+        "session_id": "22222222-2222-4222-8222-222222222222",
+        "jti": "33333333-3333-4333-8333-333333333333",
+        "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "token_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "verification_policy_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "trust_ref": "attestations/33333333-3333-4333-8333-333333333333"
+      }
+    },
+    "authorizer": {
+      "kind": "attested_session",
+      "subject": "operator-1",
+      "role": "entarch",
+      "scope": "lanytehq",
+      "attestation": {
+        "issuer": "lanyte-attest",
+        "session_id": "22222222-2222-4222-8222-222222222222",
+        "jti": "33333333-3333-4333-8333-333333333333",
+        "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "token_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "verification_policy_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "trust_ref": "attestations/33333333-3333-4333-8333-333333333333"
+      }
+    },
+    "authorization_ref": "authz/1",
+    "supervisor": {
+      "kind": "service",
+      "subject": "lanyte-kernel",
+      "role": null,
+      "scope": null,
+      "attestation": null
+    },
+    "operating_role": {
+      "role": "entarch",
+      "scope": "lanytehq"
+    },
+    "phase": "cancelled",
+    "terminal_reason": "operator_cancelled",
+    "deadline_at": null,
+    "lease_policy": {
+      "enabled": true,
+      "lease_seconds": 600,
+      "deadman_seconds": 300
+    },
+    "budget_policy": {
+      "wall_clock_seconds": null,
+      "token_limit": null,
+      "cost_micros": null,
+      "action_limit": null
+    },
+    "harness_selection": null,
+    "recovery_policy": "stand_down",
+    "recovery_point_ref": null,
+    "attempts": [
+      {
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "ordinal": 1,
+        "generation": 1,
+        "fencing_token_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "recovery_relation": "initial",
+        "predecessor_attempt_id": null,
+        "state": "cancelled",
+        "driver_id": "driver.codex-app-server",
+        "harness_session_id": "thread-1",
+        "started_at": "2026-08-18T17:01:00Z",
+        "ended_at": "2026-08-18T17:08:30Z",
+        "terminal_reason": "protocol_cancelled",
+        "evidence_ref": "evidence/attempt-1",
+        "lease_expires_at": "2026-08-18T17:18:00Z",
+        "deadman_at": "2026-08-18T17:13:00Z",
+        "last_observed_at": "2026-08-18T17:08:00Z",
+        "last_observation_source": "driver_event",
+        "lease_generation": 3,
+        "process_tree_ref": "proc/tree-1",
+        "ownership_established_at": "2026-08-18T17:01:00Z",
+        "harness_thread_id": "thread-1",
+        "harness_turn_id": "turn-1"
+      }
+    ],
+    "current_attempt_id": null,
+    "evidence_chain_id": "11111111-1111-4111-8111-111111111111",
+    "terminal_entry_hash": "1515151515151515151515151515151515151515151515151515151515151515"
+  },
+  "events": [
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "77777777-7777-4777-8777-777777777777",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 1,
+      "previous_entry_hash": null,
+      "entry_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "occurred_at": "2026-08-18T17:00:00Z",
+      "recorded_at": "2026-08-18T17:00:00Z",
+      "event_type": "mission_created",
+      "source": {
+        "kind": "verified_attestation",
+        "subject": "codex",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "resource_attested",
+        "evidence_ref": "attestations/33333333-3333-4333-8333-333333333333"
+      },
+      "payload": {
+        "type": "mission_created",
+        "revision": 0
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "99999999-9999-4999-8999-999999999999",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 2,
+      "previous_entry_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "entry_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-08-18T17:00:30Z",
+      "recorded_at": "2026-08-18T17:00:30Z",
+      "event_type": "authorization_bound",
+      "source": {
+        "kind": "verified_attestation",
+        "subject": "codex",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "resource_attested",
+        "evidence_ref": "attestations/33333333-3333-4333-8333-333333333333"
+      },
+      "payload": {
+        "type": "authorization_bound",
+        "authorizer": {
+          "kind": "attested_session",
+          "subject": "operator-1",
+          "attestation_ref": "attestations/33333333-3333-4333-8333-333333333333"
+        }
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "acacacac-acac-4aca-8aca-acacacacacac",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 3,
+      "previous_entry_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "entry_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "occurred_at": "2026-08-18T17:01:00Z",
+      "recorded_at": "2026-08-18T17:01:00Z",
+      "event_type": "attempt_created",
+      "source": {
+        "kind": "kernel_observed",
+        "subject": "lanyte-kernel",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "kernel_observed",
+        "evidence_ref": "attempt/created"
+      },
+      "payload": {
+        "type": "attempt_created",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "ordinal": 1,
+        "generation": 1,
+        "recovery_relation": "initial",
+        "predecessor_attempt_id": null
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "b100b100-b100-4100-8100-b100b100b100",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 4,
+      "previous_entry_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "entry_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "occurred_at": "2026-08-18T17:01:00Z",
+      "recorded_at": "2026-08-18T17:01:00Z",
+      "event_type": "lease_started",
+      "source": {
+        "kind": "kernel_observed",
+        "subject": "lanyte-kernel",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "kernel_observed",
+        "evidence_ref": "lease/started"
+      },
+      "payload": {
+        "type": "lease_started",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "generation": 1,
+        "lease_generation": 1,
+        "lease_expires_at": "2026-08-18T17:11:00Z",
+        "deadman_at": "2026-08-18T17:06:00Z",
+        "observed_at": "2026-08-18T17:01:00Z",
+        "observation_source": "driver_event"
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 5,
+      "previous_entry_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "entry_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "occurred_at": "2026-08-18T17:04:00Z",
+      "recorded_at": "2026-08-18T17:04:00Z",
+      "event_type": "lease_tick",
+      "source": {
+        "kind": "kernel_observed",
+        "subject": "lanyte-kernel",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "kernel_observed",
+        "evidence_ref": "lease/lease_tick"
+      },
+      "payload": {
+        "type": "lease_tick",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "generation": 1,
+        "kind": "renewed",
+        "prior_lease_generation": 1,
+        "result_lease_generation": 2,
+        "prior_lease_expires_at": "2026-08-18T17:11:00Z",
+        "prior_deadman_at": "2026-08-18T17:06:00Z",
+        "result_lease_expires_at": "2026-08-18T17:14:00Z",
+        "result_deadman_at": "2026-08-18T17:09:00Z",
+        "observed_at": "2026-08-18T17:04:00Z",
+        "observation_source": "driver_event"
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "e6e6e6e6-e6e6-4e6e-8e6e-e6e6e6e6e6e6",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 6,
+      "previous_entry_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "entry_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "occurred_at": "2026-08-18T17:08:00Z",
+      "recorded_at": "2026-08-18T17:08:00Z",
+      "event_type": "lease_tick",
+      "source": {
+        "kind": "kernel_observed",
+        "subject": "lanyte-kernel",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "kernel_observed",
+        "evidence_ref": "lease/renew2"
+      },
+      "payload": {
+        "type": "lease_tick",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "generation": 1,
+        "kind": "renewed",
+        "prior_lease_generation": 2,
+        "result_lease_generation": 3,
+        "prior_lease_expires_at": "2026-08-18T17:14:00Z",
+        "prior_deadman_at": "2026-08-18T17:09:00Z",
+        "result_lease_expires_at": "2026-08-18T17:18:00Z",
+        "result_deadman_at": "2026-08-18T17:13:00Z",
+        "observed_at": "2026-08-18T17:08:00Z",
+        "observation_source": "driver_event"
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 7,
+      "previous_entry_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "entry_hash": "1212121212121212121212121212121212121212121212121212121212121212",
+      "occurred_at": "2026-08-18T17:08:30Z",
+      "recorded_at": "2026-08-18T17:08:30Z",
+      "event_type": "cancel_requested",
+      "source": {
+        "kind": "operator_command",
+        "subject": "operator-1",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "resource_attested",
+        "evidence_ref": "control/cancel/2"
+      },
+      "payload": {
+        "type": "cancel_requested",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "generation": 1,
+        "lease_generation": 3
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 8,
+      "previous_entry_hash": "1212121212121212121212121212121212121212121212121212121212121212",
+      "entry_hash": "1313131313131313131313131313131313131313131313131313131313131313",
+      "occurred_at": "2026-08-18T17:08:30Z",
+      "recorded_at": "2026-08-18T17:08:30Z",
+      "event_type": "protocol_cancel_attempted",
+      "source": {
+        "kind": "driver_reported",
+        "subject": "codex",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "driver_observed",
+        "evidence_ref": "codex/turn-1/interrupted"
+      },
+      "payload": {
+        "type": "protocol_cancel_attempted",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "generation": 1,
+        "lease_generation": 3,
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+        "outcome": "interrupted"
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 9,
+      "previous_entry_hash": "1313131313131313131313131313131313131313131313131313131313131313",
+      "entry_hash": "1414141414141414141414141414141414141414141414141414141414141414",
+      "occurred_at": "2026-08-18T17:08:30Z",
+      "recorded_at": "2026-08-18T17:08:30Z",
+      "event_type": "attempt_state_changed",
+      "source": {
+        "kind": "kernel_observed",
+        "subject": "lanyte-kernel",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "kernel_observed",
+        "evidence_ref": "evidence/attempt-1/cancelled"
+      },
+      "payload": {
+        "type": "attempt_state_changed",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "generation": 1,
+        "from": "cancelling",
+        "to": "cancelled",
+        "reason": "protocol interrupted",
+        "cause": "protocol_interrupt"
+      }
+    },
+    {
+      "event_schema": "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json",
+      "event_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 10,
+      "previous_entry_hash": "1414141414141414141414141414141414141414141414141414141414141414",
+      "entry_hash": "1515151515151515151515151515151515151515151515151515151515151515",
+      "occurred_at": "2026-08-18T17:08:30Z",
+      "recorded_at": "2026-08-18T17:08:30Z",
+      "event_type": "mission_terminal",
+      "source": {
+        "kind": "kernel_observed",
+        "subject": "lanyte-kernel",
+        "producer_version": "lanyte/0.3.0",
+        "assurance": "kernel_observed",
+        "evidence_ref": "evidence/terminal"
+      },
+      "payload": {
+        "type": "mission_terminal",
+        "phase": "cancelled",
+        "reason": "operator_cancelled",
+        "terminal_entry_hash": "1515151515151515151515151515151515151515151515151515151515151515"
+      }
+    }
+  ],
+  "driver_capabilities": []
+}

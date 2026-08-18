@@ -586,7 +586,10 @@ impl Orchestrator {
             attempt.state == AttemptState::Cancelling
                 && before.current_attempt_id == Some(attempt.attempt_id)
         });
-        if !already_cancelling && before.revision != expected_revision {
+        let resume_stored = service
+            .incomplete_mutation(&body.mission_id.to_string(), "mission.cancel")?
+            .is_some_and(|pending| pending.key == idempotency_key);
+        if !(already_cancelling && resume_stored) && before.revision != expected_revision {
             return Err(MissionCommandError::invalid_args(format!(
                 "stale mission revision: expected {expected_revision}, actual {}",
                 before.revision
@@ -764,7 +767,10 @@ impl Orchestrator {
                 None,
             )?;
             service.persist_update_events(expected_revision, cancelling.clone(), receipts, None)?;
-            service.crash_after_cancelling_persist()?;
+            if let Err(err) = service.crash_after_cancelling_persist() {
+                reservation_guard.disarm();
+                return Err(err);
+            }
         }
 
         let protocol = {
@@ -1073,10 +1079,25 @@ impl Orchestrator {
                         } if *id == attempt_id
                     )
                 });
-                let outcome = if already_dispatched {
-                    probe_process_tree(tree_ref)
-                } else {
-                    terminate_process_tree(tree_ref)
+                let outcome = match live_sessions().try_lock() {
+                    Ok(mut sessions) => {
+                        if let Some(session) = sessions.get_mut(&attempt_id) {
+                            let _ = session.poll_exit();
+                            let outcome = if already_dispatched {
+                                session.probe_process_tree()
+                            } else {
+                                session.kill_process_tree()
+                            };
+                            let _ = session.poll_exit();
+                            outcome
+                        } else if already_dispatched {
+                            probe_process_tree(tree_ref)
+                        } else {
+                            terminate_process_tree(tree_ref)
+                        }
+                    }
+                    Err(_) if already_dispatched => probe_process_tree(tree_ref),
+                    Err(_) => terminate_process_tree(tree_ref),
                 };
                 if outcome == ProcessTreeKill::Cleared {
                     let mut mission = before.clone();
@@ -1154,7 +1175,35 @@ impl Orchestrator {
                             *terminal_entry_hash = hash;
                         }
                     }
-                    service.persist_update_events(before.revision, mission, receipts, None)?;
+                    service.persist_update_events(
+                        before.revision,
+                        mission.clone(),
+                        receipts,
+                        None,
+                    )?;
+                    let result = MissionControlResult::Cancel {
+                        request_id: Uuid::new_v4(),
+                        idempotency_key: service
+                            .incomplete_mutation(&before.mission_id.to_string(), "mission.cancel")?
+                            .map(|pending| pending.key)
+                            .unwrap_or_else(|| format!("mission-cancel:{}", Uuid::new_v4())),
+                        expected_revision: before.revision,
+                        record: Box::new(mission),
+                        progress: CancelProgress {
+                            requested: true,
+                            protocol: None,
+                            fallback: Some(FallbackCancelProgress {
+                                outcome: FallbackCancelOutcome::Cleared,
+                            }),
+                        },
+                    };
+                    if let Ok(json) = serde_json::to_string(&result) {
+                        let _ = service.complete_incomplete_mutation(
+                            &before.mission_id.to_string(),
+                            "mission.cancel",
+                            &json,
+                        );
+                    }
                 } else if !already_dispatched {
                     let mut mission = before.clone();
                     mission.revision = before.revision + 1;
@@ -2913,6 +2962,14 @@ mod close_disposition_tests {
             )
             .expect("midway");
         assert_eq!(midway.attempts[0].state, AttemptState::Cancelling);
+        orchestrator.tick_leases().await;
+        let after_supervisor = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("after supervisor");
+        assert_eq!(after_supervisor.phase, MissionPhase::Cancelled);
         let retried = orchestrator
             .cancel_mission(
                 &test_event(),
@@ -2925,7 +2982,7 @@ mod close_disposition_tests {
                 .expect("retry cancel"),
             )
             .await
-            .expect("exact replay must resume");
+            .expect("exact replay after supervisor complete");
         let MissionControlResult::Cancel { record, .. } = retried else {
             panic!("expected cancel result");
         };

@@ -168,6 +168,32 @@ impl MissionService {
         Ok(())
     }
 
+    pub(crate) fn incomplete_mutation(
+        &self,
+        mission_id: &str,
+        operation: &str,
+    ) -> Result<Option<lanyte_state::MissionMutationIdempotency>, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .incomplete_mutation(mission_id, operation)
+            .map_err(map_state_error)
+    }
+
+    pub(crate) fn complete_incomplete_mutation(
+        &self,
+        mission_id: &str,
+        operation: &str,
+        result_json: &str,
+    ) -> Result<(), MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .complete_incomplete_mutation(mission_id, operation, result_json)
+            .map_err(map_state_error)?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn production(store: Arc<Mutex<StateStore>>) -> Self {
         Self::new(store, Arc::new(AttestationSessionVerifier))

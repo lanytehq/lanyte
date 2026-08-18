@@ -1,0 +1,62 @@
+{
+  "kind": "mission-history",
+  "mission": {
+    "mission_id": "11111111-1111-4111-8111-111111111111",
+    "evidence_chain_id": "11111111-1111-4111-8111-111111111111",
+    "phase": "active",
+    "authorizer": null,
+    "attempts": [
+      {
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "ordinal": 1,
+        "generation": 1,
+        "fencing_token_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "recovery_relation": "initial",
+        "predecessor_attempt_id": null,
+        "state": "completed",
+        "driver_id": "driver.local-process",
+        "harness_session_id": "harness-first",
+        "started_at": "2026-08-17T14:00:00Z",
+        "ended_at": "2026-08-17T14:05:00Z",
+        "terminal_reason": "harness_completed",
+        "evidence_ref": "evidence/attempt-1",
+        "lease_expires_at": null,
+        "deadman_at": null,
+        "last_observed_at": null,
+        "last_observation_source": null,
+        "lease_generation": null,
+        "process_tree_ref": null,
+        "ownership_established_at": null,
+        "harness_thread_id": null,
+        "harness_turn_id": null
+      },
+      {
+        "attempt_id": "99999999-9999-4999-8999-999999999999",
+        "ordinal": 2,
+        "generation": 2,
+        "fencing_token_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "recovery_relation": "relaunches",
+        "predecessor_attempt_id": "88888888-8888-4888-8888-888888888888",
+        "state": "starting",
+        "driver_id": "driver.local-process",
+        "harness_session_id": "harness-second",
+        "started_at": "2026-08-17T14:06:00Z",
+        "ended_at": null,
+        "terminal_reason": null,
+        "evidence_ref": "evidence/attempt-2",
+        "lease_expires_at": null,
+        "deadman_at": null,
+        "last_observed_at": null,
+        "last_observation_source": null,
+        "lease_generation": null,
+        "process_tree_ref": null,
+        "ownership_established_at": null,
+        "harness_thread_id": null,
+        "harness_turn_id": null
+      }
+    ],
+    "current_attempt_id": "99999999-9999-4999-8999-999999999999"
+  },
+  "events": [],
+  "driver_capabilities": []
+}

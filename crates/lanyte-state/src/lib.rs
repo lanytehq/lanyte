@@ -489,6 +489,44 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn incomplete_mutation(
+        &self,
+        mission_id: &str,
+        operation: &str,
+    ) -> Result<Option<MissionMutationIdempotency>> {
+        self.connection
+            .query_row(
+                "SELECT idempotency_key, request_fingerprint, operation, result_json, owner_token \
+                 FROM mission_mutations WHERE mission_id = ?1 AND operation = ?2 AND result_json = '' LIMIT 1",
+                [mission_id, operation],
+                |row| {
+                    Ok(MissionMutationIdempotency {
+                        key: row.get(0)?,
+                        request_fingerprint: row.get(1)?,
+                        operation: row.get(2)?,
+                        result_json: row.get(3)?,
+                        owner_token: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn complete_incomplete_mutation(
+        &mut self,
+        mission_id: &str,
+        operation: &str,
+        result_json: &str,
+    ) -> Result<bool> {
+        let updated = self.connection.execute(
+            "UPDATE mission_mutations SET result_json = ?1 \
+             WHERE mission_id = ?2 AND operation = ?3 AND result_json = ''",
+            params![result_json, mission_id, operation],
+        )?;
+        Ok(updated == 1)
+    }
+
     #[allow(dead_code)]
     pub fn replay_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
         validate_mission_create_idempotency(key, fingerprint)?;

@@ -55,7 +55,15 @@ pub fn capture_process_tree_handle(leader: u32) -> ProcessTreeHandle {
     let pgid = process_group_id(leader).unwrap_or(leader);
     let born_unix_ms = sysprims_proc::get_process(leader)
         .ok()
-        .and_then(|info| info.start_time_unix_ms);
+        .and_then(|info| info.start_time_unix_ms)
+        .or_else(|| {
+            Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis() as u64,
+            )
+        });
     ProcessTreeHandle {
         pgid,
         leader,
@@ -82,53 +90,58 @@ fn parse_safe_pid(value: &str) -> Option<u32> {
     Some(parsed)
 }
 
-fn process_birth_ms(pid: u32) -> Option<u64> {
-    sysprims_proc::get_process(pid)
-        .ok()
-        .and_then(|info| info.start_time_unix_ms)
-}
-
-fn handle_is_owned(handle: &ProcessTreeHandle) -> Result<bool, String> {
-    let Some(expected) = handle.born_unix_ms else {
-        return Err("process_tree_ref lacks birth identity".to_owned());
+fn classify_membership(
+    handle: &ProcessTreeHandle,
+    census: Result<Vec<u32>, String>,
+    leader_birth: Result<Option<u64>, String>,
+) -> ProcessTreeKill {
+    let Some(expected_birth) = handle.born_unix_ms else {
+        return ProcessTreeKill::Unknown;
     };
-    match process_birth_ms(handle.leader) {
-        Some(actual) if actual != expected => Ok(false),
-        Some(_) => Ok(true),
-        None => Ok(true),
+    match leader_birth {
+        Err(_) => return ProcessTreeKill::Unknown,
+        Ok(Some(actual)) if actual != expected_birth => return ProcessTreeKill::Unknown,
+        Ok(Some(_)) | Ok(None) => {}
+    }
+    match census {
+        Err(_) => ProcessTreeKill::Unknown,
+        Ok(members) if members.is_empty() => ProcessTreeKill::Cleared,
+        Ok(_) => ProcessTreeKill::Survivors,
     }
 }
 
 pub fn live_tree_members(tree_ref: &str) -> Result<Vec<u32>, String> {
     let handle = parse_process_tree_handle(tree_ref)
         .ok_or_else(|| "process_tree_ref is not an ownership-bound process group".to_owned())?;
-    if !handle_is_owned(&handle)? {
-        return Err("process group identity was reused".to_owned());
-    }
-    let members = group_member_pids(handle.pgid)?;
-    let mut live = Vec::new();
-    for pid in members {
-        if sysprims_proc::get_process(pid).is_ok() {
-            live.push(pid);
+    match probe_process_tree(tree_ref) {
+        ProcessTreeKill::Survivors => group_member_pids(handle.pgid),
+        ProcessTreeKill::Cleared => Ok(Vec::new()),
+        ProcessTreeKill::Unknown | ProcessTreeKill::KillDispatched => {
+            Err("process-tree membership is unknown".to_owned())
         }
     }
-    Ok(live)
 }
 
 pub fn probe_process_tree(tree_ref: &str) -> ProcessTreeKill {
-    match live_tree_members(tree_ref) {
-        Ok(members) if members.is_empty() => ProcessTreeKill::Cleared,
-        Ok(_) => ProcessTreeKill::Survivors,
-        Err(_) => ProcessTreeKill::Unknown,
-    }
+    let Some(handle) = parse_process_tree_handle(tree_ref) else {
+        return ProcessTreeKill::Unknown;
+    };
+    let census = group_member_pids(handle.pgid);
+    let leader_birth = match sysprims_proc::get_process(handle.leader) {
+        Ok(info) => Ok(info.start_time_unix_ms),
+        Err(_) => Ok(None),
+    };
+    classify_membership(&handle, census, leader_birth)
 }
 
 pub fn terminate_process_tree(tree_ref: &str) -> ProcessTreeKill {
     let Some(handle) = parse_process_tree_handle(tree_ref) else {
         return ProcessTreeKill::Unknown;
     };
-    if handle_is_owned(&handle).ok() != Some(true) {
-        return ProcessTreeKill::Unknown;
+    match probe_process_tree(tree_ref) {
+        ProcessTreeKill::Unknown => return ProcessTreeKill::Unknown,
+        ProcessTreeKill::Cleared => return ProcessTreeKill::Cleared,
+        ProcessTreeKill::Survivors | ProcessTreeKill::KillDispatched => {}
     }
     let dispatched = sysprims_signal::force_kill_group(handle.pgid).is_ok();
     if !dispatched {
@@ -141,7 +154,15 @@ pub fn terminate_process_tree(tree_ref: &str) -> ProcessTreeKill {
             Err(_) => return ProcessTreeKill::Unknown,
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    #[cfg(unix)]
+    unsafe {
+        libc::waitpid(
+            handle.leader as libc::pid_t,
+            std::ptr::null_mut(),
+            libc::WNOHANG,
+        );
+    }
     match live_tree_members(tree_ref) {
         Ok(members) if members.is_empty() => ProcessTreeKill::Cleared,
         Ok(_) if dispatched => ProcessTreeKill::Survivors,
@@ -268,6 +289,37 @@ mod tests {
         assert_eq!(
             probe_process_tree(&format_process_tree_handle(&handle)),
             ProcessTreeKill::Cleared
+        );
+    }
+
+    #[test]
+    fn census_and_lookup_errors_fail_closed() {
+        let handle = ProcessTreeHandle {
+            pgid: 7,
+            leader: 7,
+            born_unix_ms: Some(9),
+        };
+        assert_eq!(
+            classify_membership(&handle, Err("census".to_owned()), Ok(Some(9))),
+            ProcessTreeKill::Unknown
+        );
+        assert_eq!(
+            classify_membership(&handle, Ok(Vec::new()), Err("leader".to_owned())),
+            ProcessTreeKill::Unknown
+        );
+        assert_eq!(
+            classify_membership(&handle, Ok(vec![42]), Ok(None)),
+            ProcessTreeKill::Survivors
+        );
+        assert_eq!(
+            classify_membership(&handle, Ok(Vec::new()), Ok(None)),
+            ProcessTreeKill::Cleared
+        );
+        let mut reused = handle.clone();
+        reused.born_unix_ms = Some(1);
+        assert_eq!(
+            classify_membership(&reused, Ok(vec![7]), Ok(Some(9))),
+            ProcessTreeKill::Unknown
         );
     }
 
