@@ -197,9 +197,17 @@ pub async fn run_mission(command: MissionCommand, socket: &Path) -> Result<(), C
                 request_id.clone(),
                 "mission.launch".to_owned(),
                 serde_json::json!({
-                    "mission_id": args.mission_id,
-                    "workspace": args.workspace,
-                    "binary": args.binary,
+                    "control_schema": "https://schemas.3leaps.dev/agentic/mission/v0/mission-control.schema.json",
+                    "kind": "request",
+                    "request_id": request_id,
+                    "idempotency_key": format!("mission-launch:{request_id}"),
+                    "expected_revision": 0,
+                    "operation": "mission.launch",
+                    "body": {
+                        "mission_id": args.mission_id,
+                        "workspace": args.workspace,
+                        "binary": args.binary,
+                    }
                 }),
                 args.json,
             )

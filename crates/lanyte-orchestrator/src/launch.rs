@@ -26,6 +26,12 @@ fn live_sessions() -> &'static Mutex<HashMap<Uuid, CodexSession>> {
 }
 
 #[derive(Debug, Deserialize)]
+struct LaunchEnvelope {
+    operation: String,
+    body: LaunchArgs,
+}
+
+#[derive(Debug, Deserialize)]
 struct LaunchArgs {
     mission_id: String,
     workspace: String,
@@ -85,8 +91,11 @@ impl Orchestrator {
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
         )?;
-        let args: LaunchArgs = serde_json::from_value(command_request.args.clone())
-            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        let args = match serde_json::from_value::<LaunchEnvelope>(command_request.args.clone()) {
+            Ok(envelope) if envelope.operation == "mission.launch" => envelope.body,
+            _ => serde_json::from_value(command_request.args.clone())
+                .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+        };
         let mut mission = service.visible_mission(&args.mission_id, &caller)?;
         if mission.phase != MissionPhase::Created {
             return Err(MissionCommandError::internal(
