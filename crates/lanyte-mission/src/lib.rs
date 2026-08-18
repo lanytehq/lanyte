@@ -11,6 +11,7 @@ mod driver;
 mod invariant;
 mod model;
 mod transition;
+mod wave3;
 
 pub use control::*;
 pub use driver::{DriverDescriptor, HarnessDriver, NormalizedHarnessEvent};

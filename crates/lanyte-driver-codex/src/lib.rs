@@ -6,7 +6,9 @@ mod protocol;
 mod spawn;
 
 pub use process::{
-    format_process_tree_ref, parse_process_tree_ref, probe_process_tree, terminate_process_tree,
+    capture_process_tree_handle, format_process_tree_handle, format_process_tree_ref,
+    parse_process_tree_handle, parse_process_tree_ref, probe_process_tree, terminate_process_tree,
+    ProcessTreeHandle,
 };
 pub use protocol::{map_notification, CodexProtocolError, JsonRpcLine};
 pub use spawn::{confine_workspace, scrub_child_env, CodexBinary, CodexLaunchSpec, SpawnError};
@@ -241,6 +243,7 @@ impl CodexSession {
         let Some(thread_id) = thread_id else {
             return InterruptAttempt::Unavailable;
         };
+        let cursor = self.events.lock().await.len();
         if let Err(err) = self
             .request(
                 "turn/interrupt",
@@ -255,44 +258,13 @@ impl CodexSession {
                 },
             };
         }
-        let accepted_at = tokio::time::Instant::now();
-        let deadline = accepted_at + std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let outcome = self.events.lock().await.iter().rev().find_map(|event| {
-                if let NormalizedHarnessEvent::TurnProgress {
-                    turn_id: event_turn,
-                    thread_id: event_thread,
-                    status,
-                    ..
-                } = event
-                {
-                    if event_turn != &turn_id {
-                        return None;
-                    }
-                    if event_thread
-                        .as_ref()
-                        .is_some_and(|value| value != &thread_id)
-                    {
-                        return Some(InterruptAttempt::UnrelatedCompletion {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                        });
-                    }
-                    if status == "interrupted" {
-                        return Some(InterruptAttempt::Interrupted {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                        });
-                    }
-                    if status == "completed" {
-                        return Some(InterruptAttempt::UnrelatedCompletion {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                        });
-                    }
-                }
-                None
-            });
+            let outcome = matching_interrupt_outcome(
+                self.events.lock().await.iter().skip(cursor),
+                &thread_id,
+                &turn_id,
+            );
             if let Some(outcome) = outcome {
                 return outcome;
             }
@@ -312,7 +284,9 @@ impl CodexSession {
             return terminate_process_tree(tree_ref);
         }
         match self.child.id() {
-            Some(pid) => terminate_process_tree(&format_process_tree_ref(pid)),
+            Some(pid) => terminate_process_tree(&format_process_tree_handle(
+                &capture_process_tree_handle(pid),
+            )),
             None => ProcessTreeKill::Unknown,
         }
     }
@@ -385,6 +359,45 @@ impl CodexSession {
     }
 }
 
+fn matching_interrupt_outcome<'a>(
+    mut events: impl Iterator<Item = &'a NormalizedHarnessEvent>,
+    thread_id: &str,
+    turn_id: &str,
+) -> Option<InterruptAttempt> {
+    events.find_map(|event| {
+        if let NormalizedHarnessEvent::TurnProgress {
+            turn_id: event_turn,
+            thread_id: event_thread,
+            status,
+            ..
+        } = event
+        {
+            if event_turn != turn_id {
+                return None;
+            }
+            if event_thread.as_deref() != Some(thread_id) {
+                return Some(InterruptAttempt::UnrelatedCompletion {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
+            if status == "interrupted" {
+                return Some(InterruptAttempt::Interrupted {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
+            if status == "completed" {
+                return Some(InterruptAttempt::UnrelatedCompletion {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
+        }
+        None
+    })
+}
+
 pub struct CodexAppServerDriver {
     spec: CodexLaunchSpec,
 }
@@ -414,7 +427,10 @@ impl CodexAppServerDriver {
             command.process_group(0);
         }
         let mut child = command.spawn()?;
-        let process_tree_ref = child.id().map(format_process_tree_ref);
+        let process_tree_ref = child
+            .id()
+            .map(capture_process_tree_handle)
+            .map(|handle| format_process_tree_handle(&handle));
         let stdin = child.stdin.take().ok_or(CodexDriverError::StdinClosed)?;
         let stdout = child.stdout.take().ok_or(CodexDriverError::StdoutClosed)?;
         if let Some(stderr) = child.stderr.take() {
@@ -606,4 +622,55 @@ fn path_bytes(path: &std::path::Path) -> &[u8] {
 #[cfg(not(unix))]
 fn path_bytes(path: &std::path::Path) -> &[u8] {
     path.to_string_lossy().as_bytes()
+}
+
+#[cfg(test)]
+mod interrupt_proof_tests {
+    use super::*;
+
+    fn turn(thread: Option<&str>, turn: &str, status: &str) -> NormalizedHarnessEvent {
+        NormalizedHarnessEvent::TurnProgress {
+            occurred_at: Utc::now(),
+            attempt_id: Uuid::nil(),
+            thread_id: thread.map(str::to_owned),
+            turn_id: turn.to_owned(),
+            status: status.to_owned(),
+        }
+    }
+
+    #[test]
+    fn missing_thread_is_not_protocol_confirmed() {
+        let events = [turn(None, "turn_1", "interrupted")];
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter(), "thr", "turn_1"),
+            Some(InterruptAttempt::UnrelatedCompletion { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_events_before_cursor_are_ignored() {
+        let events = [
+            turn(Some("thr"), "turn_1", "interrupted"),
+            turn(Some("thr"), "turn_1", "completed"),
+        ];
+        assert!(matching_interrupt_outcome(events.iter().skip(1), "thr", "turn_1").is_some());
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter().skip(1), "thr", "turn_1"),
+            Some(InterruptAttempt::UnrelatedCompletion { .. })
+        ));
+        assert!(matching_interrupt_outcome(events.iter().skip(2), "thr", "turn_1").is_none());
+    }
+
+    #[test]
+    fn matching_interrupted_requires_exact_thread_and_turn() {
+        let events = [turn(Some("thr"), "turn_1", "interrupted")];
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter(), "thr", "turn_1"),
+            Some(InterruptAttempt::Interrupted { .. })
+        ));
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter(), "other", "turn_1"),
+            Some(InterruptAttempt::UnrelatedCompletion { .. })
+        ));
+    }
 }

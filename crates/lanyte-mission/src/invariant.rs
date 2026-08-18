@@ -857,6 +857,7 @@ pub fn validate_history(
             "non-terminal mission cannot contain a terminal event",
         ));
     }
+    crate::wave3::validate_wave3_semantics(mission, events)?;
     Ok(())
 }
 

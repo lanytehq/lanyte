@@ -130,6 +130,7 @@ pub struct MissionService {
     store: Arc<Mutex<StateStore>>,
     verifier: Arc<dyn SessionVerifier>,
     fail_next_terminal_persist: Arc<AtomicBool>,
+    fail_after_cancelling_persist: Arc<AtomicBool>,
 }
 
 impl MissionService {
@@ -139,6 +140,7 @@ impl MissionService {
             store,
             verifier,
             fail_next_terminal_persist: Arc::new(AtomicBool::new(false)),
+            fail_after_cancelling_persist: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -146,6 +148,24 @@ impl MissionService {
     pub fn fail_next_terminal_persist(&self) {
         self.fail_next_terminal_persist
             .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_after_cancelling_persist(&self) {
+        self.fail_after_cancelling_persist
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn crash_after_cancelling_persist(&self) -> Result<(), MissionCommandError> {
+        if self
+            .fail_after_cancelling_persist
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(MissionCommandError::internal(
+                "injected cancel pipeline crash",
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]

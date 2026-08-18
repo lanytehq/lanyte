@@ -582,7 +582,11 @@ impl Orchestrator {
                 "mission is already terminal",
             ));
         }
-        if before.revision != expected_revision {
+        let already_cancelling = before.attempts.iter().any(|attempt| {
+            attempt.state == AttemptState::Cancelling
+                && before.current_attempt_id == Some(attempt.attempt_id)
+        });
+        if !already_cancelling && before.revision != expected_revision {
             return Err(MissionCommandError::invalid_args(format!(
                 "stale mission revision: expected {expected_revision}, actual {}",
                 before.revision
@@ -699,7 +703,6 @@ impl Orchestrator {
             .cloned()
             .ok_or_else(|| MissionCommandError::invalid_args("current attempt is missing"))?;
         let lease_generation = attempt.lease_generation.unwrap_or(1);
-        let already_cancelling = attempt.state == AttemptState::Cancelling;
         let history = service.lifecycle_history(&body.mission_id.to_string())?;
         let already_requested = history.iter().any(|event| {
             matches!(
@@ -761,6 +764,7 @@ impl Orchestrator {
                 None,
             )?;
             service.persist_update_events(expected_revision, cancelling.clone(), receipts, None)?;
+            service.crash_after_cancelling_persist()?;
         }
 
         let protocol = {
@@ -1058,7 +1062,23 @@ impl Orchestrator {
         }
         if attempt.state == AttemptState::Cancelling {
             if let Some(tree_ref) = &attempt.process_tree_ref {
-                if probe_process_tree(tree_ref) == ProcessTreeKill::Cleared {
+                let history = service.lifecycle_history(&before.mission_id.to_string())?;
+                let already_dispatched = history.iter().any(|event| {
+                    matches!(
+                        &event.payload,
+                        LifecyclePayload::ProcessTerminationAttempted {
+                            attempt_id: id,
+                            outcome: FallbackCancelOutcome::KillDispatched,
+                            ..
+                        } if *id == attempt_id
+                    )
+                });
+                let outcome = if already_dispatched {
+                    probe_process_tree(tree_ref)
+                } else {
+                    terminate_process_tree(tree_ref)
+                };
+                if outcome == ProcessTreeKill::Cleared {
                     let mut mission = before.clone();
                     mission.revision = before.revision + 1;
                     mission.updated_at = now;
@@ -1134,6 +1154,31 @@ impl Orchestrator {
                             *terminal_entry_hash = hash;
                         }
                     }
+                    service.persist_update_events(before.revision, mission, receipts, None)?;
+                } else if !already_dispatched {
+                    let mut mission = before.clone();
+                    mission.revision = before.revision + 1;
+                    mission.updated_at = now;
+                    let receipts = chain_receipts_from(
+                        &history,
+                        &mission,
+                        &mission.supervisor.subject,
+                        Some("lanyte://kernel/supervisor"),
+                        vec![(
+                            EventSourceKind::KernelObserved,
+                            LifecyclePayload::ProcessTerminationAttempted {
+                                attempt_id,
+                                generation: attempt.generation,
+                                lease_generation: attempt.lease_generation.unwrap_or(1),
+                                outcome: match outcome {
+                                    ProcessTreeKill::Survivors => FallbackCancelOutcome::Survivors,
+                                    ProcessTreeKill::Unknown => FallbackCancelOutcome::Unknown,
+                                    _ => FallbackCancelOutcome::KillDispatched,
+                                },
+                            },
+                        )],
+                        Some("sysprims/dispatched"),
+                    )?;
                     service.persist_update_events(before.revision, mission, receipts, None)?;
                 }
             }
@@ -1455,7 +1500,7 @@ impl Orchestrator {
             {
                 if live.state.is_live() {
                     payloads.push((
-                        EventSourceKind::KernelObserved,
+                        EventSourceKind::DriverReported,
                         LifecyclePayload::AttemptStateChanged {
                             attempt_id,
                             generation: live.generation,
@@ -2823,6 +2868,68 @@ mod close_disposition_tests {
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
         lanyte_mission::validate_history(&record, &history).expect("history must validate");
+        let _ = launched;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancel_retries_original_revision_after_pipeline_crash() {
+        let (root, orchestrator, service, created, launched) = launched_fixture(true).await;
+        for _ in 0..20 {
+            let _ = orchestrator
+                .observe_codex(
+                    &test_event(),
+                    MissionControlRequest::observe(Uuid::new_v4(), created.mission_id)
+                        .expect("observe"),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let latest = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("latest");
+        service.fail_after_cancelling_persist();
+        let first = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:crash-resume-01".to_owned(),
+                    latest.revision,
+                    created.mission_id,
+                )
+                .expect("cancel"),
+            )
+            .await
+            .expect_err("pipeline crash");
+        assert!(first.message.contains("injected cancel pipeline crash"));
+        let midway = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("midway");
+        assert_eq!(midway.attempts[0].state, AttemptState::Cancelling);
+        let retried = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:crash-resume-01".to_owned(),
+                    latest.revision,
+                    created.mission_id,
+                )
+                .expect("retry cancel"),
+            )
+            .await
+            .expect("exact replay must resume");
+        let MissionControlResult::Cancel { record, .. } = retried else {
+            panic!("expected cancel result");
+        };
+        assert_eq!(record.phase, MissionPhase::Cancelled);
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
     }
