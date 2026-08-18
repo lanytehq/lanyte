@@ -3,11 +3,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const MISSION_RECORD_SCHEMA: &str =
+    "https://schemas.3leaps.dev/agentic/mission/v0.1/mission-record.schema.json";
+pub const MISSION_RECORD_SCHEMA_V0: &str =
     "https://schemas.3leaps.dev/agentic/mission/v0/mission-record.schema.json";
 pub const DRIVER_CAPABILITIES_SCHEMA: &str =
-    "https://schemas.3leaps.dev/agentic/mission/v0/driver-capabilities.schema.json";
+    "https://schemas.3leaps.dev/agentic/mission/v0.1/driver-capabilities.schema.json";
 pub const LIFECYCLE_EVENT_SCHEMA: &str =
-    "https://schemas.3leaps.dev/agentic/mission/v0/lifecycle-event.schema.json";
+    "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +197,48 @@ pub struct AttemptRecord {
     pub ended_at: Option<DateTime<Utc>>,
     pub terminal_reason: Option<AttemptTerminalReason>,
     pub evidence_ref: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub deadman_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_observed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_observation_source: Option<ObservationSource>,
+    #[serde(default)]
+    pub lease_generation: Option<u64>,
+    #[serde(default)]
+    pub process_tree_ref: Option<String>,
+    #[serde(default)]
+    pub ownership_established_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub harness_thread_id: Option<String>,
+    #[serde(default)]
+    pub harness_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationSource {
+    DriverEvent,
+    HarnessEvent,
+    ProcessProbe,
+    KernelClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStateCause {
+    OperatorCancel,
+    ProtocolInterrupt,
+    ProcessExit,
+    ProcessSignal,
+    DeadmanSilence,
+    LeaseExpired,
+    ConnectivityLost,
+    SuccessorReplace,
+    HarnessCompleted,
+    Policy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

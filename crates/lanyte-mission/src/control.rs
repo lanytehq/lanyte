@@ -9,6 +9,8 @@ use uuid::{Uuid, Version};
 use crate::{MissionPhase, MissionRecord, NormalizedHarnessEvent, RecoveryPolicy, Validate};
 
 pub const MISSION_CONTROL_SCHEMA: &str =
+    "https://schemas.3leaps.dev/agentic/mission/v0.1/mission-control.schema.json";
+pub const MISSION_CONTROL_SCHEMA_V0: &str =
     "https://schemas.3leaps.dev/agentic/mission/v0/mission-control.schema.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -160,6 +162,12 @@ pub enum MissionControlRequest {
         expected_revision: u64,
         body: MissionShowBody,
     },
+    Cancel {
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        body: MissionShowBody,
+    },
 }
 
 impl MissionControlRequest {
@@ -241,7 +249,8 @@ impl MissionControlRequest {
             | Self::List { request_id, .. }
             | Self::Launch { request_id, .. }
             | Self::Observe { request_id, .. }
-            | Self::Close { request_id, .. } => *request_id,
+            | Self::Close { request_id, .. }
+            | Self::Cancel { request_id, .. } => *request_id,
         }
     }
 
@@ -254,6 +263,7 @@ impl MissionControlRequest {
             Self::Launch { .. } => "mission.launch",
             Self::Observe { .. } => "mission.observe",
             Self::Close { .. } => "mission.close",
+            Self::Cancel { .. } => "mission.cancel",
         }
     }
 
@@ -295,6 +305,11 @@ impl MissionControlRequest {
                 idempotency_key,
                 body,
                 ..
+            }
+            | Self::Cancel {
+                idempotency_key,
+                body,
+                ..
             } => {
                 validate_idempotency_key(idempotency_key)?;
                 if body.mission_id.get_version() != Some(Version::Random) {
@@ -303,6 +318,22 @@ impl MissionControlRequest {
                 Ok(())
             }
         }
+    }
+
+    pub fn cancel(
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        mission_id: Uuid,
+    ) -> Result<Self, String> {
+        let request = Self::Cancel {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            body: MissionShowBody { mission_id },
+        };
+        request.validate()?;
+        Ok(request)
     }
 }
 
@@ -380,6 +411,20 @@ impl Serialize for MissionControlRequest {
                 "operation": "mission.close",
                 "body": body,
             }),
+            Self::Cancel {
+                request_id,
+                idempotency_key,
+                expected_revision,
+                body,
+            } => serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "request",
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "expected_revision": expected_revision,
+                "operation": "mission.cancel",
+                "body": body,
+            }),
         };
         value.serialize(serializer)
     }
@@ -403,7 +448,9 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
         }
 
         let raw = Raw::deserialize(deserializer)?;
-        if raw.control_schema != MISSION_CONTROL_SCHEMA {
+        if raw.control_schema != MISSION_CONTROL_SCHEMA
+            && raw.control_schema != MISSION_CONTROL_SCHEMA_V0
+        {
             return Err(D::Error::custom("unsupported control_schema"));
         }
         if raw.kind != "request" {
@@ -491,6 +538,23 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
                     body,
                 }
             }
+            "mission.cancel" => {
+                let expected_revision = require_revision(&raw.expected_revision)?;
+                let idempotency_key = raw
+                    .idempotency_key
+                    .as_str()
+                    .ok_or_else(|| {
+                        D::Error::custom("mission.cancel idempotency_key must be a string")
+                    })?
+                    .to_owned();
+                let body = serde_json::from_value(raw.body).map_err(D::Error::custom)?;
+                Self::Cancel {
+                    request_id,
+                    idempotency_key,
+                    expected_revision,
+                    body,
+                }
+            }
             _ => return Err(D::Error::custom("unsupported mission operation")),
         };
         request.validate().map_err(D::Error::custom)?;
@@ -525,6 +589,55 @@ pub enum MissionControlResult {
         mission_id: Uuid,
         attempt_id: Uuid,
     },
+    Cancel {
+        request_id: Uuid,
+        idempotency_key: String,
+        expected_revision: u64,
+        record: Box<MissionRecord>,
+        progress: CancelProgress,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolCancelOutcome {
+    RequestAccepted,
+    Interrupted,
+    Unavailable,
+    Failed,
+    Timeout,
+    UnrelatedCompletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackCancelOutcome {
+    KillDispatched,
+    Cleared,
+    Survivors,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolCancelProgress {
+    pub outcome: ProtocolCancelOutcome,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackCancelProgress {
+    pub outcome: FallbackCancelOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelProgress {
+    pub requested: bool,
+    pub protocol: Option<ProtocolCancelProgress>,
+    pub fallback: Option<FallbackCancelProgress>,
 }
 
 impl MissionControlResult {
@@ -698,6 +811,24 @@ impl Serialize for MissionControlResult {
                     "mission_id": mission_id,
                     "attempt_id": attempt_id,
                     "closed": true,
+                },
+            }),
+            Self::Cancel {
+                request_id,
+                idempotency_key,
+                expected_revision,
+                record,
+                progress,
+            } => serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "result",
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "expected_revision": expected_revision,
+                "operation": "mission.cancel",
+                "body": {
+                    "record": record,
+                    "progress": progress,
                 },
             }),
         };

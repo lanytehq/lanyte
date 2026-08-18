@@ -405,8 +405,9 @@ impl MissionService {
             }
             MissionControlRequest::Launch { .. }
             | MissionControlRequest::Observe { .. }
-            | MissionControlRequest::Close { .. } => Err(MissionCommandError::invalid_args(
-                "launch, observe, and close are kernel-owned and cannot use the sync control path",
+            | MissionControlRequest::Close { .. }
+            | MissionControlRequest::Cancel { .. } => Err(MissionCommandError::invalid_args(
+                "launch, observe, close, and cancel are kernel-owned and cannot use the sync control path",
             )),
         }
     }

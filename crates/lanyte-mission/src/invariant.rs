@@ -172,7 +172,9 @@ impl Validate for AttemptRecord {
 
 impl Validate for MissionRecord {
     fn validate(&self) -> Result<(), InvariantError> {
-        if self.mission_schema != MISSION_RECORD_SCHEMA {
+        if self.mission_schema != MISSION_RECORD_SCHEMA
+            && self.mission_schema != crate::MISSION_RECORD_SCHEMA_V0
+        {
             return Err(InvariantError::new(
                 "mission_schema",
                 "unsupported schema identifier",
@@ -1070,6 +1072,15 @@ pub(crate) mod fixtures {
             ended_at: None,
             terminal_reason: None,
             evidence_ref: None,
+            lease_expires_at: None,
+            deadman_at: None,
+            last_observed_at: None,
+            last_observation_source: None,
+            lease_generation: None,
+            process_tree_ref: None,
+            ownership_established_at: None,
+            harness_thread_id: None,
+            harness_turn_id: None,
         }
     }
 }
