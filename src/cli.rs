@@ -45,6 +45,8 @@ pub enum MissionCommand {
     Show(ShowArgs),
     List(ListArgs),
     Launch(LaunchArgs),
+    Observe(ObserveArgs),
+    Close(CloseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -89,6 +91,20 @@ pub struct LaunchArgs {
     workspace: String,
     #[arg(long)]
     binary: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ObserveArgs {
+    mission_id: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CloseArgs {
+    mission_id: String,
     #[arg(long)]
     json: bool,
 }
@@ -196,19 +212,44 @@ pub async fn run_mission(command: MissionCommand, socket: &Path) -> Result<(), C
             (
                 request_id.clone(),
                 "mission.launch".to_owned(),
-                serde_json::json!({
-                    "control_schema": "https://schemas.3leaps.dev/agentic/mission/v0/mission-control.schema.json",
-                    "kind": "request",
-                    "request_id": request_id,
-                    "idempotency_key": format!("mission-launch:{request_id}"),
-                    "expected_revision": 0,
-                    "operation": "mission.launch",
-                    "body": {
+                control_envelope(
+                    &request_id,
+                    "mission.launch",
+                    serde_json::json!({
                         "mission_id": args.mission_id,
                         "workspace": args.workspace,
                         "binary": args.binary,
-                    }
-                }),
+                    }),
+                    true,
+                ),
+                args.json,
+            )
+        }
+        MissionCommand::Observe(args) => {
+            let request_id = Uuid::new_v4().to_string();
+            (
+                request_id.clone(),
+                "mission.observe".to_owned(),
+                control_envelope(
+                    &request_id,
+                    "mission.observe",
+                    serde_json::json!({ "mission_id": args.mission_id }),
+                    false,
+                ),
+                args.json,
+            )
+        }
+        MissionCommand::Close(args) => {
+            let request_id = Uuid::new_v4().to_string();
+            (
+                request_id.clone(),
+                "mission.close".to_owned(),
+                control_envelope(
+                    &request_id,
+                    "mission.close",
+                    serde_json::json!({ "mission_id": args.mission_id }),
+                    true,
+                ),
                 args.json,
             )
         }
@@ -317,9 +358,11 @@ async fn read_frame(
 fn build_request(command: MissionCommand) -> Result<(MissionControlRequest, bool), ClientError> {
     let request_id = Uuid::new_v4();
     match command {
-        MissionCommand::Launch(_) => Err(ClientError::InvalidArgument(
-            "launch uses a dedicated invoke path".to_owned(),
-        )),
+        MissionCommand::Launch(_) | MissionCommand::Observe(_) | MissionCommand::Close(_) => {
+            Err(ClientError::InvalidArgument(
+                "launch, observe, and close use a dedicated invoke path".to_owned(),
+            ))
+        }
         MissionCommand::Create(args) => {
             let deadline_at = args
                 .deadline
@@ -363,6 +406,18 @@ fn build_request(command: MissionCommand) -> Result<(MissionControlRequest, bool
             Ok((request, args.json))
         }
     }
+}
+
+fn control_envelope(request_id: &str, operation: &str, body: Value, mutating: bool) -> Value {
+    serde_json::json!({
+        "control_schema": "https://schemas.3leaps.dev/agentic/mission/v0/mission-control.schema.json",
+        "kind": "request",
+        "request_id": request_id,
+        "idempotency_key": mutating.then(|| format!("{operation}:{request_id}")),
+        "expected_revision": if mutating { Value::from(0) } else { Value::Null },
+        "operation": operation,
+        "body": body,
+    })
 }
 
 fn parse_canonical_uuid_v4(value: &str) -> Result<Uuid, ClientError> {

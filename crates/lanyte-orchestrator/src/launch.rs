@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 
 use chrono::Utc;
 use lanyte_driver_codex::{CodexAppServerDriver, CodexLaunchSpec, CodexSession};
@@ -197,10 +198,7 @@ impl Orchestrator {
             },
         )?;
 
-        live_sessions()
-            .lock()
-            .map_err(|_| MissionCommandError::internal("live session map poisoned"))?
-            .insert(attempt_id, session);
+        live_sessions().lock().await.insert(attempt_id, session);
 
         Ok(serde_json::json!({
             "mission_id": mission.mission_id,
@@ -208,6 +206,163 @@ impl Orchestrator {
             "phase": "active",
             "harness_session_id": mission.attempts[0].harness_session_id,
             "binary": mission.attempts[0].driver_id,
+        }))
+    }
+
+    pub(super) async fn handle_mission_observe(
+        &self,
+        event: &GatewayEvent,
+        command_request: CommandInvokeRequest,
+    ) {
+        match self.observe_codex(event, &command_request).await {
+            Ok(result) => {
+                self.send_command_result(
+                    &event.peer_id,
+                    super::CommandInvokeResult {
+                        kind: "invoke_result",
+                        request_id: command_request.request_id.clone(),
+                        command: command_request.command.clone(),
+                        result,
+                    },
+                )
+                .await;
+            }
+            Err(err) => {
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id,
+                        command: command_request.command,
+                        error_code: err.code.as_str(),
+                        message: err.message,
+                        retryable: false,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn handle_mission_close(
+        &self,
+        event: &GatewayEvent,
+        command_request: CommandInvokeRequest,
+    ) {
+        match self.close_codex(event, &command_request).await {
+            Ok(result) => {
+                self.send_command_result(
+                    &event.peer_id,
+                    super::CommandInvokeResult {
+                        kind: "invoke_result",
+                        request_id: command_request.request_id.clone(),
+                        command: command_request.command.clone(),
+                        result,
+                    },
+                )
+                .await;
+            }
+            Err(err) => {
+                self.send_command_error(
+                    &event.peer_id,
+                    CommandInvokeError {
+                        kind: "invoke_error",
+                        request_id: command_request.request_id,
+                        command: command_request.command,
+                        error_code: err.code.as_str(),
+                        message: err.message,
+                        retryable: false,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn observe_codex(
+        &self,
+        event: &GatewayEvent,
+        command_request: &CommandInvokeRequest,
+    ) -> Result<Value, MissionCommandError> {
+        let Some(service) = &self.mission_service else {
+            return Err(MissionCommandError::internal(
+                "mission service is not configured",
+            ));
+        };
+        let caller = service.authenticate(
+            event
+                .client_auth_token
+                .as_ref()
+                .map(lanyte_gateway::ClientAuthToken::expose),
+        )?;
+        let mission_id = command_request
+            .args
+            .get("body")
+            .and_then(|body| body.get("mission_id"))
+            .or_else(|| command_request.args.get("mission_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| MissionCommandError::internal("mission_id required"))?;
+        let mission = service.visible_mission(mission_id, &caller)?;
+        let attempt_id = mission
+            .current_attempt_id
+            .ok_or_else(|| MissionCommandError::internal("mission has no live attempt"))?;
+        let mut sessions = live_sessions().lock().await;
+        let session = sessions
+            .get_mut(&attempt_id)
+            .ok_or_else(|| MissionCommandError::internal("codex session is not in this kernel"))?;
+        let mut events = Vec::new();
+        while let Some(event) = session
+            .observe()
+            .await
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?
+        {
+            events.push(event);
+            if events.len() >= 32 {
+                break;
+            }
+        }
+        Ok(serde_json::json!({ "mission_id": mission_id, "attempt_id": attempt_id, "events": events }))
+    }
+
+    async fn close_codex(
+        &self,
+        event: &GatewayEvent,
+        command_request: &CommandInvokeRequest,
+    ) -> Result<Value, MissionCommandError> {
+        let Some(service) = &self.mission_service else {
+            return Err(MissionCommandError::internal(
+                "mission service is not configured",
+            ));
+        };
+        let caller = service.authenticate(
+            event
+                .client_auth_token
+                .as_ref()
+                .map(lanyte_gateway::ClientAuthToken::expose),
+        )?;
+        let mission_id = command_request
+            .args
+            .get("body")
+            .and_then(|body| body.get("mission_id"))
+            .or_else(|| command_request.args.get("mission_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| MissionCommandError::internal("mission_id required"))?;
+        let mission = service.visible_mission(mission_id, &caller)?;
+        let attempt_id = mission
+            .current_attempt_id
+            .ok_or_else(|| MissionCommandError::internal("mission has no live attempt"))?;
+        let mut sessions = live_sessions().lock().await;
+        let mut session = sessions
+            .remove(&attempt_id)
+            .ok_or_else(|| MissionCommandError::internal("codex session is not in this kernel"))?;
+        session
+            .close()
+            .await
+            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+        Ok(serde_json::json!({
+            "mission_id": mission_id,
+            "attempt_id": attempt_id,
+            "closed": true
         }))
     }
 }

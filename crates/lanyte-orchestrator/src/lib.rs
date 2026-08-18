@@ -216,6 +216,14 @@ impl Orchestrator {
             self.handle_mission_launch(event, command_request).await;
             return;
         }
+        if command_request.command == "mission.observe" {
+            self.handle_mission_observe(event, command_request).await;
+            return;
+        }
+        if command_request.command == "mission.close" {
+            self.handle_mission_close(event, command_request).await;
+            return;
+        }
 
         if command_request.command.starts_with("mission.") {
             self.handle_mission_command(event, command_request).await;
