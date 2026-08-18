@@ -500,7 +500,7 @@ impl StateStore {
             .query_row(
                 "SELECT idempotency_key, request_fingerprint, operation, result_json, owner_token \
                  FROM mission_mutations WHERE mission_id = ?1 AND operation = ?2 \
-                 AND (result_json = '' OR json_extract(result_json, '$.kind') = 'pending_cancel') LIMIT 1",
+                 AND json_extract(result_json, '$.kind') = 'pending_cancel' LIMIT 1",
                 [mission_id, operation],
                 |row| {
                     Ok(MissionMutationIdempotency {
@@ -515,8 +515,6 @@ impl StateStore {
             .optional()
             .map_err(Into::into)
     }
-
-
 
     #[allow(dead_code)]
     pub fn replay_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {

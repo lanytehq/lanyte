@@ -180,8 +180,6 @@ impl MissionService {
             .map_err(map_state_error)
     }
 
-
-
     #[must_use]
     pub fn production(store: Arc<Mutex<StateStore>>) -> Self {
         Self::new(store, Arc::new(AttestationSessionVerifier))

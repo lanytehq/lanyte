@@ -82,18 +82,30 @@ fn parse_safe_pid(value: &str) -> Option<u32> {
     Some(parsed)
 }
 
+#[derive(Debug)]
+enum LeaderObservation {
+    Birth(u64),
+    Absent,
+    PresentWithoutBirth,
+    Failed,
+}
+
 fn classify_membership(
     handle: &ProcessTreeHandle,
     census: Result<Vec<u32>, String>,
-    leader_birth: Result<Option<u64>, String>,
+    leader: LeaderObservation,
 ) -> ProcessTreeKill {
     let Some(expected_birth) = handle.born_unix_ms else {
         return ProcessTreeKill::Unknown;
     };
-    match leader_birth {
-        Err(_) => return ProcessTreeKill::Unknown,
-        Ok(Some(actual)) if actual != expected_birth => return ProcessTreeKill::Unknown,
-        Ok(Some(_)) | Ok(None) => {}
+    match leader {
+        LeaderObservation::Failed | LeaderObservation::PresentWithoutBirth => {
+            return ProcessTreeKill::Unknown;
+        }
+        LeaderObservation::Birth(actual) if actual != expected_birth => {
+            return ProcessTreeKill::Unknown;
+        }
+        LeaderObservation::Birth(_) | LeaderObservation::Absent => {}
     }
     match census {
         Err(_) => ProcessTreeKill::Unknown,
@@ -119,12 +131,15 @@ pub fn probe_process_tree(tree_ref: &str) -> ProcessTreeKill {
         return ProcessTreeKill::Unknown;
     };
     let census = group_member_pids(handle.pgid);
-    let leader_birth = match sysprims_proc::get_process(handle.leader) {
-        Ok(info) => Ok(info.start_time_unix_ms),
-        Err(sysprims_core::SysprimsError::NotFound { .. }) => Ok(None),
-        Err(err) => Err(err.to_string()),
+    let leader = match sysprims_proc::get_process(handle.leader) {
+        Ok(info) => match info.start_time_unix_ms {
+            Some(born) => LeaderObservation::Birth(born),
+            None => LeaderObservation::PresentWithoutBirth,
+        },
+        Err(sysprims_core::SysprimsError::NotFound { .. }) => LeaderObservation::Absent,
+        Err(_) => LeaderObservation::Failed,
     };
-    classify_membership(&handle, census, leader_birth)
+    classify_membership(&handle, census, leader)
 }
 
 pub fn terminate_process_tree(tree_ref: &str) -> ProcessTreeKill {
@@ -294,25 +309,49 @@ mod tests {
             born_unix_ms: Some(9),
         };
         assert_eq!(
-            classify_membership(&handle, Err("census".to_owned()), Ok(Some(9))),
+            classify_membership(
+                &handle,
+                Err("census".to_owned()),
+                LeaderObservation::Birth(9)
+            ),
             ProcessTreeKill::Unknown
         );
         assert_eq!(
-            classify_membership(&handle, Ok(Vec::new()), Err("leader".to_owned())),
+            classify_membership(&handle, Ok(Vec::new()), LeaderObservation::Failed),
             ProcessTreeKill::Unknown
         );
         assert_eq!(
-            classify_membership(&handle, Ok(vec![42]), Ok(None)),
-            ProcessTreeKill::Survivors
+            classify_membership(
+                &handle,
+                Ok(Vec::new()),
+                LeaderObservation::PresentWithoutBirth
+            ),
+            ProcessTreeKill::Unknown
         );
         assert_eq!(
-            classify_membership(&handle, Ok(Vec::new()), Ok(None)),
+            classify_membership(
+                &handle,
+                Ok(vec![42]),
+                LeaderObservation::PresentWithoutBirth
+            ),
+            ProcessTreeKill::Unknown
+        );
+        assert_eq!(
+            classify_membership(&handle, Ok(Vec::new()), LeaderObservation::Absent),
             ProcessTreeKill::Cleared
+        );
+        assert_eq!(
+            classify_membership(&handle, Ok(Vec::new()), LeaderObservation::Birth(9)),
+            ProcessTreeKill::Cleared
+        );
+        assert_eq!(
+            classify_membership(&handle, Ok(vec![42]), LeaderObservation::Birth(9)),
+            ProcessTreeKill::Survivors
         );
         let mut reused = handle.clone();
         reused.born_unix_ms = Some(1);
         assert_eq!(
-            classify_membership(&reused, Ok(vec![7]), Ok(Some(9))),
+            classify_membership(&reused, Ok(vec![7]), LeaderObservation::Birth(9)),
             ProcessTreeKill::Unknown
         );
     }

@@ -586,8 +586,22 @@ impl Orchestrator {
             attempt.state == AttemptState::Cancelling
                 && before.current_attempt_id == Some(attempt.attempt_id)
         });
-        let resume_stored = service
-            .incomplete_mutation(&body.mission_id.to_string(), "mission.cancel")?
+        let pending_cancel =
+            service.incomplete_mutation(&body.mission_id.to_string(), "mission.cancel")?;
+        if let Some(pending) = pending_cancel.as_ref() {
+            if pending.key != idempotency_key {
+                return Err(MissionCommandError::invalid_args(
+                    "a cancel mutation is already in flight for this mission",
+                ));
+            }
+            if parse_pending_cancel(&pending.result_json).is_none() {
+                return Err(MissionCommandError::internal(
+                    "stored cancel mutation is not a typed pending stub",
+                ));
+            }
+        }
+        let resume_stored = pending_cancel
+            .as_ref()
             .is_some_and(|pending| pending.key == idempotency_key);
         if !(already_cancelling && resume_stored) && before.revision != expected_revision {
             return Err(MissionCommandError::invalid_args(format!(
@@ -1193,58 +1207,44 @@ impl Orchestrator {
                     }
                     let pending = service
                         .incomplete_mutation(&before.mission_id.to_string(), "mission.cancel")?;
-                    let (request_id, expected_revision, key, fingerprint, owner_token) =
-                        match pending.as_ref() {
-                            Some(pending) => {
-                                let stub: serde_json::Value =
-                                    serde_json::from_str(&pending.result_json).unwrap_or_default();
-                                (
-                                    stub.get("request_id")
-                                        .and_then(|value| value.as_str())
-                                        .and_then(|value| Uuid::parse_str(value).ok())
-                                        .unwrap_or_else(Uuid::new_v4),
-                                    stub.get("expected_revision")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or(before.revision),
-                                    pending.key.clone(),
-                                    pending.request_fingerprint.clone(),
-                                    pending.owner_token.clone(),
-                                )
-                            }
-                            None => (
-                                Uuid::new_v4(),
-                                before.revision,
-                                format!("mission-cancel:{}", Uuid::new_v4()),
-                                String::new(),
-                                String::new(),
-                            ),
-                        };
-                    let result = MissionControlResult::Cancel {
-                        request_id,
-                        idempotency_key: key.clone(),
-                        expected_revision,
-                        record: Box::new(mission.clone()),
-                        progress: CancelProgress {
-                            requested: true,
-                            protocol: None,
-                            fallback: Some(FallbackCancelProgress {
-                                outcome: FallbackCancelOutcome::Cleared,
-                            }),
-                        },
+                    let idempotency = match pending {
+                        Some(pending) => {
+                            let stub =
+                                parse_pending_cancel(&pending.result_json).ok_or_else(|| {
+                                    MissionCommandError::internal(
+                                        "stored cancel mutation is not a typed pending stub",
+                                    )
+                                })?;
+                            let result = MissionControlResult::Cancel {
+                                request_id: stub.request_id,
+                                idempotency_key: pending.key.clone(),
+                                expected_revision: stub.expected_revision,
+                                record: Box::new(mission.clone()),
+                                progress: CancelProgress {
+                                    requested: true,
+                                    protocol: None,
+                                    fallback: Some(FallbackCancelProgress {
+                                        outcome: FallbackCancelOutcome::Cleared,
+                                    }),
+                                },
+                            };
+                            Some(lanyte_state::MissionMutationIdempotency {
+                                key: pending.key,
+                                request_fingerprint: pending.request_fingerprint,
+                                operation: pending.operation,
+                                result_json: serde_json::to_string(&result).map_err(|err| {
+                                    MissionCommandError::internal(err.to_string())
+                                })?,
+                                owner_token: pending.owner_token,
+                            })
+                        }
+                        None => None,
                     };
-                    let idempotency =
-                        pending.map(|pending| lanyte_state::MissionMutationIdempotency {
-                            key,
-                            request_fingerprint: fingerprint,
-                            operation: pending.operation,
-                            result_json: serde_json::to_string(&result).unwrap_or_default(),
-                            owner_token,
-                        });
                     service.persist_update_events(
                         before.revision,
                         mission,
                         receipts,
-                        idempotency.filter(|item| !item.request_fingerprint.is_empty()),
+                        idempotency,
                     )?;
                 } else if !already_dispatched {
                     let mut mission = before.clone();
@@ -2315,6 +2315,19 @@ impl Drop for ReservationGuard<'_> {
     }
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingCancelStub {
+    kind: String,
+    request_id: Uuid,
+    expected_revision: u64,
+}
+
+fn parse_pending_cancel(result_json: &str) -> Option<PendingCancelStub> {
+    let stub = serde_json::from_str::<PendingCancelStub>(result_json).ok()?;
+    (stub.kind == "pending_cancel").then_some(stub)
+}
+
 fn mutation_fingerprint(
     operation: &str,
     caller: &crate::mission::VerifiedSession,
@@ -3035,6 +3048,84 @@ mod close_disposition_tests {
         };
         assert_eq!(request_id, original_id);
         assert_eq!(expected_revision, latest.revision);
+        assert_eq!(record.phase, MissionPhase::Cancelled);
+        let _ = launched;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn distinct_cancel_key_is_rejected_while_original_is_pending() {
+        let (root, orchestrator, service, created, launched) = launched_fixture(true).await;
+        for _ in 0..20 {
+            let _ = orchestrator
+                .observe_codex(
+                    &test_event(),
+                    MissionControlRequest::observe(Uuid::new_v4(), created.mission_id)
+                        .expect("observe"),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let latest = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("latest");
+        service.fail_after_cancelling_persist();
+        let original = MissionControlRequest::cancel(
+            Uuid::new_v4(),
+            "cancel:original-key-01".to_owned(),
+            latest.revision,
+            created.mission_id,
+        )
+        .expect("cancel A");
+        let original_id = original.request_id();
+        let _ = orchestrator
+            .cancel_mission(&test_event(), original)
+            .await
+            .expect_err("pipeline crash");
+        let midway = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("midway");
+        let hijack = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:other-key-0002".to_owned(),
+                    midway.revision,
+                    created.mission_id,
+                )
+                .expect("cancel B"),
+            )
+            .await
+            .expect_err("distinct key must not take over");
+        assert!(hijack.message.contains("already in flight"));
+        orchestrator.tick_leases().await;
+        let retried = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:original-key-01".to_owned(),
+                    latest.revision,
+                    created.mission_id,
+                )
+                .expect("replay A"),
+            )
+            .await
+            .expect("original key replays");
+        let MissionControlResult::Cancel {
+            request_id, record, ..
+        } = retried
+        else {
+            panic!("expected cancel result");
+        };
+        assert_eq!(request_id, original_id);
         assert_eq!(record.phase, MissionPhase::Cancelled);
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
