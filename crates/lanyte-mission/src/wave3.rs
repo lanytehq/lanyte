@@ -457,6 +457,12 @@ pub(crate) fn validate_wave3_semantics(
         }
     }
 
+    if wave3_cancel && mission.phase.is_terminal() && mission.phase != MissionPhase::Cancelled {
+        return sem(
+            "SEM-C01",
+            "cancel_requested cannot fold an incompatible terminal phase",
+        );
+    }
     if wave3_cancel && mission.phase == MissionPhase::Cancelled {
         let no_attempt = attempts.is_empty();
         if (!cancel_requested_seen || !no_attempt)

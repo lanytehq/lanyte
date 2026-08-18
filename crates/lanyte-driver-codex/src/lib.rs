@@ -284,9 +284,9 @@ impl CodexSession {
             return terminate_process_tree(tree_ref);
         }
         match self.child.id() {
-            Some(pid) => terminate_process_tree(&format_process_tree_handle(
-                &capture_process_tree_handle(pid),
-            )),
+            Some(pid) => capture_process_tree_handle(pid)
+                .map(|handle| terminate_process_tree(&format_process_tree_handle(&handle)))
+                .unwrap_or(ProcessTreeKill::Unknown),
             None => ProcessTreeKill::Unknown,
         }
     }
@@ -429,8 +429,14 @@ impl CodexAppServerDriver {
         let mut child = command.spawn()?;
         let process_tree_ref = child
             .id()
-            .map(capture_process_tree_handle)
+            .and_then(capture_process_tree_handle)
             .map(|handle| format_process_tree_handle(&handle));
+        if process_tree_ref.is_none() {
+            let _ = child.start_kill();
+            return Err(CodexDriverError::Io(std::io::Error::other(
+                "could not capture authoritative process-group birth identity",
+            )));
+        }
         let stdin = child.stdin.take().ok_or(CodexDriverError::StdinClosed)?;
         let stdout = child.stdout.take().ok_or(CodexDriverError::StdoutClosed)?;
         if let Some(stderr) = child.stderr.take() {

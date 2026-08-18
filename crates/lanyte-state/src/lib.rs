@@ -385,7 +385,9 @@ impl StateStore {
             .optional()?;
         match existing {
             None => Ok(None),
-            Some((stored, result)) if stored == fingerprint && !result.is_empty() => {
+            Some((stored, result))
+                if stored == fingerprint && mutation_result_is_complete(&result) =>
+            {
                 Ok(Some(result))
             }
             Some((stored, _)) if stored != fingerprint => {
@@ -400,7 +402,7 @@ impl StateStore {
     pub fn renew_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
         let now = Utc::now();
         let updated = self.connection.execute(
-            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2 AND owner_token = ?3 AND result_json = ''",
+            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2 AND owner_token = ?3 AND (result_json = '' OR json_extract(result_json, '$.kind') = 'pending_cancel')",
             params![
                 now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 key,
@@ -439,7 +441,7 @@ impl StateStore {
                     key: idempotency.key.clone(),
                 });
             }
-            if !result.is_empty() {
+            if mutation_result_is_complete(&result) {
                 tx.commit()?;
                 return Ok(MutationReserve::Replay(result));
             }
@@ -483,7 +485,7 @@ impl StateStore {
 
     pub fn release_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
         self.connection.execute(
-            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND owner_token = ?2 AND result_json = ''",
+            "DELETE FROM mission_mutations WHERE idempotency_key = ?1 AND owner_token = ?2 AND (result_json = '' OR json_extract(result_json, '$.kind') = 'pending_cancel')",
             params![key, owner_token],
         )?;
         Ok(())
@@ -497,7 +499,8 @@ impl StateStore {
         self.connection
             .query_row(
                 "SELECT idempotency_key, request_fingerprint, operation, result_json, owner_token \
-                 FROM mission_mutations WHERE mission_id = ?1 AND operation = ?2 AND result_json = '' LIMIT 1",
+                 FROM mission_mutations WHERE mission_id = ?1 AND operation = ?2 \
+                 AND (result_json = '' OR json_extract(result_json, '$.kind') = 'pending_cancel') LIMIT 1",
                 [mission_id, operation],
                 |row| {
                     Ok(MissionMutationIdempotency {
@@ -513,19 +516,7 @@ impl StateStore {
             .map_err(Into::into)
     }
 
-    pub fn complete_incomplete_mutation(
-        &mut self,
-        mission_id: &str,
-        operation: &str,
-        result_json: &str,
-    ) -> Result<bool> {
-        let updated = self.connection.execute(
-            "UPDATE mission_mutations SET result_json = ?1 \
-             WHERE mission_id = ?2 AND operation = ?3 AND result_json = ''",
-            params![result_json, mission_id, operation],
-        )?;
-        Ok(updated == 1)
-    }
+
 
     #[allow(dead_code)]
     pub fn replay_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
@@ -660,7 +651,7 @@ impl StateStore {
                         key: idempotency.key.clone(),
                     });
                 }
-                if !stored_result.is_empty() {
+                if mutation_result_is_complete(&stored_result) {
                     let projection =
                         load_mission_projection_tx(&tx, &mission_id)?.ok_or_else(|| {
                             StateError::InvalidMissionProjection(
@@ -1667,6 +1658,19 @@ fn parse_mission_list_cursor(
         ));
     }
     Ok(cursor)
+}
+
+pub(crate) fn mutation_result_is_complete(result: &str) -> bool {
+    if result.is_empty() {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(result) {
+        Ok(value) => value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|kind| kind != "pending_cancel"),
+        Err(_) => true,
+    }
 }
 
 fn is_canonical_mission_cursor_position(created_at: &str, mission_id: &str) -> bool {

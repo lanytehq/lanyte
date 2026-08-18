@@ -51,24 +51,16 @@ pub fn format_process_tree_handle(handle: &ProcessTreeHandle) -> String {
     }
 }
 
-pub fn capture_process_tree_handle(leader: u32) -> ProcessTreeHandle {
+pub fn capture_process_tree_handle(leader: u32) -> Option<ProcessTreeHandle> {
     let pgid = process_group_id(leader).unwrap_or(leader);
     let born_unix_ms = sysprims_proc::get_process(leader)
-        .ok()
-        .and_then(|info| info.start_time_unix_ms)
-        .or_else(|| {
-            Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()?
-                    .as_millis() as u64,
-            )
-        });
-    ProcessTreeHandle {
+        .ok()?
+        .start_time_unix_ms?;
+    Some(ProcessTreeHandle {
         pgid,
         leader,
-        born_unix_ms,
-    }
+        born_unix_ms: Some(born_unix_ms),
+    })
 }
 
 fn process_group_id(pid: u32) -> Option<u32> {
@@ -129,7 +121,8 @@ pub fn probe_process_tree(tree_ref: &str) -> ProcessTreeKill {
     let census = group_member_pids(handle.pgid);
     let leader_birth = match sysprims_proc::get_process(handle.leader) {
         Ok(info) => Ok(info.start_time_unix_ms),
-        Err(_) => Ok(None),
+        Err(sysprims_core::SysprimsError::NotFound { .. }) => Ok(None),
+        Err(err) => Err(err.to_string()),
     };
     classify_membership(&handle, census, leader_birth)
 }
@@ -247,16 +240,17 @@ fn linux_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         };
         let stat = match std::fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("unreadable /proc/{pid}/stat: {err}")),
         };
         let Some(close) = stat.rfind(')') else {
-            continue;
+            return Err(format!("malformed /proc/{pid}/stat"));
         };
         let mut fields = stat[close + 1..].split_whitespace();
         let _state = fields.next();
         let _ppid = fields.next();
         let Some(pgrp) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
-            continue;
+            return Err(format!("malformed /proc/{pid}/stat pgrp"));
         };
         if pgrp == pgid {
             pids.push(pid);
@@ -326,10 +320,9 @@ mod tests {
     #[test]
     fn current_process_group_is_survivors_when_owned() {
         let pid = std::process::id();
-        let handle = capture_process_tree_handle(pid);
-        if handle.born_unix_ms.is_none() {
+        let Some(handle) = capture_process_tree_handle(pid) else {
             return;
-        }
+        };
         assert_eq!(
             probe_process_tree(&format_process_tree_handle(&handle)),
             ProcessTreeKill::Survivors
