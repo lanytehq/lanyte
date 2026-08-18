@@ -1372,15 +1372,19 @@ mod close_disposition_tests {
             )
             .await
             .expect("retry must keep Terminated");
-        assert!(matches!(closed, MissionControlResult::Close { .. }));
+        let MissionControlResult::Close {
+            request_id: committed_request_id,
+            ..
+        } = &closed
+        else {
+            panic!("expected close result");
+        };
 
+        let caller = TestVerifier
+            .verify("valid-session-secret")
+            .expect("caller");
         let finished = service
-            .visible_mission(
-                &created.mission_id.to_string(),
-                &TestVerifier
-                    .verify("valid-session-secret")
-                    .unwrap(),
-            )
+            .visible_mission(&created.mission_id.to_string(), &caller)
             .expect("finished mission");
         assert_eq!(finished.phase, MissionPhase::Cancelled);
         assert_eq!(
@@ -1396,14 +1400,104 @@ mod close_disposition_tests {
         let history = service
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
-        assert!(history.iter().any(|event| {
-            event.source.kind == EventSourceKind::KernelObserved
-                && event
-                    .source
-                    .evidence_ref
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with("lifecycle/"))
-        }));
+        lanyte_mission::validate_history(&finished, &history).expect("history must validate");
+        assert_eq!(history[0].previous_entry_hash, None);
+        for (index, event) in history.iter().enumerate() {
+            assert_eq!(event.sequence, u64::try_from(index + 1).unwrap());
+            if index > 0 {
+                assert_eq!(
+                    event.previous_entry_hash.as_deref(),
+                    Some(history[index - 1].entry_hash.as_str())
+                );
+            }
+            if event.source.kind == EventSourceKind::KernelObserved {
+                assert_eq!(
+                    event.source.evidence_ref.as_deref(),
+                    Some(format!("lifecycle/{}", event.event_id).as_str())
+                );
+            }
+        }
+        let terminal = history
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.payload,
+                    lanyte_mission::LifecyclePayload::MissionTerminal { .. }
+                )
+            })
+            .expect("terminal event");
+        assert_eq!(
+            finished.terminal_entry_hash.as_deref(),
+            Some(terminal.entry_hash.as_str())
+        );
+
+        let audit = store
+            .lock()
+            .expect("store lock")
+            .audit_records(&created.mission_id.to_string())
+            .expect("audit");
+        let stored = store
+            .lock()
+            .expect("store lock")
+            .mission(&created.mission_id.to_string())
+            .expect("projection")
+            .expect("projection present");
+        let mission_events: Vec<_> = audit
+            .iter()
+            .filter(|record| record.kind == lanyte_telemetry::AuditRecordKind::MissionEvent)
+            .collect();
+        assert_eq!(mission_events.len(), history.len());
+        assert_eq!(
+            stored.audit_entry_id,
+            history.last().unwrap().event_id.to_string()
+        );
+        assert_eq!(
+            stored.audit_entry_hash,
+            mission_events.last().unwrap().entry_hash
+        );
+        for event in &history {
+            assert!(
+                mission_events
+                    .iter()
+                    .any(|record| record.entry_id == event.event_id.to_string()),
+                "lifecycle {} must resolve to an audit entry",
+                event.event_id
+            );
+        }
+
+        let replayed = orchestrator
+            .close_codex(
+                &test_event(),
+                MissionControlRequest::close(
+                    Uuid::new_v4(),
+                    "close:retry-terminated".to_owned(),
+                    launched.revision,
+                    created.mission_id,
+                )
+                .expect("replay close"),
+            )
+            .await
+            .expect("completed close must replay");
+        assert_eq!(replayed, closed);
+        if let MissionControlResult::Close { request_id, .. } = replayed {
+            assert_eq!(request_id, *committed_request_id);
+        }
+
+        let after_replay = service
+            .visible_mission(&created.mission_id.to_string(), &caller)
+            .expect("replayed mission");
+        assert_eq!(after_replay, finished);
+        let history_after = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history after replay");
+        assert_eq!(history_after, history);
+        let audit_after = store
+            .lock()
+            .expect("store lock")
+            .audit_records(&created.mission_id.to_string())
+            .expect("audit after replay");
+        assert_eq!(audit_after.len(), audit.len());
         let _ = std::fs::remove_dir_all(root);
     }
 }

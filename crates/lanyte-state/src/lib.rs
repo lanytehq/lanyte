@@ -3267,4 +3267,108 @@ mod tests {
             .to_string()
             .contains("timestamp must be RFC3339 UTC with millisecond precision"));
     }
+
+    #[test]
+    fn stale_owner_cannot_renew_release_or_finalize_after_reclaim() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        let mut store = StateStore::open(paths).expect("state store should open");
+        store
+            .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
+            .expect("mission should commit");
+
+        let reservation = MissionMutationIdempotency {
+            key: "mutation:reclaim-owner".to_owned(),
+            request_fingerprint: "ab".repeat(32),
+            operation: "mission.close".to_owned(),
+            result_json: String::new(),
+            owner_token: String::new(),
+        };
+        let MutationReserve::Owned(stale_token) = store
+            .reserve_mutation(TEST_SESSION_ID, &reservation)
+            .expect("first reserve")
+        else {
+            panic!("first reserve must own the lease");
+        };
+
+        store
+            .connection
+            .execute(
+                "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2",
+                ("2020-01-01T00:00:00.000Z", "mutation:reclaim-owner"),
+            )
+            .expect("backdate reservation");
+
+        let MutationReserve::Owned(current_token) = store
+            .reserve_mutation(TEST_SESSION_ID, &reservation)
+            .expect("reclaim reserve")
+        else {
+            panic!("stale lease must be reclaimable");
+        };
+        assert_ne!(stale_token, current_token);
+
+        let stale_renew = store
+            .renew_mutation("mutation:reclaim-owner", &stale_token)
+            .expect_err("stale owner must not renew");
+        assert!(stale_renew
+            .to_string()
+            .contains("mutation lease could not be renewed"));
+        store
+            .release_mutation("mutation:reclaim-owner", &stale_token)
+            .expect("stale release is a no-op");
+        let remaining: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM mission_mutations WHERE idempotency_key = ?1",
+                ["mutation:reclaim-owner"],
+                |row| row.get(0),
+            )
+            .expect("count reservation");
+        assert_eq!(remaining, 1, "stale release must not drop the current lease");
+
+        store
+            .renew_mutation("mutation:reclaim-owner", &current_token)
+            .expect("current owner must renew");
+
+        let mut terminal = created_mission();
+        terminal.revision = 1;
+        terminal.phase = MissionPhase::Failed;
+        terminal.terminal_reason = Some(lanyte_mission::MissionTerminalReason::InternalError);
+        terminal.terminal_entry_hash = Some("d".repeat(64));
+        terminal.updated_at += chrono::Duration::seconds(1);
+
+        let mut stale_finalize = reservation.clone();
+        stale_finalize.owner_token = stale_token;
+        let stale_err = store
+            .update_mission_with_events(
+                0,
+                terminal.clone(),
+                vec![created_mission_receipt(TEST_ENTRY_ID_B)],
+                Some(stale_finalize),
+            )
+            .expect_err("stale owner must not finalize");
+        assert!(
+            stale_err
+                .to_string()
+                .contains("mutation owner token does not match the reservation"),
+            "stale finalize error: {stale_err}"
+        );
+
+        let mut current_finalize = reservation;
+        current_finalize.owner_token = current_token;
+        let current_err = store
+            .update_mission_with_events(
+                0,
+                terminal,
+                vec![created_mission_receipt(TEST_ENTRY_ID_B)],
+                Some(current_finalize),
+            )
+            .expect_err("fixture history is not a valid close fold");
+        assert!(
+            !current_err
+                .to_string()
+                .contains("mutation owner token does not match the reservation"),
+            "current owner must pass the token fence: {current_err}"
+        );
+    }
 }
