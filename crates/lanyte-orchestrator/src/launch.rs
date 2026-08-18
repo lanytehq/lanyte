@@ -5,8 +5,8 @@ use tokio::sync::Mutex;
 
 use chrono::{Duration, Utc};
 use lanyte_driver_codex::{
-    confine_workspace, CloseOutcome, CodexAppServerDriver, CodexLaunchSpec, CodexSession,
-    InterruptAttempt, ProcessTreeKill,
+    confine_workspace, probe_process_tree, terminate_process_tree, CloseOutcome,
+    CodexAppServerDriver, CodexLaunchSpec, CodexSession, InterruptAttempt, ProcessTreeKill,
 };
 use lanyte_gateway::GatewayEvent;
 use lanyte_mission::{
@@ -271,6 +271,8 @@ impl Orchestrator {
                     CapabilityName::Identify,
                     CapabilityName::Observe,
                     CapabilityName::Close,
+                    CapabilityName::Cancel,
+                    CapabilityName::LocalProcessTermination,
                 ],
             )
             .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
@@ -444,6 +446,30 @@ impl Orchestrator {
                     generation: 1,
                     driver_id: CODEX_DRIVER_ID.to_owned(),
                     capability: CapabilityName::Close,
+                    availability: report.availability,
+                    fidelity: lanyte_mission::CapabilityFidelity::Native,
+                    report_id: report.report_id,
+                },
+            ),
+            (
+                EventSourceKind::DriverReported,
+                LifecyclePayload::DriverCapabilityEvaluated {
+                    attempt_id,
+                    generation: 1,
+                    driver_id: CODEX_DRIVER_ID.to_owned(),
+                    capability: CapabilityName::Cancel,
+                    availability: report.availability,
+                    fidelity: lanyte_mission::CapabilityFidelity::Native,
+                    report_id: report.report_id,
+                },
+            ),
+            (
+                EventSourceKind::DriverReported,
+                LifecyclePayload::DriverCapabilityEvaluated {
+                    attempt_id,
+                    generation: 1,
+                    driver_id: CODEX_DRIVER_ID.to_owned(),
+                    capability: CapabilityName::LocalProcessTermination,
                     availability: report.availability,
                     fidelity: lanyte_mission::CapabilityFidelity::Native,
                     report_id: report.report_id,
@@ -673,50 +699,81 @@ impl Orchestrator {
             .cloned()
             .ok_or_else(|| MissionCommandError::invalid_args("current attempt is missing"))?;
         let lease_generation = attempt.lease_generation.unwrap_or(1);
+        let already_cancelling = attempt.state == AttemptState::Cancelling;
+        let history = service.lifecycle_history(&body.mission_id.to_string())?;
+        let already_requested = history.iter().any(|event| {
+            matches!(
+                &event.payload,
+                LifecyclePayload::CancelRequested {
+                    attempt_id: Some(id),
+                    generation: Some(generation),
+                    ..
+                } if *id == attempt_id && *generation == attempt.generation
+            )
+        });
+        let already_dispatched = history.iter().any(|event| {
+            matches!(
+                &event.payload,
+                LifecyclePayload::ProcessTerminationAttempted {
+                    attempt_id: id,
+                    outcome: FallbackCancelOutcome::KillDispatched,
+                    ..
+                } if *id == attempt_id
+            )
+        });
         let now = Utc::now();
         let mut cancelling = before.clone();
-        cancelling.revision = expected_revision + 1;
-        cancelling.updated_at = now;
-        if let Some(live) = cancelling
-            .attempts
-            .iter_mut()
-            .find(|item| item.attempt_id == attempt_id)
-        {
-            live.state = AttemptState::Cancelling;
+        if !already_cancelling && !already_requested {
+            cancelling.revision = expected_revision + 1;
+            cancelling.updated_at = now;
+            if let Some(live) = cancelling
+                .attempts
+                .iter_mut()
+                .find(|item| item.attempt_id == attempt_id)
+            {
+                live.state = AttemptState::Cancelling;
+            }
+            let receipts = chain_receipts(
+                &history,
+                &cancelling,
+                &caller,
+                vec![
+                    (
+                        EventSourceKind::OperatorCommand,
+                        LifecyclePayload::CancelRequested {
+                            attempt_id: Some(attempt_id),
+                            generation: Some(attempt.generation),
+                            lease_generation: Some(lease_generation),
+                        },
+                    ),
+                    (
+                        EventSourceKind::OperatorCommand,
+                        LifecyclePayload::AttemptStateChanged {
+                            attempt_id,
+                            generation: attempt.generation,
+                            from: attempt.state,
+                            to: AttemptState::Cancelling,
+                            reason: Some("operator cancel".to_owned()),
+                            cause: Some(AttemptStateCause::OperatorCancel),
+                        },
+                    ),
+                ],
+                None,
+            )?;
+            service.persist_update_events(expected_revision, cancelling.clone(), receipts, None)?;
         }
-        let receipts = chain_receipts(
-            &service.lifecycle_history(&body.mission_id.to_string())?,
-            &cancelling,
-            &caller,
-            vec![
-                (
-                    EventSourceKind::OperatorCommand,
-                    LifecyclePayload::CancelRequested {
-                        attempt_id: Some(attempt_id),
-                        generation: Some(attempt.generation),
-                        lease_generation: Some(lease_generation),
-                    },
-                ),
-                (
-                    EventSourceKind::OperatorCommand,
-                    LifecyclePayload::AttemptStateChanged {
-                        attempt_id,
-                        generation: attempt.generation,
-                        from: attempt.state,
-                        to: AttemptState::Cancelling,
-                        reason: Some("operator cancel".to_owned()),
-                        cause: Some(AttemptStateCause::OperatorCancel),
-                    },
-                ),
-            ],
-            None,
-        )?;
-        service.persist_update_events(expected_revision, cancelling.clone(), receipts, None)?;
 
         let protocol = {
             let mut sessions = live_sessions().lock().await;
             match sessions.get_mut(&attempt_id) {
-                Some(session) => Some(session.interrupt_active_turn().await),
+                Some(session) => Some(
+                    session
+                        .interrupt_turn(
+                            attempt.harness_thread_id.as_deref(),
+                            attempt.harness_turn_id.as_deref(),
+                        )
+                        .await,
+                ),
                 None => None,
             }
         };
@@ -729,7 +786,7 @@ impl Orchestrator {
             Some(InterruptAttempt::Unavailable) => ProtocolCancelProgress {
                 outcome: ProtocolCancelOutcome::Unavailable,
                 thread_id: attempt.harness_thread_id.clone(),
-                turn_id: None,
+                turn_id: attempt.harness_turn_id.clone(),
             },
             Some(InterruptAttempt::RequestAccepted { thread_id, turn_id }) => {
                 ProtocolCancelProgress {
@@ -748,6 +805,13 @@ impl Orchestrator {
                 thread_id: Some(thread_id),
                 turn_id: Some(turn_id),
             },
+            Some(InterruptAttempt::UnrelatedCompletion { thread_id, turn_id }) => {
+                ProtocolCancelProgress {
+                    outcome: ProtocolCancelOutcome::UnrelatedCompletion,
+                    thread_id: Some(thread_id),
+                    turn_id: Some(turn_id),
+                }
+            }
             Some(InterruptAttempt::Failed { detail }) => ProtocolCancelProgress {
                 outcome: ProtocolCancelOutcome::Failed,
                 thread_id: attempt.harness_thread_id.clone(),
@@ -755,13 +819,17 @@ impl Orchestrator {
             },
         };
         let interrupted = protocol_progress.outcome == ProtocolCancelOutcome::Interrupted;
+        let tree_ref = attempt.process_tree_ref.clone();
         let fallback = if interrupted {
             None
+        } else if already_dispatched {
+            tree_ref.as_deref().map(probe_process_tree)
         } else {
             let mut sessions = live_sessions().lock().await;
             sessions
                 .get_mut(&attempt_id)
                 .map(CodexSession::kill_process_tree)
+                .or_else(|| tree_ref.as_deref().map(terminate_process_tree))
         };
         let fallback_progress = fallback.map(|outcome| FallbackCancelProgress {
             outcome: match outcome {
@@ -801,6 +869,26 @@ impl Orchestrator {
         let mut mission = cancelling.clone();
         mission.revision += 1;
         mission.updated_at = now;
+        if let Some(live) = mission
+            .attempts
+            .iter_mut()
+            .find(|item| item.attempt_id == attempt_id)
+        {
+            if let Some(thread_id) = &protocol_progress.thread_id {
+                live.harness_thread_id = Some(thread_id.clone());
+            }
+            if protocol_progress.outcome == ProtocolCancelOutcome::Interrupted {
+                if let Some(turn_id) = &protocol_progress.turn_id {
+                    live.harness_turn_id = Some(turn_id.clone());
+                }
+            } else if live.harness_turn_id.is_none() {
+                if let Some(turn_id) = &protocol_progress.turn_id {
+                    if protocol_progress.outcome != ProtocolCancelOutcome::Failed {
+                        live.harness_turn_id = Some(turn_id.clone());
+                    }
+                }
+            }
+        }
         if interrupted || cleared {
             mission.phase = MissionPhase::Cancelled;
             mission.terminal_reason = Some(MissionTerminalReason::OperatorCancelled);
@@ -831,6 +919,14 @@ impl Orchestrator {
                     } else {
                         AttemptStateCause::ProcessExit
                     }),
+                },
+            ));
+            evidence.push((
+                EventSourceKind::KernelObserved,
+                LifecyclePayload::MissionPhaseChanged {
+                    from: cancelling.phase,
+                    to: MissionPhase::Cancelled,
+                    reason: Some("cancel confirmed".to_owned()),
                 },
             ));
             evidence.push((
@@ -881,20 +977,27 @@ impl Orchestrator {
             record: Box::new(mission.clone()),
             progress,
         };
+        let complete = mission.phase == MissionPhase::Cancelled;
         service.persist_update_events(
             cancelling.revision,
             mission,
             receipts,
-            Some(lanyte_state::MissionMutationIdempotency {
-                key: idempotency_key,
-                request_fingerprint: fingerprint,
-                operation: "mission.cancel".to_owned(),
-                result_json: serde_json::to_string(&result)
-                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
-                owner_token,
-            }),
+            if complete {
+                Some(lanyte_state::MissionMutationIdempotency {
+                    key: idempotency_key,
+                    request_fingerprint: fingerprint,
+                    operation: "mission.cancel".to_owned(),
+                    result_json: serde_json::to_string(&result)
+                        .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                    owner_token,
+                })
+            } else {
+                None
+            },
         )?;
-        reservation_guard.disarm();
+        if complete {
+            reservation_guard.disarm();
+        }
         Ok(result)
     }
 
@@ -953,6 +1056,89 @@ impl Orchestrator {
         if !attempt.state.is_live() {
             return Ok(());
         }
+        if attempt.state == AttemptState::Cancelling {
+            if let Some(tree_ref) = &attempt.process_tree_ref {
+                if probe_process_tree(tree_ref) == ProcessTreeKill::Cleared {
+                    let mut mission = before.clone();
+                    mission.revision = before.revision + 1;
+                    mission.updated_at = now;
+                    mission.phase = MissionPhase::Cancelled;
+                    mission.terminal_reason = Some(MissionTerminalReason::OperatorCancelled);
+                    mission.current_attempt_id = None;
+                    if let Some(live) = mission
+                        .attempts
+                        .iter_mut()
+                        .find(|item| item.attempt_id == attempt_id)
+                    {
+                        live.state = AttemptState::Cancelled;
+                        live.ended_at = Some(now);
+                        live.terminal_reason = Some(AttemptTerminalReason::ProcessReaped);
+                    }
+                    let mut receipts = chain_receipts_from(
+                        &service.lifecycle_history(&before.mission_id.to_string())?,
+                        &mission,
+                        &mission.supervisor.subject,
+                        Some("lanyte://kernel/supervisor"),
+                        vec![
+                            (
+                                EventSourceKind::KernelObserved,
+                                LifecyclePayload::ProcessTerminationAttempted {
+                                    attempt_id,
+                                    generation: attempt.generation,
+                                    lease_generation: attempt.lease_generation.unwrap_or(1),
+                                    outcome: FallbackCancelOutcome::Cleared,
+                                },
+                            ),
+                            (
+                                EventSourceKind::KernelObserved,
+                                LifecyclePayload::AttemptStateChanged {
+                                    attempt_id,
+                                    generation: attempt.generation,
+                                    from: AttemptState::Cancelling,
+                                    to: AttemptState::Cancelled,
+                                    reason: Some("membership cleared".to_owned()),
+                                    cause: Some(AttemptStateCause::ProcessExit),
+                                },
+                            ),
+                            (
+                                EventSourceKind::KernelObserved,
+                                LifecyclePayload::MissionPhaseChanged {
+                                    from: before.phase,
+                                    to: MissionPhase::Cancelled,
+                                    reason: Some("membership cleared".to_owned()),
+                                },
+                            ),
+                            (
+                                EventSourceKind::KernelObserved,
+                                LifecyclePayload::MissionTerminal {
+                                    phase: MissionPhase::Cancelled,
+                                    reason: MissionTerminalReason::OperatorCancelled,
+                                    terminal_entry_hash: "0".repeat(64),
+                                },
+                            ),
+                        ],
+                        Some("sysprims/cleared"),
+                    )?;
+                    if let Some(hash) = receipts
+                        .last()
+                        .map(|receipt| receipt.event.entry_hash.clone())
+                    {
+                        mission.terminal_entry_hash = Some(hash.clone());
+                        if let Some(LifecyclePayload::MissionTerminal {
+                            terminal_entry_hash,
+                            ..
+                        }) = receipts
+                            .last_mut()
+                            .map(|receipt| &mut receipt.event.payload)
+                        {
+                            *terminal_entry_hash = hash;
+                        }
+                    }
+                    service.persist_update_events(before.revision, mission, receipts, None)?;
+                }
+            }
+            return Ok(());
+        }
         let Some(lease_generation) = attempt.lease_generation else {
             return Ok(());
         };
@@ -964,13 +1150,16 @@ impl Orchestrator {
         };
         let history = service.lifecycle_history(&before.mission_id.to_string())?;
         let mut payloads = Vec::new();
+        let overdue = now >= deadman_at || now >= lease_expires_at;
         if restart
+            && overdue
             && !history.iter().any(|event| {
                 matches!(
                     &event.payload,
                     LifecyclePayload::RestartReconciled {
                         attempt_id: id,
                         lease_generation: generation,
+                        overdue: true,
                         ..
                     } if *id == attempt_id && *generation == lease_generation
                 )
@@ -982,7 +1171,7 @@ impl Orchestrator {
                     attempt_id,
                     generation: attempt.generation,
                     lease_generation,
-                    overdue: now >= deadman_at || now >= lease_expires_at,
+                    overdue: true,
                 },
             ));
         }
@@ -1023,6 +1212,16 @@ impl Orchestrator {
                         cause: Some(AttemptStateCause::DeadmanSilence),
                     },
                 ));
+                if before.phase == MissionPhase::Active {
+                    payloads.push((
+                        EventSourceKind::KernelObserved,
+                        LifecyclePayload::MissionPhaseChanged {
+                            from: MissionPhase::Active,
+                            to: MissionPhase::RecoveryPending,
+                            reason: Some("deadman fired".to_owned()),
+                        },
+                    ));
+                }
                 next_state = AttemptState::Unresponsive;
             }
         }
@@ -1051,6 +1250,13 @@ impl Orchestrator {
                 },
             ));
             if next_state.is_live() {
+                let stand_down =
+                    before.recovery_policy == lanyte_mission::RecoveryPolicy::StandDown;
+                let next_phase = if stand_down {
+                    MissionPhase::DeadlineExceeded
+                } else {
+                    MissionPhase::RecoveryPending
+                };
                 payloads.push((
                     EventSourceKind::KernelObserved,
                     LifecyclePayload::AttemptStateChanged {
@@ -1062,22 +1268,26 @@ impl Orchestrator {
                         cause: Some(AttemptStateCause::LeaseExpired),
                     },
                 ));
-                payloads.push((
-                    EventSourceKind::KernelObserved,
-                    LifecyclePayload::MissionPhaseChanged {
-                        from: before.phase,
-                        to: MissionPhase::DeadlineExceeded,
-                        reason: Some("lease expired".to_owned()),
-                    },
-                ));
-                payloads.push((
-                    EventSourceKind::KernelObserved,
-                    LifecyclePayload::MissionTerminal {
-                        phase: MissionPhase::DeadlineExceeded,
-                        reason: MissionTerminalReason::MissionDeadlineExceeded,
-                        terminal_entry_hash: "0".repeat(64),
-                    },
-                ));
+                if before.phase != next_phase {
+                    payloads.push((
+                        EventSourceKind::KernelObserved,
+                        LifecyclePayload::MissionPhaseChanged {
+                            from: before.phase,
+                            to: next_phase,
+                            reason: Some("lease expired".to_owned()),
+                        },
+                    ));
+                }
+                if stand_down {
+                    payloads.push((
+                        EventSourceKind::KernelObserved,
+                        LifecyclePayload::MissionTerminal {
+                            phase: MissionPhase::DeadlineExceeded,
+                            reason: MissionTerminalReason::MissionDeadlineExceeded,
+                            terminal_entry_hash: "0".repeat(64),
+                        },
+                    ));
+                }
                 next_state = AttemptState::TimedOut;
             }
         }
@@ -1098,9 +1308,19 @@ impl Orchestrator {
                 live.terminal_reason = Some(AttemptTerminalReason::AttemptTimedOut);
             }
         }
+        if next_state == AttemptState::Unresponsive && mission.phase == MissionPhase::Active {
+            mission.phase = MissionPhase::RecoveryPending;
+        }
         if next_state == AttemptState::TimedOut {
-            mission.phase = MissionPhase::DeadlineExceeded;
-            mission.terminal_reason = Some(MissionTerminalReason::MissionDeadlineExceeded);
+            let stand_down = mission.recovery_policy == lanyte_mission::RecoveryPolicy::StandDown;
+            mission.phase = if stand_down {
+                MissionPhase::DeadlineExceeded
+            } else {
+                MissionPhase::RecoveryPending
+            };
+            if stand_down {
+                mission.terminal_reason = Some(MissionTerminalReason::MissionDeadlineExceeded);
+            }
             mission.current_attempt_id = None;
         }
         let mut receipts = chain_receipts_from(
@@ -1208,70 +1428,163 @@ impl Orchestrator {
         else {
             return Ok(());
         };
-        let Some(prior_generation) = attempt.lease_generation else {
-            return Ok(());
-        };
-        let Some(prior_lease) = attempt.lease_expires_at else {
-            return Ok(());
-        };
-        let Some(prior_deadman) = attempt.deadman_at else {
-            return Ok(());
-        };
         let now = events
             .iter()
             .map(observation_time)
             .max()
             .unwrap_or_else(Utc::now);
-        let lease_seconds = before.lease_policy.lease_seconds.unwrap_or(600);
-        let deadman_seconds = before.lease_policy.deadman_seconds.unwrap_or(300);
-        let result_lease = now + Duration::seconds(lease_seconds as i64);
-        let result_deadman = now + Duration::seconds(deadman_seconds as i64);
-        if result_deadman <= prior_deadman && result_lease <= prior_lease {
-            return Ok(());
-        }
-        let turn_id = events.iter().rev().find_map(|event| match event {
-            lanyte_mission::NormalizedHarnessEvent::TurnProgress { turn_id, .. } => {
-                Some(turn_id.clone())
-            }
+        let exited = events.iter().rev().find_map(|event| match event {
+            lanyte_mission::NormalizedHarnessEvent::Exited { success, .. } => Some(*success),
             _ => None,
         });
+        let started_turn = events.iter().rev().find_map(|event| match event {
+            lanyte_mission::NormalizedHarnessEvent::TurnProgress {
+                turn_id, status, ..
+            } if status == "started" => Some(turn_id.clone()),
+            _ => None,
+        });
+        let mut payloads = Vec::new();
         let mut mission = before.clone();
         mission.revision = before.revision + 1;
         mission.updated_at = now;
-        if let Some(live) = mission
-            .attempts
-            .iter_mut()
-            .find(|item| item.attempt_id == attempt_id)
-        {
-            live.lease_generation = Some(prior_generation + 1);
-            live.lease_expires_at = Some(result_lease);
-            live.deadman_at = Some(result_deadman);
-            live.last_observed_at = Some(now);
-            live.last_observation_source = Some(ObservationSource::DriverEvent);
-            if let Some(turn_id) = turn_id {
-                live.harness_turn_id = Some(turn_id);
+        if let Some(success) = exited {
+            if let Some(live) = mission
+                .attempts
+                .iter_mut()
+                .find(|item| item.attempt_id == attempt_id)
+            {
+                if live.state.is_live() {
+                    payloads.push((
+                        EventSourceKind::KernelObserved,
+                        LifecyclePayload::AttemptStateChanged {
+                            attempt_id,
+                            generation: live.generation,
+                            from: live.state,
+                            to: if success {
+                                AttemptState::Completed
+                            } else {
+                                AttemptState::Crashed
+                            },
+                            reason: Some("observed process exit".to_owned()),
+                            cause: Some(AttemptStateCause::ProcessExit),
+                        },
+                    ));
+                    live.state = if success {
+                        AttemptState::Completed
+                    } else {
+                        AttemptState::Crashed
+                    };
+                    live.ended_at = Some(now);
+                    live.terminal_reason = Some(if success {
+                        AttemptTerminalReason::HarnessCompleted
+                    } else {
+                        AttemptTerminalReason::HarnessCrashed
+                    });
+                    mission.phase = MissionPhase::RecoveryPending;
+                    mission.current_attempt_id = None;
+                    payloads.push((
+                        EventSourceKind::KernelObserved,
+                        LifecyclePayload::MissionPhaseChanged {
+                            from: before.phase,
+                            to: MissionPhase::RecoveryPending,
+                            reason: Some("observed process exit".to_owned()),
+                        },
+                    ));
+                }
             }
+        } else {
+            let Some(prior_generation) = attempt.lease_generation else {
+                return Ok(());
+            };
+            let Some(prior_lease) = attempt.lease_expires_at else {
+                return Ok(());
+            };
+            let Some(prior_deadman) = attempt.deadman_at else {
+                return Ok(());
+            };
+            let lease_seconds = before.lease_policy.lease_seconds.unwrap_or(600);
+            let deadman_seconds = before.lease_policy.deadman_seconds.unwrap_or(300);
+            let result_lease = now + Duration::seconds(lease_seconds as i64);
+            let result_deadman = now + Duration::seconds(deadman_seconds as i64);
+            let clocks_moved = result_deadman > prior_deadman || result_lease > prior_lease;
+            if let Some(live) = mission
+                .attempts
+                .iter_mut()
+                .find(|item| item.attempt_id == attempt_id)
+            {
+                if live.state == AttemptState::Unresponsive {
+                    payloads.push((
+                        EventSourceKind::KernelObserved,
+                        LifecyclePayload::AttemptStateChanged {
+                            attempt_id,
+                            generation: live.generation,
+                            from: AttemptState::Unresponsive,
+                            to: AttemptState::Running,
+                            reason: Some("driver observation".to_owned()),
+                            cause: Some(AttemptStateCause::HarnessCompleted),
+                        },
+                    ));
+                    live.state = AttemptState::Running;
+                    if mission.phase == MissionPhase::RecoveryPending {
+                        payloads.push((
+                            EventSourceKind::KernelObserved,
+                            LifecyclePayload::MissionPhaseChanged {
+                                from: MissionPhase::RecoveryPending,
+                                to: MissionPhase::Active,
+                                reason: Some("driver observation".to_owned()),
+                            },
+                        ));
+                        mission.phase = MissionPhase::Active;
+                    }
+                }
+                if let Some(turn_id) = started_turn.clone() {
+                    live.harness_turn_id = Some(turn_id);
+                }
+                if clocks_moved {
+                    live.lease_generation = Some(prior_generation + 1);
+                    live.lease_expires_at = Some(result_lease);
+                    live.deadman_at = Some(result_deadman);
+                    live.last_observed_at = Some(now);
+                    live.last_observation_source = Some(ObservationSource::DriverEvent);
+                    payloads.push((
+                        EventSourceKind::KernelObserved,
+                        LifecyclePayload::LeaseTick {
+                            attempt_id,
+                            generation: attempt.generation,
+                            kind: LeaseTickKind::Renewed,
+                            prior_lease_generation: prior_generation,
+                            result_lease_generation: prior_generation + 1,
+                            prior_lease_expires_at: prior_lease,
+                            prior_deadman_at: prior_deadman,
+                            result_lease_expires_at: result_lease,
+                            result_deadman_at: result_deadman,
+                            observed_at: now,
+                            observation_source: ObservationSource::DriverEvent,
+                        },
+                    ));
+                }
+            }
+        }
+        if payloads.is_empty() && started_turn.is_none() {
+            return Ok(());
+        }
+        if payloads.is_empty() {
+            if let Some(live) = mission
+                .attempts
+                .iter_mut()
+                .find(|item| item.attempt_id == attempt_id)
+            {
+                live.harness_turn_id = started_turn;
+            }
+        }
+        if payloads.is_empty() {
+            return Ok(());
         }
         let receipts = chain_receipts(
             &service.lifecycle_history(&before.mission_id.to_string())?,
             &mission,
             caller,
-            vec![(
-                EventSourceKind::KernelObserved,
-                LifecyclePayload::LeaseTick {
-                    attempt_id,
-                    generation: attempt.generation,
-                    kind: LeaseTickKind::Renewed,
-                    prior_lease_generation: prior_generation,
-                    result_lease_generation: prior_generation + 1,
-                    prior_lease_expires_at: prior_lease,
-                    prior_deadman_at: prior_deadman,
-                    result_lease_expires_at: result_lease,
-                    result_deadman_at: result_deadman,
-                    observed_at: now,
-                    observation_source: ObservationSource::DriverEvent,
-                },
-            )],
+            payloads,
             None,
         )?;
         service.persist_update_events(before.revision, mission, receipts, None)?;
@@ -1650,7 +1963,15 @@ fn chain_receipts_from(
                 kind: source_kind,
                 subject: subject.to_owned(),
                 producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-                assurance: ObservationLevel::KernelObserved,
+                assurance: match source_kind {
+                    EventSourceKind::KernelObserved => ObservationLevel::KernelObserved,
+                    EventSourceKind::DriverReported | EventSourceKind::HarnessReported => {
+                        ObservationLevel::DriverObserved
+                    }
+                    EventSourceKind::OperatorCommand | EventSourceKind::VerifiedAttestation => {
+                        ObservationLevel::ResourceAttested
+                    }
+                },
                 evidence_ref,
             },
             payload,
@@ -2179,7 +2500,7 @@ mod close_disposition_tests {
 
         let mut saw_started = false;
         let mut saw_tool = false;
-        let mut saw_exited = false;
+        let mut saw_turn = false;
         for _ in 0..20 {
             let observed = orchestrator
                 .observe_codex(
@@ -2194,17 +2515,17 @@ mod close_disposition_tests {
                     match event {
                         NormalizedHarnessEvent::Started { .. } => saw_started = true,
                         NormalizedHarnessEvent::ToolProposed { .. } => saw_tool = true,
-                        NormalizedHarnessEvent::Exited { .. } => saw_exited = true,
-                        NormalizedHarnessEvent::TurnProgress { .. } => {}
+                        NormalizedHarnessEvent::Exited { .. } => {}
+                        NormalizedHarnessEvent::TurnProgress { .. } => saw_turn = true,
                     }
                 }
             }
-            if saw_started && saw_tool && saw_exited {
+            if saw_started && saw_tool && saw_turn {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(saw_started && saw_tool && saw_exited);
+        assert!(saw_started && saw_tool && saw_turn);
 
         let latest = service
             .visible_mission(
@@ -2430,7 +2751,7 @@ mod close_disposition_tests {
             )
             .expect("after deadman");
         assert_eq!(after_deadman.attempts[0].state, AttemptState::Unresponsive);
-        assert_eq!(after_deadman.phase, MissionPhase::Active);
+        assert_eq!(after_deadman.phase, MissionPhase::RecoveryPending);
         orchestrator
             .tick_leases_at(started + Duration::seconds(601))
             .await;
@@ -2440,12 +2761,69 @@ mod close_disposition_tests {
                 &TestVerifier.verify("valid-session-secret").unwrap(),
             )
             .expect("after expire");
-        assert_eq!(after_expire.phase, MissionPhase::DeadlineExceeded);
+        assert_eq!(after_expire.phase, MissionPhase::RecoveryPending);
         assert_eq!(after_expire.attempts[0].state, AttemptState::TimedOut);
         let history = service
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
         lanyte_mission::validate_history(&after_expire, &history).expect("history must validate");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn live_protocol_cancel_binds_turn_and_folds() {
+        let (root, orchestrator, service, created, launched) = launched_fixture(true).await;
+        for _ in 0..20 {
+            let _ = orchestrator
+                .observe_codex(
+                    &test_event(),
+                    MissionControlRequest::observe(Uuid::new_v4(), created.mission_id)
+                        .expect("observe"),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let latest = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("latest");
+        let cancelled = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:live-protocol-1".to_owned(),
+                    latest.revision,
+                    created.mission_id,
+                )
+                .expect("cancel"),
+            )
+            .await
+            .expect("cancel live");
+        let MissionControlResult::Cancel {
+            record, progress, ..
+        } = cancelled
+        else {
+            panic!("expected cancel result");
+        };
+        assert!(progress.requested);
+        assert_eq!(
+            progress.protocol.as_ref().map(|item| item.outcome.clone()),
+            Some(lanyte_mission::ProtocolCancelOutcome::Interrupted)
+        );
+        assert_eq!(record.phase, MissionPhase::Cancelled);
+        assert_eq!(record.attempts[0].state, AttemptState::Cancelled);
+        assert_eq!(
+            record.attempts[0].harness_turn_id.as_deref(),
+            Some("turn_test")
+        );
+        let history = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history");
+        lanyte_mission::validate_history(&record, &history).expect("history must validate");
+        let _ = launched;
         let _ = std::fs::remove_dir_all(root);
     }
 

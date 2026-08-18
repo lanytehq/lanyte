@@ -213,6 +213,10 @@ impl MissionService {
                 .validate()
                 .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         }
+        let mut history = self.lifecycle_history(&mission.mission_id.to_string())?;
+        history.extend(receipts.iter().map(|receipt| receipt.event.clone()));
+        lanyte_mission::validate_history(&mission, &history)
+            .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         if mission.phase.is_terminal()
             && self
                 .fail_next_terminal_persist

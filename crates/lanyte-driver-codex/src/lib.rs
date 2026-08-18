@@ -1,9 +1,13 @@
 //! Codex App Server driver. Owns a child `codex app-server` process and maps
 //! JSON-RPC observations to [`lanyte_mission::NormalizedHarnessEvent`].
 
+mod process;
 mod protocol;
 mod spawn;
 
+pub use process::{
+    format_process_tree_ref, parse_process_tree_ref, probe_process_tree, terminate_process_tree,
+};
 pub use protocol::{map_notification, CodexProtocolError, JsonRpcLine};
 pub use spawn::{confine_workspace, scrub_child_env, CodexBinary, CodexLaunchSpec, SpawnError};
 
@@ -22,7 +26,7 @@ impl CloseOutcome {
     }
 }
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,6 +49,9 @@ use uuid::Uuid;
 const DRIVER_ID: &str = "driver.codex.app_server";
 const DRIVER_VERSION: &str = "0.1.0";
 const HARNESS_KIND: &str = "codex";
+
+type PendingResponses =
+    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, CodexDriverError>>>>>;
 
 #[derive(Debug, Error)]
 pub enum CodexDriverError {
@@ -78,6 +85,7 @@ pub struct CodexSession {
     last_close: Option<CloseOutcome>,
     pub process_tree_ref: Option<String>,
     active_turn_id: Arc<Mutex<Option<String>>>,
+    pending: PendingResponses,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +94,7 @@ pub enum InterruptAttempt {
     RequestAccepted { thread_id: String, turn_id: String },
     Interrupted { thread_id: String, turn_id: String },
     Timeout { thread_id: String, turn_id: String },
+    UnrelatedCompletion { thread_id: String, turn_id: String },
     Failed { detail: String },
 }
 
@@ -118,6 +127,7 @@ impl CodexSession {
         let events = Arc::clone(&self.events);
         let overflowed = Arc::clone(&self.overflowed);
         let active_turn_id = Arc::clone(&self.active_turn_id);
+        let pending = Arc::clone(&self.pending);
         let attempt_id = self.attempt_id;
         tokio::spawn(async move {
             let mut stdout = stdout.lock().await;
@@ -126,7 +136,21 @@ impl CodexSession {
                 match stdout.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        if let Some(event) = map_notification(attempt_id, line.trim_end()) {
+                        let trimmed = line.trim_end();
+                        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                            if let Some(id) = parsed.get("id").and_then(Value::as_u64) {
+                                if let Some(tx) = pending.lock().await.remove(&id) {
+                                    let result = if let Some(error) = parsed.get("error") {
+                                        Err(CodexProtocolError::Remote(error.to_string()).into())
+                                    } else {
+                                        Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
+                                    };
+                                    let _ = tx.send(result);
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(event) = map_notification(attempt_id, trimmed) {
                             if let NormalizedHarnessEvent::TurnProgress {
                                 turn_id, status, ..
                             } = &event
@@ -191,73 +215,113 @@ impl CodexSession {
         self.active_turn_id.lock().await.clone()
     }
 
-    pub async fn interrupt_active_turn(&mut self) -> InterruptAttempt {
-        let Some(turn_id) = self.active_turn_id().await else {
+    pub async fn interrupt_turn(
+        &mut self,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> InterruptAttempt {
+        let turn_id = match self
+            .active_turn_id()
+            .await
+            .or_else(|| turn_id.map(str::to_owned))
+        {
+            Some(turn_id) if !turn_id.is_empty() => turn_id,
+            _ => return InterruptAttempt::Unavailable,
+        };
+        let thread_id = thread_id
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                if self.harness_session_id.is_empty() {
+                    None
+                } else {
+                    Some(self.harness_session_id.clone())
+                }
+            });
+        let Some(thread_id) = thread_id else {
             return InterruptAttempt::Unavailable;
         };
-        if self.harness_session_id.is_empty() {
-            return InterruptAttempt::Unavailable;
-        }
-        let thread_id = self.harness_session_id.clone();
         if let Err(err) = self
-            .notify(
+            .request(
                 "turn/interrupt",
                 json!({ "threadId": thread_id, "turnId": turn_id }),
             )
             .await
         {
-            return InterruptAttempt::Failed {
-                detail: err.to_string(),
+            return match err {
+                CodexDriverError::Timeout => InterruptAttempt::Timeout { thread_id, turn_id },
+                other => InterruptAttempt::Failed {
+                    detail: other.to_string(),
+                },
             };
         }
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let accepted_at = tokio::time::Instant::now();
+        let deadline = accepted_at + std::time::Duration::from_secs(2);
         loop {
-            if tokio::time::Instant::now() >= deadline {
-                return InterruptAttempt::Timeout { thread_id, turn_id };
-            }
-            let maybe = self.events.lock().await.iter().rev().find_map(|event| {
+            let outcome = self.events.lock().await.iter().rev().find_map(|event| {
                 if let NormalizedHarnessEvent::TurnProgress {
                     turn_id: event_turn,
+                    thread_id: event_thread,
                     status,
                     ..
                 } = event
                 {
-                    if event_turn == &turn_id && status == "interrupted" {
-                        return Some(());
+                    if event_turn != &turn_id {
+                        return None;
+                    }
+                    if event_thread
+                        .as_ref()
+                        .is_some_and(|value| value != &thread_id)
+                    {
+                        return Some(InterruptAttempt::UnrelatedCompletion {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        });
+                    }
+                    if status == "interrupted" {
+                        return Some(InterruptAttempt::Interrupted {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        });
+                    }
+                    if status == "completed" {
+                        return Some(InterruptAttempt::UnrelatedCompletion {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        });
                     }
                 }
                 None
             });
-            if maybe.is_some() {
-                return InterruptAttempt::Interrupted { thread_id, turn_id };
+            if let Some(outcome) = outcome {
+                return outcome;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return InterruptAttempt::RequestAccepted { thread_id, turn_id };
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
+    pub async fn interrupt_active_turn(&mut self) -> InterruptAttempt {
+        self.interrupt_turn(None, None).await
+    }
+
     pub fn kill_process_tree(&mut self) -> ProcessTreeKill {
-        let Some(pid) = self.child.id() else {
-            return ProcessTreeKill::Unknown;
-        };
-        #[cfg(unix)]
-        {
-            let status = std::process::Command::new("kill")
-                .args(["-KILL", &format!("-{pid}")])
-                .status();
-            if !status.map(|value| value.success()).unwrap_or(false) {
-                let _ = self.child.start_kill();
-                return ProcessTreeKill::KillDispatched;
-            }
+        if let Some(tree_ref) = &self.process_tree_ref {
+            return terminate_process_tree(tree_ref);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.start_kill();
+        match self.child.id() {
+            Some(pid) => terminate_process_tree(&format_process_tree_ref(pid)),
+            None => ProcessTreeKill::Unknown,
         }
-        match self.child.try_wait() {
-            Ok(Some(_)) => ProcessTreeKill::Cleared,
-            Ok(None) => ProcessTreeKill::KillDispatched,
-            Err(_) => ProcessTreeKill::Unknown,
-        }
+    }
+
+    pub fn probe_process_tree(&self) -> ProcessTreeKill {
+        self.process_tree_ref
+            .as_deref()
+            .map(probe_process_tree)
+            .unwrap_or(ProcessTreeKill::Unknown)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), CodexDriverError> {
@@ -274,6 +338,19 @@ impl CodexSession {
         let message = json!({"id": id, "method": method, "params": params});
         let mut encoded = serde_json::to_string(&message)?;
         encoded.push('\n');
+        if self.stdout.is_none() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id, tx);
+            {
+                let mut stdin = self.stdin.lock().await;
+                stdin.write_all(encoded.as_bytes()).await?;
+                stdin.flush().await?;
+            }
+            return tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+                .await
+                .map_err(|_| CodexDriverError::Timeout)?
+                .map_err(|_| CodexDriverError::StdoutClosed)?;
+        }
         {
             let mut stdin = self.stdin.lock().await;
             stdin.write_all(encoded.as_bytes()).await?;
@@ -337,7 +414,7 @@ impl CodexAppServerDriver {
             command.process_group(0);
         }
         let mut child = command.spawn()?;
-        let process_tree_ref = child.id().map(|pid| format!("pgid:{pid}"));
+        let process_tree_ref = child.id().map(format_process_tree_ref);
         let stdin = child.stdin.take().ok_or(CodexDriverError::StdinClosed)?;
         let stdout = child.stdout.take().ok_or(CodexDriverError::StdoutClosed)?;
         if let Some(stderr) = child.stderr.take() {
@@ -362,6 +439,7 @@ impl CodexAppServerDriver {
             last_close: None,
             process_tree_ref,
             active_turn_id: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         };
         if let Err(err) = session
             .request(
@@ -461,17 +539,43 @@ impl HarnessDriver for CodexAppServerDriver {
                 DriverAvailability::TemporarilyUnavailable
             },
             capabilities: [
-                CapabilityName::Create,
-                CapabilityName::Identify,
-                CapabilityName::Observe,
-                CapabilityName::Close,
+                (
+                    CapabilityName::Create,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Identify,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Observe,
+                    ObservationLevel::DriverObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Close,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Cancel,
+                    ObservationLevel::DriverObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::LocalProcessTermination,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::LocalProcessControl,
+                ),
             ]
             .into_iter()
-            .map(|name| DriverCapability {
+            .map(|(name, observation, enforcement)| DriverCapability {
                 name,
                 fidelity: CapabilityFidelity::Native,
-                observation: ObservationLevel::KernelObserved,
-                enforcement: EnforcementLevel::ProtocolConfirmed,
+                observation,
+                enforcement,
                 replay: ReplaySupport::None,
                 limitation: Some(format!("codex-cli:{version}")),
                 evidence_ref: Some("probes/codex-app-server".to_owned()),

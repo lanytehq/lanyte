@@ -7,8 +7,8 @@ use uuid::{Uuid, Version};
 use crate::{
     AttemptRecord, AttemptState, CapabilityFidelity, DriverCapabilityReport, DriverDescriptor,
     EventSourceKind, LifecycleEvent, LifecyclePayload, Mission, MissionPhase, MissionRecord,
-    MissionTerminalReason, Principal, PrincipalKind, RecoveryRelation, DRIVER_CAPABILITIES_SCHEMA,
-    LIFECYCLE_EVENT_SCHEMA, MISSION_RECORD_SCHEMA,
+    MissionTerminalReason, ObservationLevel, Principal, PrincipalKind, RecoveryRelation,
+    DRIVER_CAPABILITIES_SCHEMA, LIFECYCLE_EVENT_SCHEMA, MISSION_RECORD_SCHEMA,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -615,9 +615,31 @@ impl Validate for LifecycleEvent {
                 "authoritative source requires evidence",
             ));
         }
+        if !source_assurance_allowed(self.source.kind, self.source.assurance) {
+            return Err(InvariantError::new(
+                "source.assurance",
+                "source kind and assurance must follow the Wave 3 provenance map",
+            ));
+        }
         validate_lifecycle_payload(&self.payload)?;
         Ok(())
     }
+}
+
+fn source_assurance_allowed(kind: EventSourceKind, assurance: ObservationLevel) -> bool {
+    matches!(
+        (kind, assurance),
+        (
+            EventSourceKind::KernelObserved,
+            ObservationLevel::KernelObserved | ObservationLevel::ResourceAttested
+        ) | (
+            EventSourceKind::DriverReported | EventSourceKind::HarnessReported,
+            ObservationLevel::Claim | ObservationLevel::DriverObserved
+        ) | (
+            EventSourceKind::OperatorCommand | EventSourceKind::VerifiedAttestation,
+            ObservationLevel::ResourceAttested
+        )
+    )
 }
 
 pub fn validate_history(
@@ -984,13 +1006,80 @@ fn validate_lifecycle_payload(payload: &LifecyclePayload) -> Result<(), Invarian
             }
             Ok(())
         }
-        LifecyclePayload::MissionCreated { .. }
-        | LifecyclePayload::CancelRequested { .. }
-        | LifecyclePayload::ProtocolCancelAttempted { .. }
-        | LifecyclePayload::ProcessTerminationAttempted { .. }
-        | LifecyclePayload::LeaseStarted { .. }
-        | LifecyclePayload::LeaseTick { .. }
-        | LifecyclePayload::RestartReconciled { .. } => Ok(()),
+        LifecyclePayload::MissionCreated { .. } | LifecyclePayload::CancelRequested { .. } => {
+            Ok(())
+        }
+        LifecyclePayload::ProtocolCancelAttempted {
+            outcome,
+            thread_id,
+            turn_id,
+            generation,
+            lease_generation,
+            ..
+        } => {
+            if *generation == 0 || *lease_generation == 0 {
+                return Err(InvariantError::new(
+                    "payload.protocol_cancel_attempted",
+                    "attempt and lease generations start at one",
+                ));
+            }
+            if *outcome == crate::ProtocolCancelOutcome::Interrupted
+                && (thread_id.as_deref().is_none_or(|value| !nonempty(value))
+                    || turn_id.as_deref().is_none_or(|value| !nonempty(value)))
+            {
+                return Err(InvariantError::new(
+                    "payload.protocol_cancel_attempted",
+                    "interrupted proof requires thread and turn ids",
+                ));
+            }
+            Ok(())
+        }
+        LifecyclePayload::ProcessTerminationAttempted {
+            generation,
+            lease_generation,
+            ..
+        }
+        | LifecyclePayload::LeaseStarted {
+            generation,
+            lease_generation,
+            ..
+        } => {
+            if *generation == 0 || *lease_generation == 0 {
+                return Err(InvariantError::new(
+                    "payload.generation",
+                    "attempt and lease generations start at one",
+                ));
+            }
+            Ok(())
+        }
+        LifecyclePayload::LeaseTick {
+            generation,
+            prior_lease_generation,
+            result_lease_generation,
+            ..
+        } => {
+            if *generation == 0 || *prior_lease_generation == 0 || *result_lease_generation == 0 {
+                return Err(InvariantError::new(
+                    "payload.lease_tick",
+                    "lease generations start at one",
+                ));
+            }
+            Ok(())
+        }
+        LifecyclePayload::RestartReconciled {
+            generation,
+            lease_generation,
+            overdue,
+            ..
+        } => {
+            if *generation == 0 || *lease_generation == 0 || !*overdue {
+                return Err(InvariantError::new(
+                    "payload.restart_reconciled",
+                    "overdue restart receipts require generations and overdue=true",
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
