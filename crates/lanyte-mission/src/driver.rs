@@ -1,4 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::DriverCapabilityReport;
 
@@ -11,12 +13,36 @@ pub struct DriverDescriptor {
     pub harness_kind: String,
 }
 
+/// Normalized observation from a harness session. Provider-native payloads stay
+/// in `detail` and never become authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum NormalizedHarnessEvent {
+    Started {
+        occurred_at: DateTime<Utc>,
+        attempt_id: Uuid,
+        harness_session_id: String,
+        detail: Option<String>,
+    },
+    ToolProposed {
+        occurred_at: DateTime<Utc>,
+        attempt_id: Uuid,
+        tool: String,
+        detail: Option<String>,
+    },
+    Exited {
+        occurred_at: DateTime<Utc>,
+        attempt_id: Uuid,
+        success: bool,
+        detail: Option<String>,
+    },
+}
+
 /// Domain boundary shared by future harness integrations.
 ///
-/// Sequence 2 deliberately exposes only identity and capability evidence.
-/// Create/resume/cancel/observe execution methods land with the first driver,
-/// when their async and cancellation semantics can be reviewed against a real
-/// protocol. This trait contains no transport, persistence, or runtime handle.
+/// Identity and capability evidence stay on the object-safe surface. Session
+/// create/identify/observe/close live on the concrete Wave 2 driver so async
+/// and process ownership can be reviewed against Codex App Server.
 pub trait HarnessDriver: Send + Sync {
     fn descriptor(&self) -> DriverDescriptor;
 

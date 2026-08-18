@@ -116,7 +116,7 @@ impl MissionCommandError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             code: MissionCommandErrorCode::InternalError,
             message: message.into(),
@@ -139,6 +139,47 @@ impl MissionService {
     #[must_use]
     pub fn production(store: Arc<Mutex<StateStore>>) -> Self {
         Self::new(store, Arc::new(AttestationSessionVerifier))
+    }
+
+    pub(crate) fn authenticate(
+        &self,
+        token: Option<&str>,
+    ) -> Result<VerifiedSession, MissionCommandError> {
+        let token = token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(MissionCommandError::permission_denied)?;
+        self.verifier.verify(token).map_err(|err| {
+            tracing::warn!(error = %err, "mission caller attestation denied");
+            MissionCommandError::permission_denied()
+        })
+    }
+
+    pub(crate) fn visible_mission(
+        &self,
+        mission_id: &str,
+        caller: &VerifiedSession,
+    ) -> Result<lanyte_mission::MissionRecord, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .mission(mission_id)
+            .map_err(map_state_error)?
+            .filter(|projection| visible_to(&projection.mission, caller))
+            .map(|projection| projection.mission)
+            .ok_or_else(MissionCommandError::permission_denied)
+    }
+
+    pub(crate) fn persist_update(
+        &self,
+        expected_revision: u64,
+        mission: lanyte_mission::MissionRecord,
+        receipt: lanyte_state::NewMissionProjectionReceipt,
+    ) -> Result<lanyte_state::MissionProjectionWrite, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .update_mission(expected_revision, mission, receipt)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))
     }
 
     pub fn handle(

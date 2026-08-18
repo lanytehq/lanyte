@@ -44,6 +44,7 @@ pub enum MissionCommand {
     Create(CreateArgs),
     Show(ShowArgs),
     List(ListArgs),
+    Launch(LaunchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -77,6 +78,17 @@ pub struct ListArgs {
     limit: u16,
     #[arg(long)]
     cursor: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LaunchArgs {
+    mission_id: String,
+    #[arg(long)]
+    workspace: String,
+    #[arg(long)]
+    binary: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -178,14 +190,32 @@ pub async fn run_mission(command: MissionCommand, socket: &Path) -> Result<(), C
         .filter(|value| !value.is_empty())
         .map(Zeroizing::new)
         .ok_or(ClientError::MissingSessionToken)?;
-    let (request, json) = build_request(command)?;
-    let request_id = request.request_id().to_string();
-    let operation = request.operation().to_owned();
+    let (request_id, operation, args, json) = match command {
+        MissionCommand::Launch(args) => {
+            let request_id = Uuid::new_v4().to_string();
+            (
+                request_id.clone(),
+                "mission.launch".to_owned(),
+                serde_json::json!({
+                    "mission_id": args.mission_id,
+                    "workspace": args.workspace,
+                    "binary": args.binary,
+                }),
+                args.json,
+            )
+        }
+        other => {
+            let (request, json) = build_request(other)?;
+            let request_id = request.request_id().to_string();
+            let operation = request.operation().to_owned();
+            (request_id, operation, serde_json::to_value(&request)?, json)
+        }
+    };
     let envelope = serde_json::json!({
         "type": "invoke",
         "request_id": request_id,
         "command": operation,
-        "args": request,
+        "args": args,
     });
 
     let stream = tokio::net::UnixStream::connect(socket)
@@ -279,6 +309,9 @@ async fn read_frame(
 fn build_request(command: MissionCommand) -> Result<(MissionControlRequest, bool), ClientError> {
     let request_id = Uuid::new_v4();
     match command {
+        MissionCommand::Launch(_) => Err(ClientError::InvalidArgument(
+            "launch uses a dedicated invoke path".to_owned(),
+        )),
         MissionCommand::Create(args) => {
             let deadline_at = args
                 .deadline

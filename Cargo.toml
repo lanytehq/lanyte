@@ -9,6 +9,7 @@ members = [
     "crates/lanyte-llm",
     "crates/lanyte-executor",
     "crates/lanyte-orchestrator",
+    "crates/lanyte-driver-codex",
 ]
 
 [package]
@@ -33,7 +34,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
 futures-core = "0.3.31"
 futures-util = "0.3.32"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "process", "io-util"] }
 tokio-util = "0.7"
 tokio-stream = "0.1.17"
 
@@ -42,6 +43,7 @@ bytes = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
 ipcprims = { workspace = true }
+lanyte-driver-codex = { path = "crates/lanyte-driver-codex", version = "0.1.0" }
 lanyte-common = { path = "crates/lanyte-common", version = "0.1.0" }
 lanyte-gateway = { path = "crates/lanyte-gateway", version = "0.1.0" }
 lanyte-llm = { path = "crates/lanyte-llm", version = "0.1.0" }

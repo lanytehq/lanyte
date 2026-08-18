@@ -374,6 +374,99 @@ impl StateStore {
         Ok(outcome)
     }
 
+    /// Replace a mission projection and append one receipt in the same transaction.
+    pub fn update_mission(
+        &mut self,
+        expected_revision: u64,
+        mission: MissionRecord,
+        receipt: NewMissionProjectionReceipt,
+    ) -> Result<MissionProjectionWrite> {
+        mission
+            .validate()
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        if mission.revision != expected_revision.saturating_add(1) {
+            return Err(StateError::InvalidMissionProjection(
+                "updated mission revision must be expected_revision + 1".to_owned(),
+            ));
+        }
+        if !matches!(
+            receipt.event.source.kind,
+            EventSourceKind::VerifiedAttestation | EventSourceKind::OperatorCommand
+        ) {
+            return Err(StateError::InvalidMissionProjection(
+                "update receipt must be authoritative".to_owned(),
+            ));
+        }
+
+        let mission_id = mission.mission_id.to_string();
+        let projection_json = serde_json::to_string(&mission)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        let event_json = serde_json::to_value(&receipt.event)
+            .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+        let audit_input = NewAuditRecord {
+            entry_id: receipt.event.event_id.to_string(),
+            session_id: mission_id.clone(),
+            timestamp: receipt
+                .event
+                .recorded_at
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            kind: AuditRecordKind::MissionEvent,
+            action: receipt.event.event_type.clone(),
+            severity: AuditSeverity::Notice,
+            envelope: receipt.envelope,
+            payload: event_json,
+            verification: receipt.verification,
+        };
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE missions SET revision = ?1, phase = ?2, updated_at = ?3, record_json = ?4, \
+             receipt_entry_id = ?5, receipt_entry_hash = ?6 \
+             WHERE mission_id = ?7 AND revision = ?8",
+            params![
+                i64::try_from(mission.revision).map_err(|_| {
+                    StateError::InvalidMissionProjection(
+                        "mission revision exceeds SQLite integer range".to_owned(),
+                    )
+                })?,
+                mission_phase_name(mission.phase),
+                mission
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                &projection_json,
+                "",
+                "",
+                &mission_id,
+                i64::try_from(expected_revision).map_err(|_| {
+                    StateError::InvalidMissionProjection(
+                        "expected revision exceeds SQLite integer range".to_owned(),
+                    )
+                })?,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidMissionProjection(
+                "mission update did not match the expected revision".to_owned(),
+            ));
+        }
+        let audit = append_audit_record_tx(&tx, audit_input)?;
+        tx.execute(
+            "UPDATE missions SET receipt_entry_id = ?1, receipt_entry_hash = ?2 WHERE mission_id = ?3",
+            params![&audit.entry_id, &audit.entry_hash, &mission_id],
+        )?;
+        tx.commit()?;
+        Ok(MissionProjectionWrite {
+            projection: StoredMissionProjection {
+                mission,
+                audit_entry_id: audit.entry_id.clone(),
+                audit_entry_hash: audit.entry_hash.clone(),
+            },
+            receipt: audit,
+        })
+    }
+
     fn create_mission_inner(
         &mut self,
         mission: MissionRecord,

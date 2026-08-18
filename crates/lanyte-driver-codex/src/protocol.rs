@@ -1,0 +1,124 @@
+use chrono::Utc;
+use lanyte_mission::NormalizedHarnessEvent;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+use uuid::Uuid;
+
+#[derive(Debug, Error)]
+pub enum CodexProtocolError {
+    #[error("invalid JSON-RPC line: {0}")]
+    InvalidLine(#[from] serde_json::Error),
+    #[error("remote error: {0}")]
+    Remote(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcLine {
+    #[serde(default)]
+    pub id: Option<Value>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub params: Option<Value>,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<Value>,
+}
+
+/// Map a server notification (or unsolicited method) to a normalized event.
+pub fn map_notification(attempt_id: Uuid, line: &str) -> Option<NormalizedHarnessEvent> {
+    let parsed: JsonRpcLine = serde_json::from_str(line).ok()?;
+    let method = parsed.method.as_deref()?;
+    let now = Utc::now();
+    match method {
+        "thread/started" | "session/started" => Some(NormalizedHarnessEvent::Started {
+            occurred_at: now,
+            attempt_id,
+            harness_session_id: extract_id(&parsed.params).unwrap_or_else(|| "unknown".to_owned()),
+            detail: Some(method.to_owned()),
+        }),
+        "item/started" | "item/completed" | "tool/called" | "command/started" => {
+            Some(NormalizedHarnessEvent::ToolProposed {
+                occurred_at: now,
+                attempt_id,
+                tool: extract_tool(&parsed.params).unwrap_or_else(|| method.to_owned()),
+                detail: Some(method.to_owned()),
+            })
+        }
+        "thread/exited" | "turn/completed" | "session/completed" => {
+            let failed = parsed
+                .params
+                .as_ref()
+                .and_then(|params| params.get("error"))
+                .is_some_and(|error| !error.is_null());
+            Some(NormalizedHarnessEvent::Exited {
+                occurred_at: now,
+                attempt_id,
+                success: !failed,
+                detail: Some(method.to_owned()),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn extract_id(params: &Option<Value>) -> Option<String> {
+    let params = params.as_ref()?;
+    params
+        .get("threadId")
+        .or_else(|| params.get("id"))
+        .or_else(|| params.pointer("/thread/id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn extract_tool(params: &Option<Value>) -> Option<String> {
+    let params = params.as_ref()?;
+    params
+        .get("tool")
+        .or_else(|| params.get("name"))
+        .or_else(|| params.pointer("/item/type"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_thread_started() {
+        let attempt = Uuid::nil();
+        let event = map_notification(
+            attempt,
+            r#"{"method":"thread/started","params":{"threadId":"thr_1"}}"#,
+        )
+        .expect("mapped");
+        match event {
+            NormalizedHarnessEvent::Started {
+                harness_session_id, ..
+            } => assert_eq!(harness_session_id, "thr_1"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_tool_and_exit() {
+        let attempt = Uuid::nil();
+        assert!(matches!(
+            map_notification(attempt, r#"{"method":"item/started","params":{"name":"shell"}}"#),
+            Some(NormalizedHarnessEvent::ToolProposed { tool, .. }) if tool == "shell"
+        ));
+        assert!(matches!(
+            map_notification(attempt, r#"{"method":"turn/completed","params":{}}"#),
+            Some(NormalizedHarnessEvent::Exited { success: true, .. })
+        ));
+    }
+
+    #[test]
+    fn ignores_unknown_methods() {
+        assert!(map_notification(Uuid::nil(), r#"{"method":"window/title"}"#).is_none());
+    }
+}
