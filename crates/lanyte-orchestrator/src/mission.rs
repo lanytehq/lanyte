@@ -440,19 +440,17 @@ impl MissionService {
                     body: body.clone(),
                 })
                 .map_err(MissionCommandError::internal)?;
-                let existing_create = self
+                let (mission, receipt) =
+                    build_created_mission(&caller, body).map_err(MissionCommandError::internal)?;
+                let mut store = self
                     .store
                     .lock()
-                    .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+                    .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?;
+                if let Some((_, mission_id)) = store
                     .existing_create_request(&idempotency_key)
-                    .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-                if let Some((_, mission_id)) = existing_create {
-                    let existing = self
-                        .store
-                        .lock()
-                        .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
-                        .mission(&mission_id)
-                        .map_err(map_state_error)?;
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?
+                {
+                    let existing = store.mission(&mission_id).map_err(map_state_error)?;
                     if existing
                         .as_ref()
                         .is_none_or(|projection| {
@@ -462,12 +460,7 @@ impl MissionService {
                         return Err(MissionCommandError::permission_denied());
                     }
                 }
-                let (mission, receipt) =
-                    build_created_mission(&caller, body).map_err(MissionCommandError::internal)?;
-                let outcome = self
-                    .store
-                    .lock()
-                    .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+                let outcome = store
                     .create_mission_idempotent(
                         mission,
                         receipt,
@@ -477,11 +470,7 @@ impl MissionService {
                         },
                     )
                     .map_err(map_state_error)?;
-                if outcome.replayed
-                    && !create_replay_authorized(&outcome.write.projection.mission, &caller)
-                {
-                    return Err(MissionCommandError::permission_denied());
-                }
+                drop(store);
                 let record = outcome.write.projection.mission;
                 Ok(MissionControlResult::create(request_id, idempotency_key, record)
                     .map_err(MissionCommandError::internal)?
