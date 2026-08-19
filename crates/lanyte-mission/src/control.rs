@@ -468,18 +468,17 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let is_v01 = schema == MISSION_CONTROL_SCHEMA;
-        if schema == MISSION_CONTROL_SCHEMA_V0 {
-            let obj = value
-                .as_object()
-                .ok_or_else(|| D::Error::custom("request must be an object"))?;
-            if obj.contains_key("request_fingerprint") || obj.contains_key("original_result_hash") {
-                return Err(D::Error::custom("frozen v0 control hashes must be omitted"));
-            }
-            if value.get("operation").and_then(Value::as_str) == Some("mission.cancel") {
-                return Err(D::Error::custom(
-                    "frozen v0 does not include mission.cancel",
-                ));
-            }
+        require_versioned_hash_members::<D::Error>(
+            &value,
+            is_v01,
+            schema == MISSION_CONTROL_SCHEMA_V0,
+        )?;
+        if schema == MISSION_CONTROL_SCHEMA_V0
+            && value.get("operation").and_then(Value::as_str) == Some("mission.cancel")
+        {
+            return Err(D::Error::custom(
+                "frozen v0 does not include mission.cancel",
+            ));
         }
         let raw: Raw = serde_json::from_value(value).map_err(D::Error::custom)?;
         if raw.control_schema != MISSION_CONTROL_SCHEMA
@@ -1009,18 +1008,17 @@ impl<'de> Deserialize<'de> for MissionControlResult {
             .get("control_schema")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if schema == MISSION_CONTROL_SCHEMA_V0 {
-            let obj = value
-                .as_object()
-                .ok_or_else(|| D::Error::custom("result must be an object"))?;
-            if obj.contains_key("request_fingerprint") || obj.contains_key("original_result_hash") {
-                return Err(D::Error::custom("frozen v0 control hashes must be omitted"));
-            }
-            if value.get("operation").and_then(Value::as_str) == Some("mission.cancel") {
-                return Err(D::Error::custom(
-                    "frozen v0 does not include mission.cancel",
-                ));
-            }
+        require_versioned_hash_members::<D::Error>(
+            &value,
+            schema == MISSION_CONTROL_SCHEMA,
+            schema == MISSION_CONTROL_SCHEMA_V0,
+        )?;
+        if schema == MISSION_CONTROL_SCHEMA_V0
+            && value.get("operation").and_then(Value::as_str) == Some("mission.cancel")
+        {
+            return Err(D::Error::custom(
+                "frozen v0 does not include mission.cancel",
+            ));
         }
         let raw: Raw = serde_json::from_value(value).map_err(D::Error::custom)?;
         if raw.control_schema != MISSION_CONTROL_SCHEMA
@@ -1161,15 +1159,12 @@ impl<'de> Deserialize<'de> for MissionControlResult {
                     ));
                 }
                 if let Some(protocol) = &body.progress.protocol {
+                    validate_protocol_id("thread_id", protocol.thread_id.as_deref())
+                        .map_err(D::Error::custom)?;
+                    validate_protocol_id("turn_id", protocol.turn_id.as_deref())
+                        .map_err(D::Error::custom)?;
                     if protocol.outcome == ProtocolCancelOutcome::Interrupted
-                        && (protocol
-                            .thread_id
-                            .as_ref()
-                            .is_none_or(|value| value.is_empty())
-                            || protocol
-                                .turn_id
-                                .as_ref()
-                                .is_none_or(|value| value.is_empty()))
+                        && (protocol.thread_id.is_none() || protocol.turn_id.is_none())
                     {
                         return Err(D::Error::custom(
                             "interrupted cancel progress requires nonempty thread_id and turn_id",
@@ -1192,6 +1187,34 @@ impl<'de> Deserialize<'de> for MissionControlResult {
             _ => return Err(D::Error::custom("unsupported mission operation")),
         };
         bind_parsed_fingerprint(result, &raw.request_fingerprint)
+    }
+}
+
+fn require_versioned_hash_members<E>(value: &Value, is_v01: bool, is_v0: bool) -> Result<(), E>
+where
+    E: serde::de::Error,
+{
+    let obj = value
+        .as_object()
+        .ok_or_else(|| E::custom("control envelope must be an object"))?;
+    let has_fingerprint = obj.contains_key("request_fingerprint");
+    let has_result_hash = obj.contains_key("original_result_hash");
+    if is_v0 && (has_fingerprint || has_result_hash) {
+        return Err(E::custom("frozen v0 control hashes must be omitted"));
+    }
+    if is_v01 && !(has_fingerprint && has_result_hash) {
+        return Err(E::custom(
+            "v0.1 control envelopes require request_fingerprint and original_result_hash",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_protocol_id(field: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        None => Ok(()),
+        Some(value) if (1..=512).contains(&value.chars().count()) => Ok(()),
+        Some(_) => Err(format!("{field} must contain 1..=512 characters")),
     }
 }
 
@@ -1891,5 +1914,68 @@ mod tests {
         let mut extra = valid;
         extra["body"]["spoofed"] = Value::Bool(true);
         assert!(serde_json::from_value::<MissionControlResult>(restamp_result(extra)).is_err());
+    }
+
+    #[test]
+    fn v01_nonmutating_envelopes_require_hash_members() {
+        let mut request = serde_json::json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "request",
+            "request_id": REQUEST_ID,
+            "idempotency_key": null,
+            "expected_revision": null,
+            "operation": "mission.show",
+            "body": { "mission_id": REQUEST_ID }
+        });
+        assert!(serde_json::from_value::<MissionControlRequest>(request.clone()).is_err());
+        request = stamp_request_hashes(request, false);
+        assert!(serde_json::from_value::<MissionControlRequest>(request).is_ok());
+
+        let mut result = serde_json::json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "result",
+            "request_id": REQUEST_ID,
+            "idempotency_key": null,
+            "expected_revision": null,
+            "operation": "mission.show",
+            "body": { "record": sample_record() }
+        });
+        assert!(serde_json::from_value::<MissionControlResult>(result.clone()).is_err());
+        result["request_fingerprint"] = Value::Null;
+        result["original_result_hash"] = Value::Null;
+        assert!(serde_json::from_value::<MissionControlResult>(result).is_ok());
+    }
+
+    #[test]
+    fn protocol_ids_require_one_to_512_characters_for_every_outcome() {
+        let result = MissionControlResult::Cancel {
+            request_id: Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
+            idempotency_key: "mission-cancel-example-0001".to_owned(),
+            expected_revision: 1,
+            record: Box::new(sample_record()),
+            progress: CancelProgress {
+                requested: true,
+                protocol: Some(ProtocolCancelProgress {
+                    outcome: ProtocolCancelOutcome::RequestAccepted,
+                    thread_id: Some(String::new()),
+                    turn_id: Some("turn".to_owned()),
+                }),
+                fallback: None,
+            },
+            request_fingerprint: Some("a".repeat(64)),
+        };
+        let empty = restamp_result(serde_json::to_value(&result).unwrap());
+        assert!(serde_json::from_value::<MissionControlResult>(empty).is_err());
+
+        let mut too_long = result.clone();
+        if let MissionControlResult::Cancel { progress, .. } = &mut too_long {
+            progress.protocol = Some(ProtocolCancelProgress {
+                outcome: ProtocolCancelOutcome::Timeout,
+                thread_id: Some("t".repeat(513)),
+                turn_id: Some("turn".to_owned()),
+            });
+        }
+        let too_long = restamp_result(serde_json::to_value(&too_long).unwrap());
+        assert!(serde_json::from_value::<MissionControlResult>(too_long).is_err());
     }
 }
