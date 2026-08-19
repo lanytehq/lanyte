@@ -12,8 +12,8 @@ jobs:
           toolchain: "1.85.0"
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --ignore-rust-version -- -D warnings
+      - run: cargo test --workspace --all-targets --ignore-rust-version
       - uses: EmbarkStudios/cargo-deny-action@v2
   msrv:
     name: msrv
