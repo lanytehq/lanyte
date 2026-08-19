@@ -575,18 +575,27 @@ impl Orchestrator {
         });
         let pending_cancel =
             service.incomplete_mutation(&body.mission_id.to_string(), "mission.cancel")?;
-        if let Some(pending) = pending_cancel.as_ref() {
-            if pending.key != idempotency_key {
+        let (request_id, expected_revision) = match pending_cancel.as_ref() {
+            Some(pending) if pending.key != idempotency_key => {
                 return Err(MissionCommandError::invalid_args(
                     "a cancel mutation is already in flight for this mission",
                 ));
             }
-            if parse_pending_cancel(&pending.result_json).is_none() {
-                return Err(MissionCommandError::internal(
-                    "stored cancel mutation is not a typed pending stub",
-                ));
+            Some(pending) => {
+                let stub = parse_pending_cancel(&pending.result_json).ok_or_else(|| {
+                    MissionCommandError::internal(
+                        "stored cancel mutation is not a typed pending stub",
+                    )
+                })?;
+                if stub.expected_revision != expected_revision {
+                    return Err(MissionCommandError::invalid_args(
+                        "pending cancel stub does not match fingerprint-bound expected revision",
+                    ));
+                }
+                (stub.request_id, stub.expected_revision)
             }
-        }
+            None => (request_id, expected_revision),
+        };
         let resume_stored = pending_cancel
             .as_ref()
             .is_some_and(|pending| pending.key == idempotency_key);
@@ -3223,6 +3232,94 @@ mod close_disposition_tests {
             panic!("expected cancel result");
         };
         assert_eq!(request_id, original_id);
+        assert_eq!(record.phase, MissionPhase::Cancelled);
+        let _ = launched;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_same_key_resume_keeps_original_request_identity() {
+        let (root, orchestrator, service, created, launched) = launched_fixture(true).await;
+        for _ in 0..20 {
+            let _ = orchestrator
+                .observe_codex(
+                    &test_event(),
+                    MissionControlRequest::observe(Uuid::new_v4(), created.mission_id)
+                        .expect("observe"),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let latest = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("latest");
+        service.force_nonterminal_cancel();
+        let original = MissionControlRequest::cancel(
+            Uuid::new_v4(),
+            "cancel:identity-key-01".to_owned(),
+            latest.revision,
+            created.mission_id,
+        )
+        .expect("cancel A");
+        let original_id = original.request_id();
+        let accepted = orchestrator
+            .cancel_mission(&test_event(), original)
+            .await
+            .expect("accepted nonterminal cancel");
+        let MissionControlResult::Cancel {
+            expected_revision, ..
+        } = accepted
+        else {
+            panic!("expected cancel result");
+        };
+        service
+            .age_mutation_reservation("cancel:identity-key-01")
+            .expect("age reservation");
+        let resumed = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:identity-key-01".to_owned(),
+                    latest.revision,
+                    created.mission_id,
+                )
+                .expect("resume B"),
+            )
+            .await
+            .expect("same-key resume");
+        let MissionControlResult::Cancel { request_id, .. } = resumed else {
+            panic!("expected cancel result");
+        };
+        assert_eq!(request_id, original_id);
+        orchestrator.tick_leases().await;
+        let retried = orchestrator
+            .cancel_mission(
+                &test_event(),
+                MissionControlRequest::cancel(
+                    Uuid::new_v4(),
+                    "cancel:identity-key-01".to_owned(),
+                    latest.revision,
+                    created.mission_id,
+                )
+                .expect("replay A"),
+            )
+            .await
+            .expect("original key replays");
+        let MissionControlResult::Cancel {
+            request_id,
+            expected_revision: replayed_revision,
+            record,
+            ..
+        } = retried
+        else {
+            panic!("expected cancel result");
+        };
+        assert_eq!(request_id, original_id);
+        assert_eq!(replayed_revision, expected_revision);
         assert_eq!(record.phase, MissionPhase::Cancelled);
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);

@@ -191,6 +191,15 @@ impl MissionService {
             .map_err(map_state_error)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn age_mutation_reservation(&self, key: &str) -> Result<(), MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .age_mutation_reservation(key)
+            .map_err(map_state_error)
+    }
+
     #[must_use]
     pub fn production(store: Arc<Mutex<StateStore>>) -> Self {
         Self::new(store, Arc::new(AttestationSessionVerifier))

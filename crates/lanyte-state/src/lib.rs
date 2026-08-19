@@ -516,6 +516,20 @@ impl StateStore {
             .map_err(Into::into)
     }
 
+    pub fn age_mutation_reservation(&mut self, key: &str) -> Result<()> {
+        let aged = Utc::now() - chrono::Duration::seconds(61);
+        let updated = self.connection.execute(
+            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2",
+            params![aged.to_rfc3339_opts(SecondsFormat::Millis, true), key],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidMissionProjection(
+                "mutation reservation could not be aged".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn replay_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
         validate_mission_create_idempotency(key, fingerprint)?;
