@@ -567,6 +567,11 @@ impl Orchestrator {
                     "a cancel mutation is already in flight for this mission",
                 ));
             }
+            None if already_cancelling => {
+                return Err(MissionCommandError::invalid_args(
+                    "a cancel mutation is already in flight for this mission",
+                ));
+            }
             Some(pending) => {
                 let stub = parse_pending_cancel(&pending.result_json).ok_or_else(|| {
                     MissionCommandError::internal(
@@ -723,7 +728,8 @@ impl Orchestrator {
         });
         let now = Utc::now();
         let mut cancelling = before.clone();
-        if !already_cancelling && !already_requested {
+        let request_persist_needed = !already_cancelling && !already_requested;
+        if request_persist_needed {
             cancelling.revision = expected_revision + 1;
             cancelling.updated_at = now;
             if let Some(live) = cancelling
@@ -733,61 +739,6 @@ impl Orchestrator {
             {
                 live.state = AttemptState::Cancelling;
             }
-            let mut receipts = chain_receipts(
-                &history,
-                &cancelling,
-                &caller,
-                vec![
-                    (
-                        EventSourceKind::OperatorCommand,
-                        cancel_requested(
-                            &cancelling,
-                            Some(attempt_id),
-                            Some(attempt.generation),
-                            Some(lease_generation),
-                        )?,
-                    ),
-                    (
-                        EventSourceKind::OperatorCommand,
-                        LifecyclePayload::AttemptStateChanged {
-                            attempt_id,
-                            generation: attempt.generation,
-                            from: attempt.state,
-                            to: AttemptState::Cancelling,
-                            reason: Some("operator cancel".to_owned()),
-                            cause: Some(AttemptStateCause::OperatorCancel),
-                        },
-                    ),
-                ],
-                None,
-            )?;
-            let snapshot = MissionControlResult::Cancel {
-                request_id,
-                idempotency_key: idempotency_key.clone(),
-                expected_revision,
-                record: Box::new(cancelling.clone()),
-                progress: CancelProgress {
-                    requested: true,
-                    protocol: None,
-                    fallback: None,
-                },
-                request_fingerprint: Some(fingerprint.clone()),
-            };
-            attach_cancel_control(&mut receipts, &control_request, &snapshot)?;
-            service.persist_update_events(
-                expected_revision,
-                cancelling.clone(),
-                receipts,
-                Some(pending_cancel_idempotency(
-                    &idempotency_key,
-                    &fingerprint,
-                    request_id,
-                    expected_revision,
-                    &owner_token,
-                )),
-            )?;
-            reservation_guard.disarm();
-            service.crash_after_cancelling_persist()?;
         }
 
         let protocol = {
@@ -879,7 +830,30 @@ impl Orchestrator {
             interrupted = false;
             cleared = false;
         }
-        let mut evidence = vec![(
+        let mut evidence = Vec::new();
+        if request_persist_needed {
+            evidence.push((
+                EventSourceKind::OperatorCommand,
+                cancel_requested(
+                    &cancelling,
+                    Some(attempt_id),
+                    Some(attempt.generation),
+                    Some(lease_generation),
+                )?,
+            ));
+            evidence.push((
+                EventSourceKind::OperatorCommand,
+                LifecyclePayload::AttemptStateChanged {
+                    attempt_id,
+                    generation: attempt.generation,
+                    from: attempt.state,
+                    to: AttemptState::Cancelling,
+                    reason: Some("operator cancel".to_owned()),
+                    cause: Some(AttemptStateCause::OperatorCancel),
+                },
+            ));
+        }
+        evidence.push((
             EventSourceKind::DriverReported,
             LifecyclePayload::ProtocolCancelAttempted {
                 attempt_id,
@@ -889,7 +863,7 @@ impl Orchestrator {
                 turn_id: protocol_progress.turn_id.clone(),
                 outcome: protocol_progress.outcome.clone(),
             },
-        )];
+        ));
         if let Some(fallback_progress) = &fallback_progress {
             evidence.push((
                 EventSourceKind::KernelObserved,
@@ -904,7 +878,9 @@ impl Orchestrator {
 
         let now = Utc::now();
         let mut mission = cancelling.clone();
-        mission.revision += 1;
+        if !request_persist_needed {
+            mission.revision += 1;
+        }
         mission.updated_at = now;
         if let Some(live) = mission
             .attempts
@@ -1015,32 +991,26 @@ impl Orchestrator {
             progress,
             request_fingerprint: Some(fingerprint.clone()),
         };
-        let complete = mission.phase == MissionPhase::Cancelled;
         attach_cancel_control(&mut receipts, &control_request, &result)?;
         service.persist_update_events(
-            cancelling.revision,
+            if request_persist_needed {
+                expected_revision
+            } else {
+                cancelling.revision
+            },
             mission,
             receipts,
-            Some(if complete {
-                lanyte_state::MissionMutationIdempotency {
-                    key: idempotency_key,
-                    request_fingerprint: fingerprint,
-                    operation: "mission.cancel".to_owned(),
-                    result_json: serde_json::to_string(&result)
-                        .map_err(|err| MissionCommandError::internal(err.to_string()))?,
-                    owner_token,
-                }
-            } else {
-                pending_cancel_idempotency(
-                    &idempotency_key,
-                    &fingerprint,
-                    request_id,
-                    expected_revision,
-                    &owner_token,
-                )
+            Some(lanyte_state::MissionMutationIdempotency {
+                key: idempotency_key,
+                request_fingerprint: fingerprint,
+                operation: "mission.cancel".to_owned(),
+                result_json: serde_json::to_string(&result)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                owner_token,
             }),
         )?;
         reservation_guard.disarm();
+        service.crash_after_cancelling_persist()?;
         Ok(result)
     }
 
@@ -1208,48 +1178,7 @@ impl Orchestrator {
                             *terminal_entry_hash = hash;
                         }
                     }
-                    let pending = service
-                        .incomplete_mutation(&before.mission_id.to_string(), "mission.cancel")?;
-                    let idempotency = match pending {
-                        Some(pending) => {
-                            let stub =
-                                parse_pending_cancel(&pending.result_json).ok_or_else(|| {
-                                    MissionCommandError::internal(
-                                        "stored cancel mutation is not a typed pending stub",
-                                    )
-                                })?;
-                            let result = MissionControlResult::Cancel {
-                                request_id: stub.request_id,
-                                idempotency_key: pending.key.clone(),
-                                expected_revision: stub.expected_revision,
-                                record: Box::new(mission.clone()),
-                                progress: CancelProgress {
-                                    requested: true,
-                                    protocol: None,
-                                    fallback: Some(FallbackCancelProgress {
-                                        outcome: FallbackCancelOutcome::Cleared,
-                                    }),
-                                },
-                                request_fingerprint: Some(pending.request_fingerprint.clone()),
-                            };
-                            Some(lanyte_state::MissionMutationIdempotency {
-                                key: pending.key,
-                                request_fingerprint: pending.request_fingerprint,
-                                operation: pending.operation,
-                                result_json: serde_json::to_string(&result).map_err(|err| {
-                                    MissionCommandError::internal(err.to_string())
-                                })?,
-                                owner_token: pending.owner_token,
-                            })
-                        }
-                        None => None,
-                    };
-                    service.persist_update_events(
-                        before.revision,
-                        mission,
-                        receipts,
-                        idempotency,
-                    )?;
+                    service.persist_update_events(before.revision, mission, receipts, None)?;
                 } else if !already_dispatched {
                     let mut mission = before.clone();
                     mission.revision = before.revision + 1;
@@ -2261,27 +2190,6 @@ fn parse_pending_cancel(result_json: &str) -> Option<PendingCancelStub> {
     (stub.kind == "pending_cancel").then_some(stub)
 }
 
-fn pending_cancel_idempotency(
-    key: &str,
-    fingerprint: &str,
-    request_id: Uuid,
-    expected_revision: u64,
-    owner_token: &str,
-) -> lanyte_state::MissionMutationIdempotency {
-    lanyte_state::MissionMutationIdempotency {
-        key: key.to_owned(),
-        request_fingerprint: fingerprint.to_owned(),
-        operation: "mission.cancel".to_owned(),
-        result_json: serde_json::json!({
-            "kind": "pending_cancel",
-            "request_id": request_id,
-            "expected_revision": expected_revision,
-        })
-        .to_string(),
-        owner_token: owner_token.to_owned(),
-    }
-}
-
 fn mutation_fingerprint(request: &MissionControlRequest) -> Result<String, MissionCommandError> {
     let value = serde_json::to_value(request)
         .map_err(|err| MissionCommandError::internal(err.to_string()))?;
@@ -2997,7 +2905,10 @@ mod close_disposition_tests {
                 &TestVerifier.verify("valid-session-secret").unwrap(),
             )
             .expect("midway");
-        assert_eq!(midway.attempts[0].state, AttemptState::Cancelling);
+        assert!(matches!(
+            midway.attempts[0].state,
+            AttemptState::Cancelling | AttemptState::Cancelled
+        ));
         orchestrator.tick_leases().await;
         let after_supervisor = service
             .visible_mission(
@@ -3055,6 +2966,7 @@ mod close_disposition_tests {
             )
             .expect("latest");
         service.fail_after_cancelling_persist();
+        service.force_nonterminal_cancel();
         let original = MissionControlRequest::cancel(
             Uuid::new_v4(),
             "cancel:original-key-01".to_owned(),
@@ -3101,20 +3013,16 @@ mod close_disposition_tests {
             )
             .await
             .expect("original key replays");
-        let MissionControlResult::Cancel {
-            request_id, record, ..
-        } = retried
-        else {
+        let MissionControlResult::Cancel { request_id, .. } = retried else {
             panic!("expected cancel result");
         };
         assert_eq!(request_id, original_id);
-        assert_eq!(record.phase, MissionPhase::Cancelled);
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn nonterminal_cancel_keeps_pending_stub_until_supervisor_completes() {
+    async fn nonterminal_cancel_replays_first_accepted_result() {
         let (root, orchestrator, service, created, launched) = launched_fixture(true).await;
         for _ in 0..20 {
             let _ = orchestrator
@@ -3145,10 +3053,12 @@ mod close_disposition_tests {
             .cancel_mission(&test_event(), original)
             .await
             .expect("accepted nonterminal cancel");
-        let MissionControlResult::Cancel { record, .. } = accepted else {
+        let MissionControlResult::Cancel { record, .. } = &accepted else {
             panic!("expected cancel result");
         };
         assert_ne!(record.phase, MissionPhase::Cancelled);
+        let first_bytes = serde_json::to_value(&accepted).expect("encode first result");
+        let first_hash = lanyte_mission::control_content_hash(&first_bytes).expect("hash");
         let midway = service
             .visible_mission(
                 &created.mission_id.to_string(),
@@ -3185,12 +3095,21 @@ mod close_disposition_tests {
             .expect("original key replays");
         let MissionControlResult::Cancel {
             request_id, record, ..
-        } = retried
+        } = &retried
         else {
             panic!("expected cancel result");
         };
-        assert_eq!(request_id, original_id);
-        assert_eq!(record.phase, MissionPhase::Cancelled);
+        assert_eq!(*request_id, original_id);
+        assert_ne!(record.phase, MissionPhase::Cancelled);
+        let replay_bytes = serde_json::to_value(&retried).expect("encode replay");
+        assert_eq!(
+            lanyte_mission::control_content_hash(&replay_bytes).expect("replay hash"),
+            first_hash
+        );
+        let bindings = service
+            .control_bindings(&created.mission_id.to_string())
+            .expect("bindings");
+        assert_eq!(bindings[0].original_result_hash, first_hash);
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3278,7 +3197,7 @@ mod close_disposition_tests {
         };
         assert_eq!(request_id, original_id);
         assert_eq!(replayed_revision, expected_revision);
-        assert_eq!(record.phase, MissionPhase::Cancelled);
+        assert_ne!(record.phase, MissionPhase::Cancelled);
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
     }
