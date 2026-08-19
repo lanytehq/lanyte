@@ -434,8 +434,12 @@ impl MissionService {
                 idempotency_key,
                 body,
             } => {
-                let request_fingerprint =
-                    create_fingerprint(&caller, &body).map_err(MissionCommandError::internal)?;
+                let request_fingerprint = control_request_fingerprint(&MissionControlRequest::Create {
+                    request_id,
+                    idempotency_key: idempotency_key.clone(),
+                    body: body.clone(),
+                })
+                .map_err(MissionCommandError::internal)?;
                 let (mission, receipt) =
                     build_created_mission(&caller, body).map_err(MissionCommandError::internal)?;
                 let outcome = self
@@ -447,13 +451,19 @@ impl MissionService {
                         receipt,
                         MissionCreateIdempotency {
                             key: idempotency_key.clone(),
-                            request_fingerprint,
+                            request_fingerprint: request_fingerprint.clone(),
                         },
                     )
                     .map_err(map_state_error)?;
+                if outcome.replayed
+                    && !create_replay_authorized(&outcome.write.projection.mission, &caller)
+                {
+                    return Err(MissionCommandError::permission_denied());
+                }
                 let record = outcome.write.projection.mission;
-                MissionControlResult::create(request_id, idempotency_key, record)
-                    .map_err(MissionCommandError::internal)
+                Ok(MissionControlResult::create(request_id, idempotency_key, record)
+                    .map_err(MissionCommandError::internal)?
+                    .bind_request_fingerprint(request_fingerprint))
             }
             MissionControlRequest::Show { request_id, body } => {
                 let projection = self
@@ -622,20 +632,14 @@ fn build_created_mission(
     ))
 }
 
-fn create_fingerprint(
-    caller: &VerifiedSession,
-    body: &lanyte_mission::MissionCreateBody,
-) -> Result<String, String> {
-    hash_json(&serde_json::json!({
-        "operation": "mission.create",
-        "caller": {
-            "issuer": caller.issuer,
-            "subject": caller.subject,
-            "role": caller.role,
-            "scope": caller.scope,
-        },
-        "body": body,
-    }))
+fn control_request_fingerprint(request: &MissionControlRequest) -> Result<String, String> {
+    let value = serde_json::to_value(request).map_err(|err| err.to_string())?;
+    lanyte_mission::control_content_hash(&value)
+        .ok_or_else(|| "control request fingerprint is not computable".to_owned())
+}
+
+fn create_replay_authorized(mission: &MissionRecord, caller: &VerifiedSession) -> bool {
+    visible_to(mission, caller) && mission.initiator.subject == caller.subject
 }
 
 fn visible_to(mission: &MissionRecord, caller: &VerifiedSession) -> bool {
@@ -834,15 +838,30 @@ mod tests {
         assert_eq!(created.operating_role.role, "operator");
         assert_eq!(created.supervisor.kind, PrincipalKind::Service);
 
-        let replayed = created_record(
-            service
-                .handle(
-                    create_request(Uuid::new_v4(), "create:persistent"),
-                    Some("renewed-session-secret"),
-                )
-                .expect("idempotent replay after attestation renewal"),
+        let replay_request = create_request(Uuid::new_v4(), "create:persistent");
+        let replayed_result = service
+            .handle(replay_request.clone(), Some("renewed-session-secret"))
+            .expect("idempotent replay after attestation renewal");
+        let expected_fp = lanyte_mission::control_content_hash(
+            &serde_json::to_value(&replay_request).expect("encode request"),
+        )
+        .expect("canonical fingerprint");
+        let encoded = serde_json::to_value(&replayed_result).expect("encode result");
+        assert_eq!(
+            encoded["request_fingerprint"].as_str(),
+            Some(expected_fp.as_str())
         );
+        let replayed = created_record(replayed_result);
         assert_eq!(replayed.mission_id, created.mission_id);
+
+        let denied = service
+            .handle(
+                create_request(Uuid::new_v4(), "create:persistent"),
+                Some("other-session-secret"),
+            )
+            .expect_err("different principal must not replay");
+        assert_eq!(denied.code, MissionCommandErrorCode::PermissionDenied);
+        assert!(!denied.message.contains("conflicts"));
 
         let list = service
             .handle(
