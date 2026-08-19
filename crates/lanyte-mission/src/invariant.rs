@@ -646,7 +646,15 @@ pub fn validate_history(
     mission: &MissionRecord,
     events: &[LifecycleEvent],
 ) -> Result<(), InvariantError> {
-    let semantic = crate::wave3::validate_wave3_semantics(mission, events);
+    validate_history_with_control(mission, events, &[])
+}
+
+pub fn validate_history_with_control(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+    records: &[crate::ControlBinding],
+) -> Result<(), InvariantError> {
+    let semantic = crate::wave3::validate_wave3_semantics_with_control(mission, events, records);
     let structural = validate_history_chain(mission, events);
     match semantic {
         Err(sem) => Err(sem),

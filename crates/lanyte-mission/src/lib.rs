@@ -15,7 +15,7 @@ mod wave3;
 
 pub use control::*;
 pub use driver::{DriverDescriptor, HarnessDriver, NormalizedHarnessEvent};
-pub use invariant::{validate_history, InvariantError, Validate};
+pub use invariant::{validate_history, validate_history_with_control, InvariantError, Validate};
 pub use model::*;
 pub use transition::{AttemptTransition, MissionTransition, TransitionError};
 pub use wave3::{

@@ -186,6 +186,7 @@ impl Orchestrator {
         event: &GatewayEvent,
         request: MissionControlRequest,
     ) -> Result<MissionControlResult, MissionCommandError> {
+        let fingerprint = mutation_fingerprint(&request)?;
         let MissionControlRequest::Launch {
             request_id,
             idempotency_key,
@@ -207,14 +208,6 @@ impl Orchestrator {
                 .client_auth_token
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
-        )?;
-        let fingerprint = mutation_fingerprint(
-            "mission.launch",
-            &caller,
-            &serde_json::json!({
-                "expected_revision": expected_revision,
-                "body": body,
-            }),
         )?;
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
         if let Some(replayed) = service.completed_mutation(&idempotency_key, &fingerprint)? {
@@ -527,6 +520,8 @@ impl Orchestrator {
         event: &GatewayEvent,
         request: MissionControlRequest,
     ) -> Result<MissionControlResult, MissionCommandError> {
+        let fingerprint = mutation_fingerprint(&request)?;
+        let control_request = request.clone();
         let MissionControlRequest::Cancel {
             request_id,
             idempotency_key,
@@ -548,14 +543,6 @@ impl Orchestrator {
                 .client_auth_token
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
-        )?;
-        let fingerprint = mutation_fingerprint(
-            "mission.cancel",
-            &caller,
-            &serde_json::json!({
-                "expected_revision": expected_revision,
-                "mission_id": body.mission_id,
-            }),
         )?;
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
         if let Some(replayed) = service.completed_mutation(&idempotency_key, &fingerprint)? {
@@ -683,6 +670,7 @@ impl Orchestrator {
                 record: Box::new(mission.clone()),
                 progress,
             };
+            attach_cancel_control(&mut receipts, &control_request, &result)?;
             service.persist_update_events(
                 expected_revision,
                 mission,
@@ -743,7 +731,7 @@ impl Orchestrator {
             {
                 live.state = AttemptState::Cancelling;
             }
-            let receipts = chain_receipts(
+            let mut receipts = chain_receipts(
                 &history,
                 &cancelling,
                 &caller,
@@ -771,6 +759,18 @@ impl Orchestrator {
                 ],
                 None,
             )?;
+            let snapshot = MissionControlResult::Cancel {
+                request_id,
+                idempotency_key: idempotency_key.clone(),
+                expected_revision,
+                record: Box::new(cancelling.clone()),
+                progress: CancelProgress {
+                    requested: true,
+                    protocol: None,
+                    fallback: None,
+                },
+            };
+            attach_cancel_control(&mut receipts, &control_request, &snapshot)?;
             service.persist_update_events(
                 expected_revision,
                 cancelling.clone(),
@@ -1012,6 +1012,7 @@ impl Orchestrator {
             progress,
         };
         let complete = mission.phase == MissionPhase::Cancelled;
+        attach_cancel_control(&mut receipts, &control_request, &result)?;
         service.persist_update_events(
             cancelling.revision,
             mission,
@@ -1730,6 +1731,7 @@ impl Orchestrator {
         event: &GatewayEvent,
         request: MissionControlRequest,
     ) -> Result<MissionControlResult, MissionCommandError> {
+        let fingerprint = mutation_fingerprint(&request)?;
         let MissionControlRequest::Close {
             request_id,
             idempotency_key,
@@ -1751,14 +1753,6 @@ impl Orchestrator {
                 .client_auth_token
                 .as_ref()
                 .map(lanyte_gateway::ClientAuthToken::expose),
-        )?;
-        let fingerprint = mutation_fingerprint(
-            "mission.close",
-            &caller,
-            &serde_json::json!({
-                "expected_revision": expected_revision,
-                "mission_id": body.mission_id,
-            }),
         )?;
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
         if let Some(replayed) = service.completed_mutation(&idempotency_key, &fingerprint)? {
@@ -2102,6 +2096,8 @@ fn chain_receipts_from(
             kernel_evidence
                 .map(str::to_owned)
                 .or_else(|| Some(format!("lifecycle/{event_id}")))
+        } else if matches!(payload, LifecyclePayload::CancelRequested { .. }) {
+            Some(format!("control/cancel/{event_id}"))
         } else {
             trust_ref.map(str::to_owned)
         };
@@ -2144,6 +2140,7 @@ fn chain_receipts_from(
                 ..AuditEnvelopeRef::default()
             },
             verification: None,
+            control_binding: None,
         });
     }
     Ok(receipts)
@@ -2369,23 +2366,35 @@ fn pending_cancel_idempotency(
     }
 }
 
-fn mutation_fingerprint(
-    operation: &str,
-    caller: &crate::mission::VerifiedSession,
-    body: &serde_json::Value,
-) -> Result<String, MissionCommandError> {
-    let encoded = serde_json::to_string(&serde_json::json!({
-        "operation": operation,
-        "caller": {
-            "issuer": caller.issuer,
-            "subject": caller.subject,
-            "role": caller.role,
-            "scope": caller.scope,
-        },
-        "body": body,
-    }))
-    .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-    Ok(format!("{:x}", Sha256::digest(encoded.as_bytes())))
+fn mutation_fingerprint(request: &MissionControlRequest) -> Result<String, MissionCommandError> {
+    let value = serde_json::to_value(request)
+        .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+    lanyte_mission::control_content_hash(&value).ok_or_else(|| {
+        MissionCommandError::internal("control request fingerprint is not computable")
+    })
+}
+
+fn attach_cancel_control(
+    receipts: &mut [NewMissionProjectionReceipt],
+    request: &MissionControlRequest,
+    result: &MissionControlResult,
+) -> Result<(), MissionCommandError> {
+    for receipt in receipts.iter_mut() {
+        if !matches!(
+            receipt.event.payload,
+            LifecyclePayload::CancelRequested { .. }
+        ) {
+            continue;
+        }
+        let evidence = receipt.event.source.evidence_ref.clone().ok_or_else(|| {
+            MissionCommandError::internal("cancel_requested missing evidence_ref")
+        })?;
+        receipt.control_binding = Some(
+            lanyte_mission::ControlBinding::from_envelopes(request, result, evidence)
+                .map_err(MissionCommandError::internal)?,
+        );
+    }
+    Ok(())
 }
 
 struct CloseDisposition {
@@ -2794,7 +2803,11 @@ mod close_disposition_tests {
         let history = service
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
-        lanyte_mission::validate_history(&finished, &history).expect("history must validate");
+        let records = service
+            .control_bindings(&created.mission_id.to_string())
+            .expect("control bindings");
+        lanyte_mission::validate_history_with_control(&finished, &history, &records)
+            .expect("history must validate");
         assert_eq!(history[0].previous_entry_hash, None);
         for (index, event) in history.iter().enumerate() {
             assert_eq!(event.sequence, u64::try_from(index + 1).unwrap());
@@ -2923,7 +2936,11 @@ mod close_disposition_tests {
         let history = service
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
-        lanyte_mission::validate_history(&record, &history).expect("history must validate");
+        let records = service
+            .control_bindings(&created.mission_id.to_string())
+            .expect("control bindings");
+        lanyte_mission::validate_history_with_control(&record, &history, &records)
+            .expect("history must validate");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2956,7 +2973,11 @@ mod close_disposition_tests {
         let history = service
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
-        lanyte_mission::validate_history(&after_expire, &history).expect("history must validate");
+        let records = service
+            .control_bindings(&created.mission_id.to_string())
+            .expect("control bindings");
+        lanyte_mission::validate_history_with_control(&after_expire, &history, &records)
+            .expect("history must validate");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3012,7 +3033,11 @@ mod close_disposition_tests {
         let history = service
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
-        lanyte_mission::validate_history(&record, &history).expect("history must validate");
+        let records = service
+            .control_bindings(&created.mission_id.to_string())
+            .expect("control bindings");
+        lanyte_mission::validate_history_with_control(&record, &history, &records)
+            .expect("history must validate");
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
     }

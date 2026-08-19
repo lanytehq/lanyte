@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use lanyte_mission::{
-    semantic_violation_codes_for_fixture, validate_history, ControlBinding, DriverCapabilityReport,
-    LifecycleEvent, MissionRecord,
+    semantic_violation_codes_for_fixture, validate_history_with_control, ControlBinding,
+    DriverCapabilityReport, LifecycleEvent, MissionRecord,
 };
 use serde::Deserialize;
 
@@ -66,7 +66,11 @@ fn conforming_v0_1_histories_validate() {
     for name in &manifest.conforming {
         match load_history(&dir.join(name)) {
             Ok(fixture) => {
-                if let Err(err) = validate_history(&fixture.mission, &fixture.events) {
+                if let Err(err) = validate_history_with_control(
+                    &fixture.mission,
+                    &fixture.events,
+                    &fixture.control_records,
+                ) {
                     failures.push(format!("{name}: {err}"));
                 }
                 let codes = semantic_violation_codes_for_fixture(
@@ -114,12 +118,74 @@ fn negative_v0_1_histories_reject_with_declared_sem() {
                     failures.push(format!("{name}: wanted {expected}, got {codes:?}"));
                 }
             }
-            Err(_) => {}
+            Err(err) => {
+                if expected.starts_with("SEM-M")
+                    || expected.starts_with("SEM-T")
+                    || expected == "SEM-A02"
+                    || expected == "SEM-A03"
+                    || expected == "SEM-A01"
+                    || expected == "SEM-A04"
+                    || expected == "SEM-D03"
+                {
+                    continue;
+                }
+                failures.push(format!("{name}: parse {err}"));
+            }
         }
     }
     assert!(
         failures.is_empty(),
         "negative fixtures failed:\n{}",
         failures.join("\n")
+    );
+}
+
+#[test]
+fn cancel_requested_without_binding_is_sem_a05() {
+    let fixture = load_history(&fixtures_root().join("conforming/protocol-confirmed-cancel.json"))
+        .expect("conforming cancel fixture");
+    let codes = semantic_violation_codes_for_fixture(
+        &fixture.mission,
+        &fixture.events,
+        &[],
+        &fixture.driver_capabilities,
+    );
+    assert!(
+        codes.contains(&"SEM-A05"),
+        "cancel without binding must be SEM-A05, got {codes:?}"
+    );
+}
+
+#[test]
+fn rehashed_unknown_field_and_wrong_schema_are_sem_a05() {
+    let fixture = load_history(&fixtures_root().join("conforming/protocol-confirmed-cancel.json"))
+        .expect("conforming cancel fixture");
+
+    let mut unknown = fixture.control_records.clone();
+    unknown[0].request["spoofed_identity"] = serde_json::json!("nope");
+    if let Some(hash) = lanyte_mission::control_content_hash(&unknown[0].request) {
+        unknown[0].request["request_fingerprint"] = serde_json::json!(hash);
+        unknown[0].request_fingerprint = hash;
+    }
+    let unknown_codes =
+        semantic_violation_codes_for_fixture(&fixture.mission, &fixture.events, &unknown, &[]);
+    assert!(
+        unknown_codes.contains(&"SEM-A05"),
+        "unknown field must be SEM-A05, got {unknown_codes:?}"
+    );
+
+    let mut wrong_schema = fixture.control_records;
+    wrong_schema[0].request["control_schema"] = serde_json::json!(
+        "https://schemas.3leaps.dev/agentic/mission/v0.1/not-control.schema.json"
+    );
+    if let Some(hash) = lanyte_mission::control_content_hash(&wrong_schema[0].request) {
+        wrong_schema[0].request["request_fingerprint"] = serde_json::json!(hash);
+        wrong_schema[0].request_fingerprint = hash;
+    }
+    let schema_codes =
+        semantic_violation_codes_for_fixture(&fixture.mission, &fixture.events, &wrong_schema, &[]);
+    assert!(
+        schema_codes.contains(&"SEM-A05"),
+        "wrong schema pin must be SEM-A05, got {schema_codes:?}"
     );
 }

@@ -267,7 +267,13 @@ impl MissionService {
         }
         let mut history = self.lifecycle_history(&mission.mission_id.to_string())?;
         history.extend(receipts.iter().map(|receipt| receipt.event.clone()));
-        lanyte_mission::validate_history(&mission, &history)
+        let mut records = self.control_bindings(&mission.mission_id.to_string())?;
+        records.extend(
+            receipts
+                .iter()
+                .filter_map(|receipt| receipt.control_binding.clone()),
+        );
+        lanyte_mission::validate_history_with_control(&mission, &history, &records)
             .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         if mission.phase.is_terminal()
             && self
@@ -304,6 +310,17 @@ impl MissionService {
             .into_iter()
             .map(|projection| projection.mission)
             .collect())
+    }
+
+    pub(crate) fn control_bindings(
+        &self,
+        mission_id: &str,
+    ) -> Result<Vec<lanyte_mission::ControlBinding>, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .control_bindings(mission_id)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))
     }
 
     pub(crate) fn lifecycle_history(
@@ -600,6 +617,7 @@ fn build_created_mission(
                 "verification_policy_sha256": caller.verification_policy_sha256,
                 "verified_at": now.to_rfc3339_opts(SecondsFormat::Millis, true),
             })),
+            control_binding: None,
         },
     ))
 }

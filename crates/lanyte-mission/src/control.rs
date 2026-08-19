@@ -3,7 +3,8 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::{Uuid, Version};
 
 use crate::{MissionPhase, MissionRecord, NormalizedHarnessEvent, RecoveryPolicy, Validate};
@@ -342,7 +343,7 @@ impl Serialize for MissionControlRequest {
     where
         S: Serializer,
     {
-        let value = match self {
+        let mut value = match self {
             Self::Create {
                 request_id,
                 idempotency_key,
@@ -426,6 +427,16 @@ impl Serialize for MissionControlRequest {
                 "body": body,
             }),
         };
+        apply_request_control_fields(
+            &mut value,
+            matches!(
+                self,
+                Self::Create { .. }
+                    | Self::Launch { .. }
+                    | Self::Close { .. }
+                    | Self::Cancel { .. }
+            ),
+        );
         value.serialize(serializer)
     }
 }
@@ -445,6 +456,8 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
             expected_revision: Value,
             operation: String,
             body: Value,
+            request_fingerprint: Value,
+            original_result_hash: Value,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -456,6 +469,23 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
         if raw.kind != "request" {
             return Err(D::Error::custom("kind must be request"));
         }
+        let mutating = matches!(
+            raw.operation.as_str(),
+            "mission.create" | "mission.launch" | "mission.close" | "mission.cancel"
+        );
+        verify_raw_control_hashes(HashCheck {
+            mutating,
+            is_request: true,
+            request_fingerprint: &raw.request_fingerprint,
+            original_result_hash: &raw.original_result_hash,
+            request_id: raw.request_id.as_str(),
+            idempotency_key: raw.idempotency_key.clone(),
+            expected_revision: raw.expected_revision.clone(),
+            operation: raw.operation.as_str(),
+            body: raw.body.clone(),
+            control_schema: raw.control_schema.as_str(),
+        })
+        .map_err(D::Error::custom)?;
         let request_id = parse_canonical_uuid_v4::<D::Error>(&raw.request_id, "request_id")?;
         let request = match raw.operation.as_str() {
             "mission.create" => {
@@ -744,7 +774,7 @@ impl Serialize for MissionControlResult {
     where
         S: Serializer,
     {
-        let value = match self {
+        let mut value = match self {
             Self::Record {
                 request_id,
                 operation,
@@ -832,8 +862,421 @@ impl Serialize for MissionControlResult {
                 },
             }),
         };
+        let mutating = matches!(
+            self,
+            Self::Record {
+                operation: "mission.create" | "mission.launch",
+                ..
+            } | Self::Close { .. }
+                | Self::Cancel { .. }
+        );
+        apply_result_control_fields(&mut value, mutating, self);
         value.serialize(serializer)
     }
+}
+
+impl<'de> Deserialize<'de> for MissionControlResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            control_schema: String,
+            kind: String,
+            request_id: String,
+            idempotency_key: Value,
+            expected_revision: Value,
+            operation: String,
+            body: Value,
+            request_fingerprint: Value,
+            original_result_hash: Value,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.control_schema != MISSION_CONTROL_SCHEMA
+            && raw.control_schema != MISSION_CONTROL_SCHEMA_V0
+        {
+            return Err(D::Error::custom("unsupported control_schema"));
+        }
+        if raw.kind != "result" {
+            return Err(D::Error::custom("kind must be result"));
+        }
+        let mutating = matches!(
+            raw.operation.as_str(),
+            "mission.create" | "mission.launch" | "mission.close" | "mission.cancel"
+        );
+        verify_raw_control_hashes(HashCheck {
+            mutating,
+            is_request: false,
+            request_fingerprint: &raw.request_fingerprint,
+            original_result_hash: &raw.original_result_hash,
+            request_id: raw.request_id.as_str(),
+            idempotency_key: raw.idempotency_key.clone(),
+            expected_revision: raw.expected_revision.clone(),
+            operation: raw.operation.as_str(),
+            body: raw.body.clone(),
+            control_schema: raw.control_schema.as_str(),
+        })
+        .map_err(D::Error::custom)?;
+        let request_id = parse_canonical_uuid_v4::<D::Error>(&raw.request_id, "request_id")?;
+        match raw.operation.as_str() {
+            "mission.create" => {
+                require_null_revision(&raw.expected_revision)?;
+                let idempotency_key = raw
+                    .idempotency_key
+                    .as_str()
+                    .ok_or_else(|| {
+                        D::Error::custom("mission.create idempotency_key must be a string")
+                    })?
+                    .to_owned();
+                Self::create(request_id, idempotency_key, record_from_body(&raw.body)?)
+                    .map_err(D::Error::custom)
+            }
+            "mission.show" => {
+                require_null_revision(&raw.expected_revision)?;
+                if !raw.idempotency_key.is_null() {
+                    return Err(D::Error::custom(
+                        "mission.show idempotency_key must be null",
+                    ));
+                }
+                Self::show(request_id, record_from_body(&raw.body)?).map_err(D::Error::custom)
+            }
+            "mission.launch" => {
+                let expected_revision = require_revision(&raw.expected_revision)?;
+                let idempotency_key = raw
+                    .idempotency_key
+                    .as_str()
+                    .ok_or_else(|| {
+                        D::Error::custom("mission.launch idempotency_key must be a string")
+                    })?
+                    .to_owned();
+                Self::launch(
+                    request_id,
+                    idempotency_key,
+                    expected_revision,
+                    record_from_body(&raw.body)?,
+                )
+                .map_err(D::Error::custom)
+            }
+            "mission.list" => {
+                require_null_revision(&raw.expected_revision)?;
+                if !raw.idempotency_key.is_null() {
+                    return Err(D::Error::custom(
+                        "mission.list idempotency_key must be null",
+                    ));
+                }
+                let records = raw
+                    .body
+                    .get("records")
+                    .cloned()
+                    .ok_or_else(|| D::Error::custom("mission.list body.records is required"))?;
+                let records = serde_json::from_value(records).map_err(D::Error::custom)?;
+                let next_cursor = match raw.body.get("next_cursor") {
+                    Some(Value::Null) | None => None,
+                    Some(Value::String(value)) => Some(value.clone()),
+                    Some(_) => {
+                        return Err(D::Error::custom(
+                            "mission.list next_cursor must be a string or null",
+                        ));
+                    }
+                };
+                Self::list(request_id, records, next_cursor).map_err(D::Error::custom)
+            }
+            "mission.observe" => {
+                require_null_revision(&raw.expected_revision)?;
+                if !raw.idempotency_key.is_null() {
+                    return Err(D::Error::custom(
+                        "mission.observe idempotency_key must be null",
+                    ));
+                }
+                let mission_id = parse_canonical_uuid_v4::<D::Error>(
+                    raw.body
+                        .get("mission_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "mission_id",
+                )?;
+                let attempt_id = parse_canonical_uuid_v4::<D::Error>(
+                    raw.body
+                        .get("attempt_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "attempt_id",
+                )?;
+                let events =
+                    serde_json::from_value(raw.body.get("events").cloned().unwrap_or(Value::Null))
+                        .map_err(D::Error::custom)?;
+                Self::observe(request_id, mission_id, attempt_id, events).map_err(D::Error::custom)
+            }
+            "mission.close" => {
+                let expected_revision = require_revision(&raw.expected_revision)?;
+                let idempotency_key = raw
+                    .idempotency_key
+                    .as_str()
+                    .ok_or_else(|| {
+                        D::Error::custom("mission.close idempotency_key must be a string")
+                    })?
+                    .to_owned();
+                let mission_id = parse_canonical_uuid_v4::<D::Error>(
+                    raw.body
+                        .get("mission_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "mission_id",
+                )?;
+                let attempt_id = parse_canonical_uuid_v4::<D::Error>(
+                    raw.body
+                        .get("attempt_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    "attempt_id",
+                )?;
+                Self::close(
+                    request_id,
+                    idempotency_key,
+                    expected_revision,
+                    mission_id,
+                    attempt_id,
+                )
+                .map_err(D::Error::custom)
+            }
+            "mission.cancel" => {
+                let expected_revision = require_revision(&raw.expected_revision)?;
+                let idempotency_key = raw
+                    .idempotency_key
+                    .as_str()
+                    .ok_or_else(|| {
+                        D::Error::custom("mission.cancel idempotency_key must be a string")
+                    })?
+                    .to_owned();
+                let record = record_from_body(&raw.body)?;
+                let progress = serde_json::from_value(
+                    raw.body.get("progress").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(D::Error::custom)?;
+                record
+                    .validate()
+                    .map_err(|err| D::Error::custom(err.to_string()))?;
+                validate_idempotency_key(&idempotency_key).map_err(D::Error::custom)?;
+                Ok(Self::Cancel {
+                    request_id,
+                    idempotency_key,
+                    expected_revision,
+                    record: Box::new(record),
+                    progress,
+                })
+            }
+            _ => Err(D::Error::custom("unsupported mission operation")),
+        }
+    }
+}
+
+fn record_from_body<E>(body: &Value) -> Result<MissionRecord, E>
+where
+    E: serde::de::Error,
+{
+    serde_json::from_value(body.get("record").cloned().unwrap_or(Value::Null)).map_err(E::custom)
+}
+
+pub fn control_content_hash(value: &Value) -> Option<String> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+    let mut filtered = serde_json::Map::new();
+    for (key, item) in map {
+        if matches!(
+            key.as_str(),
+            "request_id" | "request_fingerprint" | "original_result_hash"
+        ) {
+            continue;
+        }
+        filtered.insert(key.clone(), item.clone());
+    }
+    let blob = serde_json::to_string(&canonical_control_value(&Value::Object(filtered))).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(blob.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn canonical_control_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_control_value(&map[&key]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_control_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn apply_request_control_fields(value: &mut Value, mutating: bool) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.remove("request_fingerprint");
+    obj.remove("original_result_hash");
+    if !mutating {
+        obj.insert("request_fingerprint".to_owned(), Value::Null);
+        obj.insert("original_result_hash".to_owned(), Value::Null);
+        return;
+    }
+    let fingerprint = control_content_hash(value).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("request_fingerprint".to_owned(), Value::String(fingerprint));
+        obj.insert("original_result_hash".to_owned(), Value::Null);
+    }
+}
+
+fn apply_result_control_fields(value: &mut Value, mutating: bool, result: &MissionControlResult) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.remove("request_fingerprint");
+    obj.remove("original_result_hash");
+    if !mutating {
+        obj.insert("request_fingerprint".to_owned(), Value::Null);
+        obj.insert("original_result_hash".to_owned(), Value::Null);
+        return;
+    }
+    let result_hash = control_content_hash(value).unwrap_or_default();
+    let request_fingerprint = reconstructed_request_fingerprint(result).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "request_fingerprint".to_owned(),
+            Value::String(request_fingerprint),
+        );
+        obj.insert(
+            "original_result_hash".to_owned(),
+            Value::String(result_hash),
+        );
+    }
+}
+
+fn reconstructed_request_fingerprint(result: &MissionControlResult) -> Option<String> {
+    let value = match result {
+        MissionControlResult::Record {
+            request_id,
+            operation,
+            idempotency_key,
+            expected_revision,
+            record,
+        } if matches!(*operation, "mission.create" | "mission.launch") => json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "request",
+            "request_id": request_id,
+            "idempotency_key": idempotency_key,
+            "expected_revision": expected_revision,
+            "operation": operation,
+            "body": if *operation == "mission.create" {
+                json!({
+                    "goal": record.goal,
+                    "policy_id": record.policy_id,
+                    "deadline_at": record.deadline_at,
+                    "recovery_policy": record.recovery_policy,
+                })
+            } else {
+                json!({
+                    "mission_id": record.mission_id,
+                    "workspace": record.harness_selection.as_ref().map(|item| item.workspace_ref.clone()).unwrap_or_default(),
+                    "binary": Value::Null,
+                })
+            }
+        }),
+        MissionControlResult::Close {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            mission_id,
+            ..
+        } => json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "request",
+            "request_id": request_id,
+            "idempotency_key": idempotency_key,
+            "expected_revision": expected_revision,
+            "operation": "mission.close",
+            "body": { "mission_id": mission_id },
+        }),
+        MissionControlResult::Cancel {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            record,
+            ..
+        } => json!({
+            "control_schema": MISSION_CONTROL_SCHEMA,
+            "kind": "request",
+            "request_id": request_id,
+            "idempotency_key": idempotency_key,
+            "expected_revision": expected_revision,
+            "operation": "mission.cancel",
+            "body": { "mission_id": record.mission_id },
+        }),
+        _ => return None,
+    };
+    control_content_hash(&value)
+}
+
+struct HashCheck<'a> {
+    mutating: bool,
+    is_request: bool,
+    request_fingerprint: &'a Value,
+    original_result_hash: &'a Value,
+    request_id: &'a str,
+    idempotency_key: Value,
+    expected_revision: Value,
+    operation: &'a str,
+    body: Value,
+    control_schema: &'a str,
+}
+
+fn verify_raw_control_hashes(check: HashCheck<'_>) -> Result<(), String> {
+    let envelope = json!({
+        "control_schema": check.control_schema,
+        "kind": if check.is_request { "request" } else { "result" },
+        "request_id": check.request_id,
+        "idempotency_key": check.idempotency_key,
+        "expected_revision": check.expected_revision,
+        "operation": check.operation,
+        "body": check.body,
+    });
+    if !check.mutating {
+        if !check.request_fingerprint.is_null() || !check.original_result_hash.is_null() {
+            return Err("non-mutating control hashes must be null".to_owned());
+        }
+        return Ok(());
+    }
+    if check.is_request {
+        if !check.original_result_hash.is_null() {
+            return Err("mutating request original_result_hash must be null".to_owned());
+        }
+        let expected = control_content_hash(&envelope)
+            .ok_or_else(|| "mutating request fingerprint is not computable".to_owned())?;
+        if check.request_fingerprint.as_str() != Some(expected.as_str()) {
+            return Err("mutating request_fingerprint does not match canonical bytes".to_owned());
+        }
+        return Ok(());
+    }
+    let expected = control_content_hash(&envelope)
+        .ok_or_else(|| "mutating result hash is not computable".to_owned())?;
+    if check.original_result_hash.as_str() != Some(expected.as_str()) {
+        return Err("mutating original_result_hash does not match canonical bytes".to_owned());
+    }
+    if check
+        .request_fingerprint
+        .as_str()
+        .is_none_or(|value| value.len() != 64)
+    {
+        return Err("mutating result request_fingerprint must be a SHA-256 hex digest".to_owned());
+    }
+    Ok(())
 }
 
 fn require_null_revision<E>(value: &Value) -> Result<(), E>
@@ -1002,6 +1445,18 @@ mod tests {
 
     const REQUEST_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+    fn stamp_request_hashes(mut value: Value, mutating: bool) -> Value {
+        if mutating {
+            let fingerprint = control_content_hash(&value).expect("hash");
+            value["request_fingerprint"] = Value::String(fingerprint);
+            value["original_result_hash"] = Value::Null;
+        } else {
+            value["request_fingerprint"] = Value::Null;
+            value["original_result_hash"] = Value::Null;
+        }
+        value
+    }
+
     #[test]
     fn create_request_requires_explicit_null_revision_and_deadline() {
         let base = serde_json::json!({
@@ -1018,6 +1473,7 @@ mod tests {
                 "recovery_policy": "ask_operator"
             }
         });
+        let base = stamp_request_hashes(base, true);
         assert!(serde_json::from_value::<MissionControlRequest>(base.clone()).is_ok());
 
         let mut missing_revision = base.clone();
@@ -1046,6 +1502,7 @@ mod tests {
             "operation": "mission.show",
             "body": { "mission_id": REQUEST_ID }
         });
+        let noncanonical = stamp_request_hashes(noncanonical, false);
         assert!(serde_json::from_value::<MissionControlRequest>(noncanonical).is_err());
 
         let unknown = serde_json::json!({
@@ -1057,26 +1514,30 @@ mod tests {
             "operation": "mission.show",
             "body": { "mission_id": REQUEST_ID, "role": "spoofed" }
         });
+        let unknown = stamp_request_hashes(unknown, false);
         assert!(serde_json::from_value::<MissionControlRequest>(unknown).is_err());
     }
 
     #[test]
     fn create_request_enforces_timestamp_lexical_form() {
         let request = |deadline_at: &str| {
-            serde_json::json!({
-                "control_schema": MISSION_CONTROL_SCHEMA,
-                "kind": "request",
-                "request_id": REQUEST_ID,
-                "idempotency_key": "mission-create:11111111-1111-4111-8111-111111111111",
-                "expected_revision": null,
-                "operation": "mission.create",
-                "body": {
-                    "goal": "persist a mission",
-                    "policy_id": "code-only",
-                    "deadline_at": deadline_at,
-                    "recovery_policy": "ask_operator"
-                }
-            })
+            stamp_request_hashes(
+                serde_json::json!({
+                    "control_schema": MISSION_CONTROL_SCHEMA,
+                    "kind": "request",
+                    "request_id": REQUEST_ID,
+                    "idempotency_key": "mission-create:11111111-1111-4111-8111-111111111111",
+                    "expected_revision": null,
+                    "operation": "mission.create",
+                    "body": {
+                        "goal": "persist a mission",
+                        "policy_id": "code-only",
+                        "deadline_at": deadline_at,
+                        "recovery_policy": "ask_operator"
+                    }
+                }),
+                true,
+            )
         };
 
         assert!(serde_json::from_value::<MissionControlRequest>(request(
@@ -1111,6 +1572,7 @@ mod tests {
                 "binary": null
             }
         });
+        let launch = stamp_request_hashes(launch, true);
         let parsed = serde_json::from_value::<MissionControlRequest>(launch.clone()).unwrap();
         assert_eq!(parsed.operation(), "mission.launch");
         assert_eq!(serde_json::to_value(&parsed).unwrap(), launch);
@@ -1124,6 +1586,7 @@ mod tests {
             "operation": "mission.observe",
             "body": { "mission_id": REQUEST_ID }
         });
+        let observe = stamp_request_hashes(observe, false);
         assert_eq!(
             serde_json::from_value::<MissionControlRequest>(observe)
                 .unwrap()
@@ -1140,11 +1603,42 @@ mod tests {
             "operation": "mission.close",
             "body": { "mission_id": REQUEST_ID }
         });
+        let close = stamp_request_hashes(close, true);
         assert_eq!(
             serde_json::from_value::<MissionControlRequest>(close)
                 .unwrap()
                 .operation(),
             "mission.close"
         );
+    }
+
+    #[test]
+    fn cancel_request_and_result_round_trip_hashes() {
+        let request = stamp_request_hashes(
+            serde_json::json!({
+                "control_schema": MISSION_CONTROL_SCHEMA,
+                "kind": "request",
+                "request_id": "44444444-4444-4444-8444-444444444444",
+                "idempotency_key": "mission-cancel-example-0001",
+                "expected_revision": 1,
+                "operation": "mission.cancel",
+                "body": { "mission_id": REQUEST_ID }
+            }),
+            true,
+        );
+        let parsed = serde_json::from_value::<MissionControlRequest>(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), request);
+
+        let mut extra = request.clone();
+        extra["spoofed_identity"] = Value::String("nope".to_owned());
+        extra = stamp_request_hashes(extra, true);
+        assert!(serde_json::from_value::<MissionControlRequest>(extra).is_err());
+
+        let mut wrong_schema = request;
+        wrong_schema["control_schema"] = Value::String(
+            "https://schemas.3leaps.dev/agentic/mission/v0.1/not-control.schema.json".to_owned(),
+        );
+        wrong_schema = stamp_request_hashes(wrong_schema, true);
+        assert!(serde_json::from_value::<MissionControlRequest>(wrong_schema).is_err());
     }
 }

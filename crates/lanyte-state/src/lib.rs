@@ -13,8 +13,8 @@ use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
 use lanyte_common::env as common_env;
 use lanyte_mission::{
-    validate_history, EventSourceKind, LifecycleEvent, LifecyclePayload, MissionPhase,
-    MissionRecord, Validate,
+    validate_history, validate_history_with_control, ControlBinding, EventSourceKind,
+    LifecycleEvent, LifecyclePayload, MissionPhase, MissionRecord, Validate,
 };
 use lanyte_telemetry::{
     genesis_prev_hash, AuditEnvelopeRef, AuditRecord, AuditRecordKind, AuditSeverity,
@@ -53,6 +53,10 @@ const MIGRATION_006: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/006_mission_mutations.sql"
 ));
+const MIGRATION_007: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/007_mission_control_bindings.sql"
+));
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
     (2, MIGRATION_002),
@@ -60,6 +64,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, MIGRATION_004),
     (5, MIGRATION_005),
     (6, MIGRATION_006),
+    (7, MIGRATION_007),
 ];
 
 const HOT_TIER_DIR: &str = "hot";
@@ -237,6 +242,7 @@ pub struct NewMissionProjectionReceipt {
     pub event: LifecycleEvent,
     pub envelope: AuditEnvelopeRef,
     pub verification: Option<serde_json::Value>,
+    pub control_binding: Option<ControlBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -516,6 +522,20 @@ impl StateStore {
             .map_err(Into::into)
     }
 
+    pub fn control_bindings(&self, mission_id: &str) -> Result<Vec<ControlBinding>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT evidence_ref, operation, idempotency_key, request_fingerprint, \
+             original_result_hash, request_json, result_json \
+             FROM mission_control_bindings WHERE mission_id = ?1",
+        )?;
+        let rows = stmt.query_map([mission_id], control_binding_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
     pub fn age_mutation_reservation(&mut self, key: &str) -> Result<()> {
         let aged = Utc::now() - chrono::Duration::seconds(61);
         let updated = self.connection.execute(
@@ -698,7 +718,13 @@ impl StateStore {
 
         let mut history = load_lifecycle_history_tx(&tx, &mission_id)?;
         history.extend(receipts.iter().map(|receipt| receipt.event.clone()));
-        validate_history(&mission, &history)
+        let mut records = load_control_bindings_tx(&tx, &mission_id)?;
+        records.extend(
+            receipts
+                .iter()
+                .filter_map(|receipt| receipt.control_binding.clone()),
+        );
+        validate_history_with_control(&mission, &history, &records)
             .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
 
         let updated = tx.execute(
@@ -734,6 +760,9 @@ impl StateStore {
 
         let mut last_audit = None;
         for receipt in receipts {
+            if let Some(binding) = &receipt.control_binding {
+                persist_control_binding_tx(&tx, &mission_id, binding)?;
+            }
             let event_json = serde_json::to_value(&receipt.event)
                 .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
             let audit_input = NewAuditRecord {
@@ -1508,6 +1537,68 @@ fn validate_projection_receipt_binding(
     Ok(())
 }
 
+fn load_control_bindings_tx(tx: &Transaction<'_>, mission_id: &str) -> Result<Vec<ControlBinding>> {
+    let mut stmt = tx.prepare(
+        "SELECT evidence_ref, operation, idempotency_key, request_fingerprint, \
+         original_result_hash, request_json, result_json \
+         FROM mission_control_bindings WHERE mission_id = ?1",
+    )?;
+    let rows = stmt.query_map([mission_id], control_binding_from_row)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
+fn persist_control_binding_tx(
+    tx: &Transaction<'_>,
+    mission_id: &str,
+    binding: &ControlBinding,
+) -> Result<()> {
+    let request_json = serde_json::to_string(&binding.request)
+        .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+    let result_json = serde_json::to_string(&binding.result)
+        .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO mission_control_bindings(\
+             evidence_ref, mission_id, operation, idempotency_key, request_fingerprint, \
+             original_result_hash, request_json, result_json\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &binding.evidence_ref,
+            mission_id,
+            &binding.operation,
+            &binding.idempotency_key,
+            &binding.request_fingerprint,
+            &binding.original_result_hash,
+            request_json,
+            result_json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn control_binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlBinding> {
+    let request_json: String = row.get(5)?;
+    let result_json: String = row.get(6)?;
+    let request = serde_json::from_str(&request_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let result = serde_json::from_str(&result_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(ControlBinding {
+        evidence_ref: row.get(0)?,
+        operation: row.get(1)?,
+        idempotency_key: row.get(2)?,
+        request_fingerprint: row.get(3)?,
+        original_result_hash: row.get(4)?,
+        request,
+        result,
+    })
+}
+
 fn load_lifecycle_history_tx(
     tx: &Transaction<'_>,
     mission_id: &str,
@@ -2194,6 +2285,7 @@ mod tests {
                 ..AuditEnvelopeRef::default()
             },
             verification: None,
+            control_binding: None,
         }
     }
 
@@ -2232,6 +2324,7 @@ mod tests {
                 ..AuditEnvelopeRef::default()
             },
             verification: None,
+            control_binding: None,
         }
     }
 
@@ -2287,7 +2380,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store should open");
 
         assert!(paths.hot_db_path().exists());
-        assert_eq!(store.schema_version().expect("schema version query"), 6);
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
     }
 
     #[test]
@@ -2296,10 +2389,10 @@ mod tests {
         let paths = StatePaths::new(&root);
 
         let store_a = StateStore::open(paths.clone()).expect("state store should open");
-        assert_eq!(store_a.schema_version().expect("schema version query"), 6);
+        assert_eq!(store_a.schema_version().expect("schema version query"), 7);
 
         let store_b = StateStore::open(paths).expect("state store should open again");
-        assert_eq!(store_b.schema_version().expect("schema version query"), 6);
+        assert_eq!(store_b.schema_version().expect("schema version query"), 7);
     }
 
     #[test]
@@ -2319,7 +2412,7 @@ mod tests {
         drop(connection);
 
         let mut store = StateStore::open(paths).expect("version-three store should upgrade");
-        assert_eq!(store.schema_version().expect("schema version query"), 6);
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
         store
             .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
             .expect("upgraded store should persist missions");
@@ -2342,7 +2435,7 @@ mod tests {
         drop(connection);
 
         let mut store = StateStore::open(paths).expect("version-four store should upgrade");
-        assert_eq!(store.schema_version().expect("schema version query"), 6);
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
         store
             .create_mission_idempotent(
                 created_mission(),
@@ -2353,6 +2446,30 @@ mod tests {
                 },
             )
             .expect("upgraded store should persist idempotent missions");
+    }
+
+    #[test]
+    fn version_six_store_upgrades_to_control_binding_schema() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        drop(StateStore::open(paths.clone()).expect("state store should open"));
+
+        let connection =
+            Connection::open(paths.hot_db_path()).expect("database should reopen directly");
+        connection
+            .execute_batch(
+                "DROP TABLE mission_control_bindings; \
+                 UPDATE state_metadata SET value = 6 WHERE key = 'schema_version';",
+            )
+            .expect("version-six fixture should prepare");
+        drop(connection);
+
+        let store = StateStore::open(paths).expect("version-six store should upgrade");
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
+        assert!(store
+            .control_bindings(TEST_SESSION_ID)
+            .expect("control bindings query")
+            .is_empty());
     }
 
     #[test]

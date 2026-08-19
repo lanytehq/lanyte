@@ -2,16 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{Duration, Utc};
-use serde::Deserialize;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-
 use crate::{
     AttemptState, AttemptStateCause, EventSourceKind, FallbackCancelOutcome, InvariantError,
     LeaseTickKind, LifecycleEvent, LifecyclePayload, MissionPhase, MissionRecord,
     ObservationSource, Principal, ProtocolCancelOutcome,
 };
+use chrono::{Duration, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const MUTATING_OPERATIONS: &[&str] = &[
     "mission.create",
@@ -20,7 +18,8 @@ const MUTATING_OPERATIONS: &[&str] = &[
     "mission.cancel",
 ];
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlBinding {
     pub operation: String,
     pub idempotency_key: String,
@@ -29,6 +28,41 @@ pub struct ControlBinding {
     pub evidence_ref: String,
     pub request: Value,
     pub result: Value,
+}
+
+impl ControlBinding {
+    pub fn from_envelopes(
+        request: &crate::MissionControlRequest,
+        result: &crate::MissionControlResult,
+        evidence_ref: impl Into<String>,
+    ) -> Result<Self, String> {
+        let request_value = serde_json::to_value(request).map_err(|err| err.to_string())?;
+        let result_value = serde_json::to_value(result).map_err(|err| err.to_string())?;
+        let idempotency_key = request_value
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "control request missing idempotency_key".to_owned())?
+            .to_owned();
+        let request_fingerprint = request_value
+            .get("request_fingerprint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "control request missing request_fingerprint".to_owned())?
+            .to_owned();
+        let original_result_hash = result_value
+            .get("original_result_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "control result missing original_result_hash".to_owned())?
+            .to_owned();
+        Ok(Self {
+            operation: request.operation().to_owned(),
+            idempotency_key,
+            request_fingerprint,
+            original_result_hash,
+            evidence_ref: evidence_ref.into(),
+            request: request_value,
+            result: result_value,
+        })
+    }
 }
 
 type Fence = (uuid::Uuid, u64, u64);
@@ -70,11 +104,15 @@ pub fn semantic_violation_codes_for_fixture(
     violations.into_iter().map(|err| err.field).collect()
 }
 
-pub(crate) fn validate_wave3_semantics(
+pub(crate) fn validate_wave3_semantics_with_control(
     mission: &MissionRecord,
     events: &[LifecycleEvent],
+    records: &[ControlBinding],
 ) -> Result<(), InvariantError> {
-    match wave3_violations(mission, events, &[]).into_iter().next() {
+    match wave3_violations(mission, events, records)
+        .into_iter()
+        .next()
+    {
         Some(err) => Err(err),
         None => Ok(()),
     }
@@ -870,15 +908,22 @@ fn check_control_bindings(
     records: &[ControlBinding],
     violations: &mut Vec<InvariantError>,
 ) {
-    if records.is_empty() {
-        return;
-    }
     let mut fingerprints_by_key: HashMap<String, HashSet<String>> = HashMap::new();
     let mut results_by_key_fp: HashMap<(String, String), HashSet<String>> = HashMap::new();
     let mut cancel_evidence: HashSet<String> = HashSet::new();
     for record in records {
-        let request_hash = control_content_hash(&record.request);
-        let result_hash = control_content_hash(&record.result);
+        if serde_json::from_value::<crate::MissionControlRequest>(record.request.clone()).is_err()
+            || serde_json::from_value::<crate::MissionControlResult>(record.result.clone()).is_err()
+        {
+            note(
+                violations,
+                "SEM-A05",
+                "embedded control request and result must be schema-equivalent envelopes",
+            );
+            continue;
+        }
+        let request_hash = crate::control_content_hash(&record.request);
+        let result_hash = crate::control_content_hash(&record.result);
         let request_id = record.request.get("request_id").and_then(Value::as_str);
         let result_id = record.result.get("request_id").and_then(Value::as_str);
         let request_op = record.request.get("operation").and_then(Value::as_str);
@@ -1015,42 +1060,6 @@ fn result_control_mission_id(result: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-}
-
-fn control_content_hash(value: &Value) -> Option<String> {
-    let Value::Object(map) = value else {
-        return None;
-    };
-    let mut filtered = serde_json::Map::new();
-    for (key, item) in map {
-        if matches!(
-            key.as_str(),
-            "request_id" | "request_fingerprint" | "original_result_hash"
-        ) {
-            continue;
-        }
-        filtered.insert(key.clone(), item.clone());
-    }
-    let blob = serde_json::to_string(&canonical_value(&Value::Object(filtered))).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(blob.as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-fn canonical_value(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<_> = map.keys().cloned().collect();
-            keys.sort();
-            let mut sorted = serde_json::Map::new();
-            for key in keys {
-                sorted.insert(key.clone(), canonical_value(&map[&key]));
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
-        other => other.clone(),
-    }
 }
 
 fn check_live_lease(
