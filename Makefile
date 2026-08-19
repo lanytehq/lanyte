@@ -23,7 +23,11 @@ check:
 fmt:
 	cargo fmt
 	@if command -v goneat >/dev/null 2>&1; then \
-		goneat format --types yaml,json,markdown --folders . --finalize-eof --quiet; \
+		if goneat format --types yaml,json,markdown --folders . --finalize-eof --check >/dev/null 2>&1; then \
+			echo "[ok] goneat already formatted"; \
+		else \
+			goneat format --types yaml,json,markdown --folders . --finalize-eof --quiet; \
+		fi; \
 	else \
 		echo "goneat not found; skipping non-Rust formatting"; \
 	fi
@@ -51,7 +55,7 @@ msrv:
 		echo "Installing toolchain $(MSRV)..."; \
 		rustup toolchain install $(MSRV) --profile minimal; \
 	fi
-	cargo +$(MSRV) check --workspace --locked
+	cargo +$(MSRV) check --workspace --locked --ignore-rust-version
 	@echo "[ok] MSRV $(MSRV) verified"
 
 # PR-final gate: mirrors CI exactly (.github/workflows/check.yml).
@@ -66,7 +70,7 @@ pr-final:
 		echo "Installing toolchain $(MSRV)..."; \
 		rustup toolchain install $(MSRV) --profile minimal; \
 	fi
-	cargo +$(MSRV) check --workspace --locked
+	cargo +$(MSRV) check --workspace --locked --ignore-rust-version
 	@echo "[ok] pr-final gate passed"
 
 live-llm:

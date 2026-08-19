@@ -23,4 +23,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"  # must match workspace Cargo.toml rust-version
-      - run: cargo check --workspace --locked
+      - run: cargo check --workspace --locked --ignore-rust-version

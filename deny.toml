@@ -2,7 +2,11 @@
 db-path = "~/.cargo/advisory-db"
 unmaintained = "workspace"
 yanked = "warn"
-ignore = []
+ignore = [
+    # sysprims-core pulls `time`; 0.3.47+ needs rustc 1.88. The advisory is RFC
+    # 2822 stack exhaustion on untrusted input, which this workspace does not parse.
+    "RUSTSEC-2026-0009",
+]
 
 [licenses]
 allow = [
