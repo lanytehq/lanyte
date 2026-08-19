@@ -734,6 +734,7 @@ impl Orchestrator {
         let now = Utc::now();
         let mut cancelling = before.clone();
         let request_persist_needed = !already_cancelling && !already_requested;
+        let mut accepted = None;
         if request_persist_needed {
             cancelling.revision = expected_revision + 1;
             cancelling.updated_at = now;
@@ -744,6 +745,63 @@ impl Orchestrator {
             {
                 live.state = AttemptState::Cancelling;
             }
+            let mut receipts = chain_receipts(
+                &history,
+                &cancelling,
+                &caller,
+                vec![
+                    (
+                        EventSourceKind::OperatorCommand,
+                        cancel_requested(
+                            &cancelling,
+                            Some(attempt_id),
+                            Some(attempt.generation),
+                            Some(lease_generation),
+                        )?,
+                    ),
+                    (
+                        EventSourceKind::OperatorCommand,
+                        LifecyclePayload::AttemptStateChanged {
+                            attempt_id,
+                            generation: attempt.generation,
+                            from: attempt.state,
+                            to: AttemptState::Cancelling,
+                            reason: Some("operator cancel".to_owned()),
+                            cause: Some(AttemptStateCause::OperatorCancel),
+                        },
+                    ),
+                ],
+                None,
+            )?;
+            let original = MissionControlResult::Cancel {
+                request_id,
+                idempotency_key: idempotency_key.clone(),
+                expected_revision,
+                record: Box::new(cancelling.clone()),
+                progress: CancelProgress {
+                    requested: true,
+                    protocol: None,
+                    fallback: None,
+                },
+                request_fingerprint: Some(fingerprint.clone()),
+            };
+            attach_cancel_control(&mut receipts, &control_request, &original)?;
+            service.persist_update_events(
+                expected_revision,
+                cancelling.clone(),
+                receipts,
+                Some(lanyte_state::MissionMutationIdempotency {
+                    key: idempotency_key.clone(),
+                    request_fingerprint: fingerprint.clone(),
+                    operation: "mission.cancel".to_owned(),
+                    result_json: serde_json::to_string(&original)
+                        .map_err(|err| MissionCommandError::internal(err.to_string()))?,
+                    owner_token: owner_token.clone(),
+                }),
+            )?;
+            reservation_guard.disarm();
+            service.crash_after_cancelling_persist()?;
+            accepted = Some(original);
         }
 
         let protocol = {
@@ -835,30 +893,7 @@ impl Orchestrator {
             interrupted = false;
             cleared = false;
         }
-        let mut evidence = Vec::new();
-        if request_persist_needed {
-            evidence.push((
-                EventSourceKind::OperatorCommand,
-                cancel_requested(
-                    &cancelling,
-                    Some(attempt_id),
-                    Some(attempt.generation),
-                    Some(lease_generation),
-                )?,
-            ));
-            evidence.push((
-                EventSourceKind::OperatorCommand,
-                LifecyclePayload::AttemptStateChanged {
-                    attempt_id,
-                    generation: attempt.generation,
-                    from: attempt.state,
-                    to: AttemptState::Cancelling,
-                    reason: Some("operator cancel".to_owned()),
-                    cause: Some(AttemptStateCause::OperatorCancel),
-                },
-            ));
-        }
-        evidence.push((
+        let mut evidence = vec![(
             EventSourceKind::DriverReported,
             LifecyclePayload::ProtocolCancelAttempted {
                 attempt_id,
@@ -868,7 +903,7 @@ impl Orchestrator {
                 turn_id: protocol_progress.turn_id.clone(),
                 outcome: protocol_progress.outcome.clone(),
             },
-        ));
+        )];
         if let Some(fallback_progress) = &fallback_progress {
             evidence.push((
                 EventSourceKind::KernelObserved,
@@ -883,9 +918,7 @@ impl Orchestrator {
 
         let now = Utc::now();
         let mut mission = cancelling.clone();
-        if !request_persist_needed {
-            mission.revision += 1;
-        }
+        mission.revision += 1;
         mission.updated_at = now;
         if let Some(live) = mission
             .attempts
@@ -983,40 +1016,20 @@ impl Orchestrator {
                 }
             }
         }
-        let progress = CancelProgress {
-            requested: true,
-            protocol: Some(protocol_progress),
-            fallback: fallback_progress,
-        };
-        let result = MissionControlResult::Cancel {
-            request_id,
-            idempotency_key: idempotency_key.clone(),
-            expected_revision,
-            record: Box::new(mission.clone()),
-            progress,
-            request_fingerprint: Some(fingerprint.clone()),
-        };
-        attach_cancel_control(&mut receipts, &control_request, &result)?;
-        service.persist_update_events(
-            if request_persist_needed {
-                expected_revision
-            } else {
-                cancelling.revision
-            },
-            mission,
-            receipts,
-            Some(lanyte_state::MissionMutationIdempotency {
-                key: idempotency_key,
-                request_fingerprint: fingerprint,
-                operation: "mission.cancel".to_owned(),
-                result_json: serde_json::to_string(&result)
-                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
-                owner_token,
-            }),
-        )?;
+        service.persist_update_events(cancelling.revision, mission, receipts, None)?;
         reservation_guard.disarm();
-        service.crash_after_cancelling_persist()?;
-        Ok(result)
+        Ok(accepted.unwrap_or_else(|| MissionControlResult::Cancel {
+            request_id,
+            idempotency_key,
+            expected_revision,
+            record: Box::new(cancelling),
+            progress: CancelProgress {
+                requested: true,
+                protocol: Some(protocol_progress),
+                fallback: fallback_progress,
+            },
+            request_fingerprint: Some(fingerprint),
+        }))
     }
 
     pub(super) async fn reconcile_restarts(&self) {
@@ -2886,23 +2899,28 @@ mod close_disposition_tests {
             panic!("expected cancel result");
         };
         assert!(progress.requested);
-        assert_eq!(
-            progress.protocol.as_ref().map(|item| item.outcome.clone()),
-            Some(lanyte_mission::ProtocolCancelOutcome::Interrupted)
-        );
-        assert_eq!(record.phase, MissionPhase::Cancelled);
-        assert_eq!(record.attempts[0].state, AttemptState::Cancelled);
-        assert_eq!(
-            record.attempts[0].harness_turn_id.as_deref(),
-            Some("turn_test")
-        );
+        assert!(progress.protocol.is_none());
+        assert_ne!(record.phase, MissionPhase::Cancelled);
+        let stored = service
+            .visible_mission(
+                &created.mission_id.to_string(),
+                &TestVerifier.verify("valid-session-secret").unwrap(),
+            )
+            .expect("stored");
         let history = service
             .lifecycle_history(&created.mission_id.to_string())
             .expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.payload,
+            LifecyclePayload::ProtocolCancelAttempted {
+                outcome: ProtocolCancelOutcome::Interrupted,
+                ..
+            }
+        )));
         let records = service
             .control_bindings(&created.mission_id.to_string())
             .expect("control bindings");
-        lanyte_mission::validate_history_with_control(&record, &history, &records)
+        lanyte_mission::validate_history_with_control(&stored, &history, &records)
             .expect("history must validate");
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
@@ -2947,18 +2965,19 @@ mod close_disposition_tests {
                 &TestVerifier.verify("valid-session-secret").unwrap(),
             )
             .expect("midway");
-        assert!(matches!(
-            midway.attempts[0].state,
-            AttemptState::Cancelling | AttemptState::Cancelled
-        ));
+        assert_eq!(midway.attempts[0].state, AttemptState::Cancelling);
+        let crash_history = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history after crash");
+        assert!(!crash_history.iter().any(|event| matches!(
+            event.payload,
+            LifecyclePayload::ProtocolCancelAttempted { .. }
+                | LifecyclePayload::ProcessTerminationAttempted { .. }
+        )));
         orchestrator.tick_leases().await;
-        let after_supervisor = service
-            .visible_mission(
-                &created.mission_id.to_string(),
-                &TestVerifier.verify("valid-session-secret").unwrap(),
-            )
-            .expect("after supervisor");
-        assert_eq!(after_supervisor.phase, MissionPhase::Cancelled);
+        let replay_history = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history before replay");
         let retried = orchestrator
             .cancel_mission(
                 &test_event(),
@@ -2971,7 +2990,11 @@ mod close_disposition_tests {
                 .expect("retry cancel"),
             )
             .await
-            .expect("exact replay after supervisor complete");
+            .expect("exact replay does not reissue effects");
+        let after_replay = service
+            .lifecycle_history(&created.mission_id.to_string())
+            .expect("history after replay");
+        assert_eq!(after_replay.len(), replay_history.len());
         let MissionControlResult::Cancel {
             request_id,
             expected_revision,
@@ -2983,7 +3006,7 @@ mod close_disposition_tests {
         };
         assert_eq!(request_id, original_id);
         assert_eq!(expected_revision, latest.revision);
-        assert_eq!(record.phase, MissionPhase::Cancelled);
+        assert_eq!(record.attempts[0].state, AttemptState::Cancelling);
         let _ = launched;
         let _ = std::fs::remove_dir_all(root);
     }
