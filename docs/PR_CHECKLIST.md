@@ -17,13 +17,13 @@ This target mirrors CI exactly. If it passes locally, CI should pass remotely.
 make pr-final
 ```
 
-The target runs, in order:
+The target runs, in order, on the workspace MSRV toolchain (currently 1.85.0), matching `.github/workflows/check.yml`:
 
-1. `cargo fmt --check` — formatting must already be applied
-2. `cargo clippy --workspace --all-targets -- -D warnings` — workspace-wide lint
-3. `cargo test --workspace --all-targets` — workspace-wide tests
-4. `cargo deny check` — license and advisory audit
-5. `cargo +$(MSRV) check --workspace --locked` — MSRV compatibility
+1. `cargo +$(MSRV) fmt --check`
+2. `cargo +$(MSRV) clippy --workspace --all-targets --ignore-rust-version -- -D warnings`
+3. `cargo +$(MSRV) test --workspace --all-targets --ignore-rust-version`
+4. `cargo deny check`
+5. `cargo +$(MSRV) check --workspace --locked --ignore-rust-version`
 
 ## Step-by-step procedure
 
