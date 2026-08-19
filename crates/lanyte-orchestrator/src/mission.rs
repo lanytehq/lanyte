@@ -440,6 +440,28 @@ impl MissionService {
                     body: body.clone(),
                 })
                 .map_err(MissionCommandError::internal)?;
+                let existing_create = self
+                    .store
+                    .lock()
+                    .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+                    .existing_create_request(&idempotency_key)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?;
+                if let Some((_, mission_id)) = existing_create {
+                    let existing = self
+                        .store
+                        .lock()
+                        .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+                        .mission(&mission_id)
+                        .map_err(map_state_error)?;
+                    if existing
+                        .as_ref()
+                        .is_none_or(|projection| {
+                            !create_replay_authorized(&projection.mission, &caller)
+                        })
+                    {
+                        return Err(MissionCommandError::permission_denied());
+                    }
+                }
                 let (mission, receipt) =
                     build_created_mission(&caller, body).map_err(MissionCommandError::internal)?;
                 let outcome = self
@@ -854,14 +876,36 @@ mod tests {
         let replayed = created_record(replayed_result);
         assert_eq!(replayed.mission_id, created.mission_id);
 
-        let denied = service
+        let denied_match = service
             .handle(
                 create_request(Uuid::new_v4(), "create:persistent"),
                 Some("other-session-secret"),
             )
             .expect_err("different principal must not replay");
-        assert_eq!(denied.code, MissionCommandErrorCode::PermissionDenied);
-        assert!(!denied.message.contains("conflicts"));
+        let denied_mismatch = service
+            .handle(
+                MissionControlRequest::create(
+                    Uuid::new_v4(),
+                    "create:persistent".to_owned(),
+                    MissionCreateBody {
+                        goal: "A different goal that must not leak equality".to_owned(),
+                        policy_id: "policy.local".to_owned(),
+                        deadline_at: None,
+                        recovery_policy: RecoveryPolicy::AskOperator,
+                    },
+                )
+                .expect("valid create request"),
+                Some("other-session-secret"),
+            )
+            .expect_err("different principal must not learn body equality");
+        assert_eq!(denied_match.code, MissionCommandErrorCode::PermissionDenied);
+        assert_eq!(
+            denied_mismatch.code,
+            MissionCommandErrorCode::PermissionDenied
+        );
+        assert_eq!(denied_match.message, denied_mismatch.message);
+        assert!(!denied_match.message.contains("conflicts"));
+        assert!(!denied_mismatch.message.contains("conflicts"));
 
         let list = service
             .handle(

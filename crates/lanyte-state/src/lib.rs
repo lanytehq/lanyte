@@ -579,6 +579,20 @@ impl StateStore {
         Ok(version)
     }
 
+    pub fn existing_create_request(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT request_fingerprint, mission_id FROM mission_requests WHERE idempotency_key = ?1 LIMIT 1",
+                [idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn create_mission(
         &mut self,
         mission: MissionRecord,
