@@ -462,7 +462,26 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
             original_result_hash: Value,
         }
 
-        let raw = Raw::deserialize(deserializer)?;
+        let value = Value::deserialize(deserializer)?;
+        let schema = value
+            .get("control_schema")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_v01 = schema == MISSION_CONTROL_SCHEMA;
+        if schema == MISSION_CONTROL_SCHEMA_V0 {
+            let obj = value
+                .as_object()
+                .ok_or_else(|| D::Error::custom("request must be an object"))?;
+            if obj.contains_key("request_fingerprint") || obj.contains_key("original_result_hash") {
+                return Err(D::Error::custom("frozen v0 control hashes must be omitted"));
+            }
+            if value.get("operation").and_then(Value::as_str) == Some("mission.cancel") {
+                return Err(D::Error::custom(
+                    "frozen v0 does not include mission.cancel",
+                ));
+            }
+        }
+        let raw: Raw = serde_json::from_value(value).map_err(D::Error::custom)?;
         if raw.control_schema != MISSION_CONTROL_SCHEMA
             && raw.control_schema != MISSION_CONTROL_SCHEMA_V0
         {
@@ -475,7 +494,6 @@ impl<'de> Deserialize<'de> for MissionControlRequest {
             raw.operation.as_str(),
             "mission.create" | "mission.launch" | "mission.close" | "mission.cancel"
         );
-        let is_v01 = raw.control_schema == MISSION_CONTROL_SCHEMA;
         verify_raw_control_hashes(HashCheck {
             mutating,
             is_request: true,
@@ -986,7 +1004,25 @@ impl<'de> Deserialize<'de> for MissionControlResult {
             progress: CancelProgress,
         }
 
-        let raw = Raw::deserialize(deserializer)?;
+        let value = Value::deserialize(deserializer)?;
+        let schema = value
+            .get("control_schema")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if schema == MISSION_CONTROL_SCHEMA_V0 {
+            let obj = value
+                .as_object()
+                .ok_or_else(|| D::Error::custom("result must be an object"))?;
+            if obj.contains_key("request_fingerprint") || obj.contains_key("original_result_hash") {
+                return Err(D::Error::custom("frozen v0 control hashes must be omitted"));
+            }
+            if value.get("operation").and_then(Value::as_str) == Some("mission.cancel") {
+                return Err(D::Error::custom(
+                    "frozen v0 does not include mission.cancel",
+                ));
+            }
+        }
+        let raw: Raw = serde_json::from_value(value).map_err(D::Error::custom)?;
         if raw.control_schema != MISSION_CONTROL_SCHEMA
             && raw.control_schema != MISSION_CONTROL_SCHEMA_V0
         {
@@ -1119,6 +1155,27 @@ impl<'de> Deserialize<'de> for MissionControlResult {
                     .to_owned();
                 let body: CancelBody =
                     serde_json::from_value(raw.body).map_err(D::Error::custom)?;
+                if !body.progress.requested {
+                    return Err(D::Error::custom(
+                        "mission.cancel progress.requested must be true",
+                    ));
+                }
+                if let Some(protocol) = &body.progress.protocol {
+                    if protocol.outcome == ProtocolCancelOutcome::Interrupted
+                        && (protocol
+                            .thread_id
+                            .as_ref()
+                            .is_none_or(|value| value.is_empty())
+                            || protocol
+                                .turn_id
+                                .as_ref()
+                                .is_none_or(|value| value.is_empty()))
+                    {
+                        return Err(D::Error::custom(
+                            "interrupted cancel progress requires nonempty thread_id and turn_id",
+                        ));
+                    }
+                }
                 body.record
                     .validate()
                     .map_err(|err| D::Error::custom(err.to_string()))?;

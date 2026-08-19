@@ -546,6 +546,11 @@ impl Orchestrator {
                 .map(lanyte_gateway::ClientAuthToken::expose),
         )?;
         let stored = service.visible_projection(&body.mission_id.to_string(), &caller)?;
+        if !caller_matches_durable_authorizer(&caller, &stored.mission) {
+            return Err(MissionCommandError::invalid_args(
+                "caller is not the durable mission authorizer",
+            ));
+        }
         if let Some(replayed) = service.completed_mutation(&idempotency_key, &fingerprint)? {
             return replayed_control_result(&replayed);
         }
@@ -1736,7 +1741,8 @@ impl Orchestrator {
                     } else {
                         session
                             .poll_exit()
-                            .map_err(|err| MissionCommandError::internal(err.to_string()))?
+                            .ok()
+                            .flatten()
                             .map(CloseOutcome::AlreadyExited)
                     }
                 }
@@ -1796,12 +1802,34 @@ impl Orchestrator {
         let close_outcome = if let Some(outcome) = prior_outcome {
             Some(outcome)
         } else if let Some(session) = sessions.get_mut(&attempt_id) {
-            Some(
-                session
-                    .close()
-                    .await
-                    .map_err(|err| MissionCommandError::internal(err.to_string()))?,
-            )
+            match session.kill_process_tree() {
+                ProcessTreeKill::Cleared => {
+                    let status = session.poll_exit().ok().flatten().or_else(|| {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::ExitStatusExt;
+                            Some(std::process::ExitStatus::from_raw(9))
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            None
+                        }
+                    });
+                    match status {
+                        Some(status) => Some(CloseOutcome::Terminated(status)),
+                        None => {
+                            return Err(MissionCommandError::invalid_args(
+                                "process tree was cleared but the leader exit status is unknown",
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(MissionCommandError::invalid_args(
+                        "process tree was not cleared; close will not claim cancellation",
+                    ));
+                }
+            }
         } else if already_cancelling {
             None
         } else {
@@ -2188,6 +2216,20 @@ struct PendingCancelStub {
 fn parse_pending_cancel(result_json: &str) -> Option<PendingCancelStub> {
     let stub = serde_json::from_str::<PendingCancelStub>(result_json).ok()?;
     (stub.kind == "pending_cancel").then_some(stub)
+}
+
+fn caller_matches_durable_authorizer(
+    caller: &crate::mission::VerifiedSession,
+    mission: &MissionRecord,
+) -> bool {
+    let durable = mission.authorizer.as_ref().unwrap_or(&mission.initiator);
+    durable.subject == caller.subject
+        && durable.role.as_deref() == Some(caller.role.as_str())
+        && durable.scope.as_deref() == Some(caller.scope.as_str())
+        && durable
+            .attestation
+            .as_ref()
+            .is_some_and(|attestation| attestation.trust_ref == caller.trust_ref)
 }
 
 fn mutation_fingerprint(request: &MissionControlRequest) -> Result<String, MissionCommandError> {

@@ -9,7 +9,11 @@ use lanyte_mission::{
 use serde::Deserialize;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HistoryFixture {
+    #[serde(default)]
+    #[allow(dead_code)]
+    kind: Option<String>,
     mission: MissionRecord,
     events: Vec<LifecycleEvent>,
     #[serde(default)]
@@ -19,7 +23,16 @@ struct HistoryFixture {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticLayer {
+    id: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
+    semantic_layer: SemanticLayer,
     conforming: Vec<String>,
     negative: BTreeMap<String, String>,
 }
@@ -29,8 +42,12 @@ fn fixtures_root() -> std::path::PathBuf {
 }
 
 fn load_manifest() -> Manifest {
-    serde_json::from_str(&fs::read_to_string(fixtures_root().join("manifest.json")).unwrap())
-        .expect("manifest")
+    let manifest: Manifest =
+        serde_json::from_str(&fs::read_to_string(fixtures_root().join("manifest.json")).unwrap())
+            .expect("manifest");
+    assert_eq!(manifest.semantic_layer.id, "mission/v0.1-semantics");
+    assert_eq!(manifest.semantic_layer.version, "0.2.13");
+    manifest
 }
 
 fn json_names(dir: &Path) -> BTreeSet<String> {
