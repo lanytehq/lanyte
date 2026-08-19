@@ -3,12 +3,33 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{Duration, Utc};
+use serde::Deserialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     AttemptState, AttemptStateCause, EventSourceKind, FallbackCancelOutcome, InvariantError,
     LeaseTickKind, LifecycleEvent, LifecyclePayload, MissionPhase, MissionRecord,
-    ObservationSource, ProtocolCancelOutcome,
+    ObservationSource, Principal, ProtocolCancelOutcome,
 };
+
+const MUTATING_OPERATIONS: &[&str] = &[
+    "mission.create",
+    "mission.launch",
+    "mission.close",
+    "mission.cancel",
+];
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlBinding {
+    pub operation: String,
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub original_result_hash: String,
+    pub evidence_ref: String,
+    pub request: Value,
+    pub result: Value,
+}
 
 type Fence = (uuid::Uuid, u64, u64);
 
@@ -16,23 +37,54 @@ pub fn semantic_violation_codes(
     mission: &MissionRecord,
     events: &[LifecycleEvent],
 ) -> Vec<&'static str> {
-    wave3_violations(mission, events)
-        .into_iter()
-        .map(|err| err.field)
-        .collect()
+    semantic_violation_codes_with_control(mission, events, &[])
+}
+
+pub fn semantic_violation_codes_with_control(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+    records: &[ControlBinding],
+) -> Vec<&'static str> {
+    semantic_violation_codes_for_fixture(mission, events, records, &[])
+}
+
+pub fn semantic_violation_codes_for_fixture(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+    records: &[ControlBinding],
+    reports: &[crate::DriverCapabilityReport],
+) -> Vec<&'static str> {
+    let mut violations = wave3_violations(mission, events, records);
+    for report in reports {
+        let mut names = HashSet::new();
+        for capability in &report.capabilities {
+            if !names.insert(capability.name) {
+                note(
+                    &mut violations,
+                    "SEM-D01",
+                    "capability names must be unique in a report",
+                );
+            }
+        }
+    }
+    violations.into_iter().map(|err| err.field).collect()
 }
 
 pub(crate) fn validate_wave3_semantics(
     mission: &MissionRecord,
     events: &[LifecycleEvent],
 ) -> Result<(), InvariantError> {
-    match wave3_violations(mission, events).into_iter().next() {
+    match wave3_violations(mission, events, &[]).into_iter().next() {
         Some(err) => Err(err),
         None => Ok(()),
     }
 }
 
-fn wave3_violations(mission: &MissionRecord, events: &[LifecycleEvent]) -> Vec<InvariantError> {
+fn wave3_violations(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+    records: &[ControlBinding],
+) -> Vec<InvariantError> {
     let mut violations = Vec::new();
     let lease_enabled = mission.lease_policy.enabled;
     let lease_seconds = mission.lease_policy.lease_seconds;
@@ -77,20 +129,50 @@ fn wave3_violations(mission: &MissionRecord, events: &[LifecycleEvent]) -> Vec<I
                     );
                 }
             }
+            LifecyclePayload::AuthorizationBound {
+                authorizer,
+                authorization_ref,
+            } => {
+                let Some(durable) = mission.authorizer.as_ref() else {
+                    note(
+                        &mut violations,
+                        "SEM-A01",
+                        "authorization_bound requires a durable authorizer",
+                    );
+                    continue;
+                };
+                if !authorizer.matches_principal(durable)
+                    || Some(authorization_ref.as_str()) != mission.authorization_ref.as_deref()
+                    || event.source.evidence_ref.as_deref()
+                        != Some(authorizer.attestation_ref.as_str())
+                {
+                    note(
+                        &mut violations,
+                        "SEM-A01",
+                        "authorization_bound must match the durable attested principal and source evidence",
+                    );
+                }
+            }
             LifecyclePayload::CancelRequested {
                 attempt_id,
                 generation,
                 lease_generation,
+                authorizer,
+                authorization_ref,
             } => {
                 cancel_requested_seen = true;
+                let durable: &Principal = mission.authorizer.as_ref().unwrap_or(&mission.initiator);
                 if event.source.kind != EventSourceKind::OperatorCommand
                     || event.source.assurance != crate::ObservationLevel::ResourceAttested
                     || event.source.evidence_ref.is_none()
+                    || event.source.subject != durable.subject
+                    || !authorizer.matches_principal(durable)
+                    || authorization_ref.as_deref() != mission.authorization_ref.as_deref()
                 {
                     note(
                         &mut violations,
                         "SEM-A04",
-                        "cancel_requested requires attested operator evidence",
+                        "cancel_requested requires attested operator evidence bound to the durable principal",
                     );
                 }
                 if let (Some(attempt_id), Some(generation), Some(lease_generation)) =
@@ -130,6 +212,18 @@ fn wave3_violations(mission: &MissionRecord, events: &[LifecycleEvent]) -> Vec<I
                         &mut violations,
                         "SEM-P01",
                         "protocol cancel evidence must stay driver/harness",
+                    );
+                }
+                let key = (*attempt_id, *generation, *lease_generation);
+                if cancel_requests
+                    .get(&key)
+                    .copied()
+                    .is_none_or(|request_seq| sequence <= request_seq)
+                {
+                    note(
+                        &mut violations,
+                        "SEM-C01",
+                        "protocol cancel attempt requires an earlier same-fence cancel_requested",
                     );
                 }
                 if *outcome == ProtocolCancelOutcome::Interrupted {
@@ -172,6 +266,18 @@ fn wave3_violations(mission: &MissionRecord, events: &[LifecycleEvent]) -> Vec<I
                         &mut violations,
                         "SEM-P01",
                         "process membership evidence must be kernel-observed",
+                    );
+                }
+                let key = (*attempt_id, *generation, *lease_generation);
+                if cancel_requests
+                    .get(&key)
+                    .copied()
+                    .is_none_or(|request_seq| sequence <= request_seq)
+                {
+                    note(
+                        &mut violations,
+                        "SEM-C01",
+                        "process cancel attempt requires an earlier same-fence cancel_requested",
                     );
                 }
                 if *outcome == FallbackCancelOutcome::Cleared
@@ -738,6 +844,7 @@ fn wave3_violations(mission: &MissionRecord, events: &[LifecycleEvent]) -> Vec<I
             }
         }
     }
+    check_control_bindings(mission, events, records, &mut violations);
     violations
 }
 
@@ -755,6 +862,195 @@ struct CancelEdge {
     source: EventSourceKind,
     cause: Option<AttemptStateCause>,
     generation: u64,
+}
+
+fn check_control_bindings(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+    records: &[ControlBinding],
+    violations: &mut Vec<InvariantError>,
+) {
+    if records.is_empty() {
+        return;
+    }
+    let mut fingerprints_by_key: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut results_by_key_fp: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    let mut cancel_evidence: HashSet<String> = HashSet::new();
+    for record in records {
+        let request_hash = control_content_hash(&record.request);
+        let result_hash = control_content_hash(&record.result);
+        let request_id = record.request.get("request_id").and_then(Value::as_str);
+        let result_id = record.result.get("request_id").and_then(Value::as_str);
+        let request_op = record.request.get("operation").and_then(Value::as_str);
+        let result_op = record.result.get("operation").and_then(Value::as_str);
+        let request_key = record
+            .request
+            .get("idempotency_key")
+            .and_then(Value::as_str);
+        let result_key = record.result.get("idempotency_key").and_then(Value::as_str);
+        let request_kind = record.request.get("kind").and_then(Value::as_str);
+        let result_kind = record.result.get("kind").and_then(Value::as_str);
+        let result_original = record
+            .result
+            .get("original_result_hash")
+            .and_then(Value::as_str);
+        let request_fp = record
+            .request
+            .get("request_fingerprint")
+            .and_then(Value::as_str);
+        let result_fp = record
+            .result
+            .get("request_fingerprint")
+            .and_then(Value::as_str);
+        let identity_ok = control_identities_match(mission.mission_id, record);
+        let ids_ok =
+            request_id.is_some_and(canonical_uuid_v4) && result_id.is_some_and(canonical_uuid_v4);
+        if !MUTATING_OPERATIONS.contains(&record.operation.as_str())
+            || request_kind != Some("request")
+            || result_kind != Some("result")
+            || request_op != Some(record.operation.as_str())
+            || result_op != Some(record.operation.as_str())
+            || request_key != Some(record.idempotency_key.as_str())
+            || result_key != Some(record.idempotency_key.as_str())
+            || request_id != result_id
+            || !ids_ok
+            || request_fp != Some(record.request_fingerprint.as_str())
+            || result_fp != Some(record.request_fingerprint.as_str())
+            || !record
+                .request
+                .get("original_result_hash")
+                .is_some_and(Value::is_null)
+            || result_original != Some(record.original_result_hash.as_str())
+            || request_hash.as_deref() != Some(record.request_fingerprint.as_str())
+            || result_hash.as_deref() != Some(record.original_result_hash.as_str())
+            || !identity_ok
+        {
+            note(
+                violations,
+                "SEM-A05",
+                "mutating control records must be schema-shaped replay bindings for this mission",
+            );
+            continue;
+        }
+        fingerprints_by_key
+            .entry(record.idempotency_key.clone())
+            .or_default()
+            .insert(record.request_fingerprint.clone());
+        results_by_key_fp
+            .entry((
+                record.idempotency_key.clone(),
+                record.request_fingerprint.clone(),
+            ))
+            .or_default()
+            .insert(record.original_result_hash.clone());
+        if record.operation == "mission.cancel" {
+            cancel_evidence.insert(record.evidence_ref.clone());
+        }
+    }
+    if fingerprints_by_key.values().any(|values| values.len() > 1)
+        || results_by_key_fp.values().any(|values| values.len() > 1)
+    {
+        note(
+            violations,
+            "SEM-A05",
+            "idempotency key must map to one fingerprint and original result",
+        );
+    }
+    for event in events {
+        if !matches!(event.payload, LifecyclePayload::CancelRequested { .. }) {
+            continue;
+        }
+        if event
+            .source
+            .evidence_ref
+            .as_ref()
+            .is_none_or(|evidence| !cancel_evidence.contains(evidence))
+        {
+            note(
+                violations,
+                "SEM-A05",
+                "cancel_requested must name a mission.cancel control binding",
+            );
+        }
+    }
+}
+
+fn control_identities_match(mission_id: uuid::Uuid, record: &ControlBinding) -> bool {
+    let history = mission_id.to_string();
+    let result_id = result_control_mission_id(&record.result);
+    if result_id.as_deref() != Some(history.as_str()) {
+        return false;
+    }
+    if record.operation == "mission.create" {
+        return true;
+    }
+    request_control_mission_id(&record.request).as_deref() == Some(history.as_str())
+}
+
+fn canonical_uuid_v4(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).ok().is_some_and(|parsed| {
+        parsed.get_version() == Some(uuid::Version::Random) && parsed.to_string() == value
+    })
+}
+
+fn request_control_mission_id(request: &Value) -> Option<String> {
+    request
+        .get("body")
+        .and_then(|body| body.get("mission_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn result_control_mission_id(result: &Value) -> Option<String> {
+    result
+        .get("body")
+        .and_then(|body| body.get("record"))
+        .and_then(|record| record.get("mission_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            result
+                .get("body")
+                .and_then(|body| body.get("mission_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn control_content_hash(value: &Value) -> Option<String> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+    let mut filtered = serde_json::Map::new();
+    for (key, item) in map {
+        if matches!(
+            key.as_str(),
+            "request_id" | "request_fingerprint" | "original_result_hash"
+        ) {
+            continue;
+        }
+        filtered.insert(key.clone(), item.clone());
+    }
+    let blob = serde_json::to_string(&canonical_value(&Value::Object(filtered))).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(blob.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_value(&map[&key]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
+        other => other.clone(),
+    }
 }
 
 fn check_live_lease(

@@ -18,4 +18,7 @@ pub use driver::{DriverDescriptor, HarnessDriver, NormalizedHarnessEvent};
 pub use invariant::{validate_history, InvariantError, Validate};
 pub use model::*;
 pub use transition::{AttemptTransition, MissionTransition, TransitionError};
-pub use wave3::semantic_violation_codes;
+pub use wave3::{
+    semantic_violation_codes, semantic_violation_codes_for_fixture,
+    semantic_violation_codes_with_control, ControlBinding,
+};

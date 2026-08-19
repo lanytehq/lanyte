@@ -1,7 +1,7 @@
 {
   "semantic_layer": {
     "id": "mission/v0.1-semantics",
-    "version": "0.2.6"
+    "version": "0.2.13"
   },
   "conforming": [
     "create-only-wave1.json",
@@ -11,7 +11,8 @@
     "restart-reconcile-once.json",
     "deadman-then-process-exit.json",
     "multi-renewal-then-cancel.json",
-    "process-cleared-cancel.json"
+    "process-cleared-cancel.json",
+    "control-replay-same-key-body.json"
   ],
   "negative": {
     "noncanonical-mission-id.json": "SEM-M01",
@@ -70,6 +71,25 @@
     "cancelled-edge-before-proof.json": "SEM-C10",
     "stale-projection-timestamps.json": "SEM-M06",
     "process-cleared-wrong-cause.json": "SEM-C10",
-    "cancel-requested-as-completed.json": "SEM-C01"
+    "authorization-unrelated-principal.json": "SEM-A01",
+    "authorization-unrelated-attestation.json": "SEM-A01",
+    "authorization-source-evidence-mismatch.json": "SEM-A01",
+    "cancel-unrelated-subject.json": "SEM-A04",
+    "cancel-unrelated-attestation.json": "SEM-A04",
+    "control-key-fingerprint-conflict.json": "SEM-A05",
+    "control-key-result-hash-conflict.json": "SEM-A05",
+    "control-record-unlinked.json": "SEM-A05",
+    "control-embedded-invalid-payload.json": "SEM-A05",
+    "control-request-id-mismatch.json": "SEM-A05",
+    "control-cross-mission.json": "SEM-A05",
+    "control-cross-mission-result.json": "SEM-A05",
+    "control-cross-mission-request.json": "SEM-A05",
+    "control-cross-mission-launch-result.json": "SEM-A05",
+    "control-cross-mission-close-result.json": "SEM-A05",
+    "duplicate-capability-name.json": "SEM-D01",
+    "protocol-request-accepted-without-cancel-request.json": "SEM-C01",
+    "protocol-request-accepted-before-cancel-request.json": "SEM-C01",
+    "process-kill-dispatched-without-cancel-request.json": "SEM-C01",
+    "process-kill-dispatched-before-cancel-request.json": "SEM-C01"
   }
 }

@@ -2,13 +2,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use lanyte_mission::{semantic_violation_codes, validate_history, LifecycleEvent, MissionRecord};
+use lanyte_mission::{
+    semantic_violation_codes_for_fixture, validate_history, ControlBinding, DriverCapabilityReport,
+    LifecycleEvent, MissionRecord,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct HistoryFixture {
     mission: MissionRecord,
     events: Vec<LifecycleEvent>,
+    #[serde(default)]
+    control_records: Vec<ControlBinding>,
+    #[serde(default)]
+    driver_capabilities: Vec<DriverCapabilityReport>,
 }
 
 #[derive(Deserialize)]
@@ -45,8 +52,8 @@ fn semantic_manifest_matches_directory_sets() {
     let manifest = load_manifest();
     let conforming: BTreeSet<_> = manifest.conforming.iter().cloned().collect();
     let negative: BTreeSet<_> = manifest.negative.keys().cloned().collect();
-    assert_eq!(conforming.len(), 8);
-    assert_eq!(negative.len(), 57);
+    assert_eq!(conforming.len(), 9);
+    assert_eq!(negative.len(), 76);
     assert_eq!(json_names(&fixtures_root().join("conforming")), conforming);
     assert_eq!(json_names(&fixtures_root().join("negative")), negative);
 }
@@ -61,6 +68,15 @@ fn conforming_v0_1_histories_validate() {
             Ok(fixture) => {
                 if let Err(err) = validate_history(&fixture.mission, &fixture.events) {
                     failures.push(format!("{name}: {err}"));
+                }
+                let codes = semantic_violation_codes_for_fixture(
+                    &fixture.mission,
+                    &fixture.events,
+                    &fixture.control_records,
+                    &fixture.driver_capabilities,
+                );
+                if !codes.is_empty() {
+                    failures.push(format!("{name}: fixture codes {codes:?}"));
                 }
             }
             Err(err) => failures.push(format!("{name}: parse {err}")),
@@ -84,15 +100,21 @@ fn negative_v0_1_histories_reject_with_declared_sem() {
             failures.push(format!("{name}: fixture is not JSON"));
             continue;
         };
-        if let Ok(fixture) = load_history(&dir.join(name)) {
-            if validate_history(&fixture.mission, &fixture.events).is_ok() {
-                failures.push(format!("{name}: accepted (wanted {expected})"));
-                continue;
+        match load_history(&dir.join(name)) {
+            Ok(fixture) => {
+                let codes = semantic_violation_codes_for_fixture(
+                    &fixture.mission,
+                    &fixture.events,
+                    &fixture.control_records,
+                    &fixture.driver_capabilities,
+                );
+                if codes.is_empty() {
+                    failures.push(format!("{name}: accepted (wanted {expected})"));
+                } else if !codes.contains(&expected.as_str()) {
+                    failures.push(format!("{name}: wanted {expected}, got {codes:?}"));
+                }
             }
-            let codes = semantic_violation_codes(&fixture.mission, &fixture.events);
-            if !codes.contains(&expected.as_str()) {
-                failures.push(format!("{name}: wanted {expected}, got {codes:?}"));
-            }
+            Err(_) => {}
         }
     }
     assert!(

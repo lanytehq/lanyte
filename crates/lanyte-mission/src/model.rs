@@ -461,6 +461,7 @@ pub enum LifecyclePayload {
     },
     AuthorizationBound {
         authorizer: PrincipalRef,
+        authorization_ref: String,
     },
     MissionPhaseChanged {
         from: MissionPhase,
@@ -508,6 +509,8 @@ pub enum LifecyclePayload {
         attempt_id: Option<Uuid>,
         generation: Option<u64>,
         lease_generation: Option<u64>,
+        authorizer: PrincipalRef,
+        authorization_ref: Option<String>,
     },
     ProtocolCancelAttempted {
         attempt_id: Uuid,
@@ -589,5 +592,32 @@ impl LifecyclePayload {
 pub struct PrincipalRef {
     pub kind: PrincipalKind,
     pub subject: String,
+    pub role: String,
+    pub scope: String,
     pub attestation_ref: String,
+}
+
+impl PrincipalRef {
+    #[must_use]
+    pub fn try_from_principal(principal: &Principal) -> Option<Self> {
+        Some(Self {
+            kind: principal.kind,
+            subject: principal.subject.clone(),
+            role: principal.role.clone()?,
+            scope: principal.scope.clone()?,
+            attestation_ref: principal.attestation.as_ref()?.trust_ref.clone(),
+        })
+    }
+
+    #[must_use]
+    pub fn matches_principal(&self, principal: &Principal) -> bool {
+        self.kind == principal.kind
+            && self.subject == principal.subject
+            && principal.role.as_deref() == Some(self.role.as_str())
+            && principal.scope.as_deref() == Some(self.scope.as_str())
+            && principal
+                .attestation
+                .as_ref()
+                .is_some_and(|attestation| attestation.trust_ref == self.attestation_ref)
+    }
 }

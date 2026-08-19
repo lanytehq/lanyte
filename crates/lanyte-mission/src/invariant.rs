@@ -707,7 +707,7 @@ fn validate_history_chain(
                 ));
             }
             LifecyclePayload::MissionCreated { .. } => {}
-            LifecyclePayload::AuthorizationBound { authorizer } => {
+            LifecyclePayload::AuthorizationBound { authorizer, .. } => {
                 if !matches!(
                     event.source.kind,
                     EventSourceKind::VerifiedAttestation | EventSourceKind::OperatorCommand
@@ -891,10 +891,16 @@ fn validate_lifecycle_payload(payload: &LifecyclePayload) -> Result<(), Invarian
         LifecyclePayload::MissionCreated { revision } if *revision != 0 => Err(
             InvariantError::new("payload.revision", "created revision must be zero"),
         ),
-        LifecyclePayload::AuthorizationBound { authorizer } => {
+        LifecyclePayload::AuthorizationBound {
+            authorizer,
+            authorization_ref,
+        } => {
             if authorizer.kind != PrincipalKind::AttestedSession
                 || !nonempty(&authorizer.subject)
+                || !nonempty(&authorizer.role)
+                || !nonempty(&authorizer.scope)
                 || !nonempty(&authorizer.attestation_ref)
+                || !nonempty(authorization_ref)
             {
                 Err(InvariantError::new(
                     "payload.authorizer",
@@ -1459,7 +1465,7 @@ mod tests {
     #[test]
     fn lifecycle_history_requires_contiguous_hash_links() {
         let mission = created_mission();
-        let created = LifecycleEvent {
+        let mut created = LifecycleEvent {
             event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
             event_id: fixtures::uuid(20),
             mission_id: mission.mission_id,
@@ -1478,23 +1484,10 @@ mod tests {
             },
             payload: LifecyclePayload::MissionCreated { revision: 0 },
         };
-        let mut authorization = created.clone();
-        authorization.event_id = fixtures::uuid(21);
-        authorization.sequence = 2;
-        authorization.previous_entry_hash = Some("9".repeat(64));
-        authorization.entry_hash = "2".repeat(64);
-        authorization.event_type = "authorization_bound".to_owned();
-        authorization.payload = LifecyclePayload::AuthorizationBound {
-            authorizer: PrincipalRef {
-                kind: PrincipalKind::AttestedSession,
-                subject: "operator-1".to_owned(),
-                attestation_ref: "attestations/1".to_owned(),
-            },
-        };
+        created.sequence = 2;
+        created.previous_entry_hash = Some("9".repeat(64));
         assert_eq!(
-            validate_history(&mission, &[created, authorization])
-                .unwrap_err()
-                .field,
+            validate_history(&mission, &[created]).unwrap_err().field,
             "event.sequence"
         );
     }
@@ -1519,7 +1512,7 @@ mod tests {
         created.source.kind = EventSourceKind::VerifiedAttestation;
         created.source.assurance = ObservationLevel::ResourceAttested;
         created.source.evidence_ref = Some("attestations/created".to_owned());
-        let authorization = event(
+        let mut authorization = event(
             31,
             mission.mission_id,
             2,
@@ -1529,10 +1522,14 @@ mod tests {
                 authorizer: PrincipalRef {
                     kind: PrincipalKind::AttestedSession,
                     subject: mission.initiator.subject.clone(),
-                    attestation_ref: "attestations/1".to_owned(),
+                    role: "entarch".to_owned(),
+                    scope: "lanytehq".to_owned(),
+                    attestation_ref: "attestations/3".to_owned(),
                 },
+                authorization_ref: "authorizations/1".to_owned(),
             },
         );
+        authorization.source.evidence_ref = Some("attestations/3".to_owned());
         assert_eq!(
             validate_history(&mission, &[created, authorization])
                 .unwrap_err()

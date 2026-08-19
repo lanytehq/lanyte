@@ -53,8 +53,11 @@
         "authorizer": {
           "kind": "attested_session",
           "subject": "approver-1",
-          "attestation_ref": "attestations/55555555-5555-4555-8555-555555555555"
-        }
+          "attestation_ref": "attestations/55555555-5555-4555-8555-555555555555",
+          "role": "entarch",
+          "scope": "lanytehq"
+        },
+        "authorization_ref": "authz/1"
       }
     }
   ],

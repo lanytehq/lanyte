@@ -13,9 +13,10 @@ use lanyte_mission::{
     AttemptRecord, AttemptState, AttemptStateCause, AttemptTerminalReason, CancelProgress,
     CapabilityName, EventSource, EventSourceKind, FallbackCancelOutcome, FallbackCancelProgress,
     HarnessDriver, HarnessSelection, LeasePolicy, LeaseTickKind, LifecycleEvent, LifecyclePayload,
-    MissionControlRequest, MissionControlResult, MissionPhase, MissionTerminalReason,
-    MissionTransition, ObservationLevel, ObservationSource, PrincipalRef, ProtocolCancelOutcome,
-    ProtocolCancelProgress, RecoveryRelation, LIFECYCLE_EVENT_SCHEMA,
+    MissionControlRequest, MissionControlResult, MissionPhase, MissionRecord,
+    MissionTerminalReason, MissionTransition, ObservationLevel, ObservationSource, Principal,
+    PrincipalRef, ProtocolCancelOutcome, ProtocolCancelProgress, RecoveryRelation,
+    LIFECYCLE_EVENT_SCHEMA,
 };
 use lanyte_state::NewMissionProjectionReceipt;
 use lanyte_telemetry::AuditEnvelopeRef;
@@ -366,11 +367,8 @@ impl Orchestrator {
             (
                 EventSourceKind::OperatorCommand,
                 LifecyclePayload::AuthorizationBound {
-                    authorizer: PrincipalRef {
-                        kind: authorizer.kind,
-                        subject: authorizer.subject.clone(),
-                        attestation_ref: format!("mission.launch/{request_id}"),
-                    },
+                    authorizer: principal_ref(&authorizer)?,
+                    authorization_ref: format!("mission.launch/{request_id}"),
                 },
             ),
             (
@@ -632,11 +630,7 @@ impl Orchestrator {
             let payloads = vec![
                 (
                     EventSourceKind::OperatorCommand,
-                    LifecyclePayload::CancelRequested {
-                        attempt_id: None,
-                        generation: None,
-                        lease_generation: None,
-                    },
+                    cancel_requested(&mission, None, None, None)?,
                 ),
                 (
                     EventSourceKind::OperatorCommand,
@@ -756,11 +750,12 @@ impl Orchestrator {
                 vec![
                     (
                         EventSourceKind::OperatorCommand,
-                        LifecyclePayload::CancelRequested {
-                            attempt_id: Some(attempt_id),
-                            generation: Some(attempt.generation),
-                            lease_generation: Some(lease_generation),
-                        },
+                        cancel_requested(
+                            &cancelling,
+                            Some(attempt_id),
+                            Some(attempt.generation),
+                            Some(lease_generation),
+                        )?,
                     ),
                     (
                         EventSourceKind::OperatorCommand,
@@ -2047,6 +2042,28 @@ fn history_has_timer_edge(
             LeaseTickKind::Renewed => false,
         },
         _ => false,
+    })
+}
+
+fn principal_ref(principal: &Principal) -> Result<PrincipalRef, MissionCommandError> {
+    PrincipalRef::try_from_principal(principal).ok_or_else(|| {
+        MissionCommandError::invalid_args("caller is not an attested session principal")
+    })
+}
+
+fn cancel_requested(
+    mission: &MissionRecord,
+    attempt_id: Option<Uuid>,
+    generation: Option<u64>,
+    lease_generation: Option<u64>,
+) -> Result<LifecyclePayload, MissionCommandError> {
+    let durable = mission.authorizer.as_ref().unwrap_or(&mission.initiator);
+    Ok(LifecyclePayload::CancelRequested {
+        attempt_id,
+        generation,
+        lease_generation,
+        authorizer: principal_ref(durable)?,
+        authorization_ref: mission.authorization_ref.clone(),
     })
 }
 
