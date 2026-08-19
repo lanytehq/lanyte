@@ -98,6 +98,25 @@ fn negative_v0_1_histories_reject_with_declared_sem() {
     let manifest = load_manifest();
     let dir = fixtures_root().join("negative");
     let mut failures = Vec::new();
+    // Incomplete lexical/history shapes that cannot deserialize as
+    // MissionRecord/LifecycleEvent. Named allowlist only — not family prefixes.
+    const PARSE_EXEMPT: &[&str] = &[
+        "attempt-created-ordinal-drift.json",
+        "capability-gating.json",
+        "forbidden-secret-field.json",
+        "illegal-mission-phase-edge.json",
+        "noncanonical-mission-id.json",
+        "orphan-attempt-lifecycle.json",
+        "premature-authorizer.json",
+        "recovery-identity-role-mutation.json",
+        "sequence-gap.json",
+        "stale-generation-fence.json",
+        "stale-projection-timestamps.json",
+        "successor-without-replaced-predecessor.json",
+        "terminal-mission-live-attempt.json",
+        "two-live-attempts.json",
+        "unauthorized-cancel.json",
+    ];
     for (name, expected) in &manifest.negative {
         let text = fs::read_to_string(dir.join(name)).expect("read negative fixture");
         let Ok(_) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -119,14 +138,7 @@ fn negative_v0_1_histories_reject_with_declared_sem() {
                 }
             }
             Err(err) => {
-                if expected.starts_with("SEM-M")
-                    || expected.starts_with("SEM-T")
-                    || expected == "SEM-A02"
-                    || expected == "SEM-A03"
-                    || expected == "SEM-A01"
-                    || expected == "SEM-A04"
-                    || expected == "SEM-D03"
-                {
+                if PARSE_EXEMPT.contains(&name.as_str()) {
                     continue;
                 }
                 failures.push(format!("{name}: parse {err}"));

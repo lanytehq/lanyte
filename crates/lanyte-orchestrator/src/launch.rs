@@ -485,7 +485,8 @@ impl Orchestrator {
             expected_revision,
             mission.clone(),
         )
-        .map_err(MissionCommandError::internal)?;
+        .map_err(MissionCommandError::internal)?
+        .bind_request_fingerprint(fingerprint.clone());
         service.renew_mutation(&idempotency_key, &owner_token)?;
         if let Err(err) = heartbeat.stop().await {
             let mut session = session;
@@ -669,6 +670,7 @@ impl Orchestrator {
                 expected_revision,
                 record: Box::new(mission.clone()),
                 progress,
+                request_fingerprint: Some(fingerprint.clone()),
             };
             attach_cancel_control(&mut receipts, &control_request, &result)?;
             service.persist_update_events(
@@ -769,6 +771,7 @@ impl Orchestrator {
                     protocol: None,
                     fallback: None,
                 },
+                request_fingerprint: Some(fingerprint.clone()),
             };
             attach_cancel_control(&mut receipts, &control_request, &snapshot)?;
             service.persist_update_events(
@@ -1010,6 +1013,7 @@ impl Orchestrator {
             expected_revision,
             record: Box::new(mission.clone()),
             progress,
+            request_fingerprint: Some(fingerprint.clone()),
         };
         let complete = mission.phase == MissionPhase::Cancelled;
         attach_cancel_control(&mut receipts, &control_request, &result)?;
@@ -1226,6 +1230,7 @@ impl Orchestrator {
                                         outcome: FallbackCancelOutcome::Cleared,
                                     }),
                                 },
+                                request_fingerprint: Some(pending.request_fingerprint.clone()),
                             };
                             Some(lanyte_state::MissionMutationIdempotency {
                                 key: pending.key,
@@ -1966,7 +1971,8 @@ impl Orchestrator {
             body.mission_id,
             attempt_id,
         )
-        .map_err(MissionCommandError::internal)?;
+        .map_err(MissionCommandError::internal)?
+        .bind_request_fingerprint(fingerprint.clone());
         if let Err(err) = service.persist_update_events(
             terminal_expected,
             mission,
@@ -2147,97 +2153,7 @@ fn chain_receipts_from(
 }
 
 fn replayed_control_result(json: &str) -> Result<MissionControlResult, MissionCommandError> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|err| MissionCommandError::internal(err.to_string()))?;
-    let request_id = value
-        .get("request_id")
-        .and_then(|value| value.as_str())
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| MissionCommandError::internal("replayed result missing request_id"))?;
-    match value.get("operation").and_then(|value| value.as_str()) {
-        Some("mission.launch") => {
-            let record = serde_json::from_value(
-                value
-                    .pointer("/body/record")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            )
-            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-            let key = value
-                .get("idempotency_key")
-                .and_then(|value| value.as_str())
-                .unwrap_or("replayed-launch-key")
-                .to_owned();
-            let expected = value
-                .get("expected_revision")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            MissionControlResult::launch(request_id, key, expected, record)
-                .map_err(MissionCommandError::internal)
-        }
-        Some("mission.cancel") => {
-            let record = serde_json::from_value(
-                value
-                    .pointer("/body/record")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            )
-            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-            let progress = serde_json::from_value(
-                value
-                    .pointer("/body/progress")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            )
-            .map_err(|err| MissionCommandError::internal(err.to_string()))?;
-            let key = value
-                .get("idempotency_key")
-                .and_then(|value| value.as_str())
-                .unwrap_or("replayed-cancel-key")
-                .to_owned();
-            let expected = value
-                .get("expected_revision")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            Ok(MissionControlResult::Cancel {
-                request_id,
-                idempotency_key: key,
-                expected_revision: expected,
-                record: Box::new(record),
-                progress,
-            })
-        }
-        Some("mission.close") => {
-            let mission_id = value
-                .pointer("/body/mission_id")
-                .and_then(|value| value.as_str())
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .ok_or_else(|| {
-                    MissionCommandError::internal("replayed close missing mission_id")
-                })?;
-            let attempt_id = value
-                .pointer("/body/attempt_id")
-                .and_then(|value| value.as_str())
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .ok_or_else(|| {
-                    MissionCommandError::internal("replayed close missing attempt_id")
-                })?;
-            let key = value
-                .get("idempotency_key")
-                .and_then(|value| value.as_str())
-                .unwrap_or("replayed-close-key")
-                .to_owned();
-            let expected = value
-                .get("expected_revision")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            MissionControlResult::close(request_id, key, expected, mission_id, attempt_id)
-                .map_err(MissionCommandError::internal)
-        }
-        other => Err(MissionCommandError::internal(format!(
-            "unsupported replayed operation: {other:?}"
-        ))),
-    }
+    serde_json::from_str(json).map_err(|err| MissionCommandError::internal(err.to_string()))
 }
 
 struct MutationHeartbeat {
