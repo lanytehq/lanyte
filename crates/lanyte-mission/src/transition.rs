@@ -291,6 +291,15 @@ mod tests {
             ended_at: None,
             terminal_reason: None,
             evidence_ref: None,
+            lease_expires_at: None,
+            deadman_at: None,
+            last_observed_at: None,
+            last_observation_source: None,
+            lease_generation: None,
+            process_tree_ref: None,
+            ownership_established_at: None,
+            harness_thread_id: None,
+            harness_turn_id: None,
         }
     }
 

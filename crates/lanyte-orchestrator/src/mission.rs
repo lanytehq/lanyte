@@ -130,6 +130,8 @@ pub struct MissionService {
     store: Arc<Mutex<StateStore>>,
     verifier: Arc<dyn SessionVerifier>,
     fail_next_terminal_persist: Arc<AtomicBool>,
+    fail_after_cancelling_persist: Arc<AtomicBool>,
+    force_nonterminal_cancel: Arc<AtomicBool>,
 }
 
 impl MissionService {
@@ -139,6 +141,8 @@ impl MissionService {
             store,
             verifier,
             fail_next_terminal_persist: Arc::new(AtomicBool::new(false)),
+            fail_after_cancelling_persist: Arc::new(AtomicBool::new(false)),
+            force_nonterminal_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -146,6 +150,54 @@ impl MissionService {
     pub fn fail_next_terminal_persist(&self) {
         self.fail_next_terminal_persist
             .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_after_cancelling_persist(&self) {
+        self.fail_after_cancelling_persist
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_nonterminal_cancel(&self) {
+        self.force_nonterminal_cancel.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_force_nonterminal_cancel(&self) -> bool {
+        self.force_nonterminal_cancel.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn crash_after_cancelling_persist(&self) -> Result<(), MissionCommandError> {
+        if self
+            .fail_after_cancelling_persist
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(MissionCommandError::internal(
+                "injected cancel pipeline crash",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn incomplete_mutation(
+        &self,
+        mission_id: &str,
+        operation: &str,
+    ) -> Result<Option<lanyte_state::MissionMutationIdempotency>, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .incomplete_mutation(mission_id, operation)
+            .map_err(map_state_error)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn age_mutation_reservation(&self, key: &str) -> Result<(), MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .age_mutation_reservation(key)
+            .map_err(map_state_error)
     }
 
     #[must_use]
@@ -213,6 +265,16 @@ impl MissionService {
                 .validate()
                 .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         }
+        let mut history = self.lifecycle_history(&mission.mission_id.to_string())?;
+        history.extend(receipts.iter().map(|receipt| receipt.event.clone()));
+        let mut records = self.control_bindings(&mission.mission_id.to_string())?;
+        records.extend(
+            receipts
+                .iter()
+                .filter_map(|receipt| receipt.control_binding.clone()),
+        );
+        lanyte_mission::validate_history_with_control(&mission, &history, &records)
+            .map_err(|err| MissionCommandError::invalid_args(err.to_string()))?;
         if mission.phase.is_terminal()
             && self
                 .fail_next_terminal_persist
@@ -234,6 +296,31 @@ impl MissionService {
                 }
                 other => MissionCommandError::internal(other.to_string()),
             })
+    }
+
+    pub(crate) fn supervised_missions(
+        &self,
+    ) -> Result<Vec<lanyte_mission::MissionRecord>, MissionCommandError> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .list_supervised_missions()
+            .map_err(map_state_error)?
+            .into_iter()
+            .map(|projection| projection.mission)
+            .collect())
+    }
+
+    pub(crate) fn control_bindings(
+        &self,
+        mission_id: &str,
+    ) -> Result<Vec<lanyte_mission::ControlBinding>, MissionCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+            .control_bindings(mission_id)
+            .map_err(|err| MissionCommandError::internal(err.to_string()))
     }
 
     pub(crate) fn lifecycle_history(
@@ -347,26 +434,47 @@ impl MissionService {
                 idempotency_key,
                 body,
             } => {
-                let request_fingerprint =
-                    create_fingerprint(&caller, &body).map_err(MissionCommandError::internal)?;
+                let request_fingerprint = control_request_fingerprint(&MissionControlRequest::Create {
+                    request_id,
+                    idempotency_key: idempotency_key.clone(),
+                    body: body.clone(),
+                })
+                .map_err(MissionCommandError::internal)?;
                 let (mission, receipt) =
                     build_created_mission(&caller, body).map_err(MissionCommandError::internal)?;
-                let outcome = self
+                let mut store = self
                     .store
                     .lock()
-                    .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?
+                    .map_err(|_| MissionCommandError::internal("mission store lock poisoned"))?;
+                if let Some((_, mission_id)) = store
+                    .existing_create_request(&idempotency_key)
+                    .map_err(|err| MissionCommandError::internal(err.to_string()))?
+                {
+                    let existing = store.mission(&mission_id).map_err(map_state_error)?;
+                    if existing
+                        .as_ref()
+                        .is_none_or(|projection| {
+                            !create_replay_authorized(&projection.mission, &caller)
+                        })
+                    {
+                        return Err(MissionCommandError::permission_denied());
+                    }
+                }
+                let outcome = store
                     .create_mission_idempotent(
                         mission,
                         receipt,
                         MissionCreateIdempotency {
                             key: idempotency_key.clone(),
-                            request_fingerprint,
+                            request_fingerprint: request_fingerprint.clone(),
                         },
                     )
                     .map_err(map_state_error)?;
+                drop(store);
                 let record = outcome.write.projection.mission;
-                MissionControlResult::create(request_id, idempotency_key, record)
-                    .map_err(MissionCommandError::internal)
+                Ok(MissionControlResult::create(request_id, idempotency_key, record)
+                    .map_err(MissionCommandError::internal)?
+                    .bind_request_fingerprint(request_fingerprint))
             }
             MissionControlRequest::Show { request_id, body } => {
                 let projection = self
@@ -405,8 +513,9 @@ impl MissionService {
             }
             MissionControlRequest::Launch { .. }
             | MissionControlRequest::Observe { .. }
-            | MissionControlRequest::Close { .. } => Err(MissionCommandError::invalid_args(
-                "launch, observe, and close are kernel-owned and cannot use the sync control path",
+            | MissionControlRequest::Close { .. }
+            | MissionControlRequest::Cancel { .. } => Err(MissionCommandError::invalid_args(
+                "launch, observe, close, and cancel are kernel-owned and cannot use the sync control path",
             )),
         }
     }
@@ -529,24 +638,19 @@ fn build_created_mission(
                 "verification_policy_sha256": caller.verification_policy_sha256,
                 "verified_at": now.to_rfc3339_opts(SecondsFormat::Millis, true),
             })),
+            control_binding: None,
         },
     ))
 }
 
-fn create_fingerprint(
-    caller: &VerifiedSession,
-    body: &lanyte_mission::MissionCreateBody,
-) -> Result<String, String> {
-    hash_json(&serde_json::json!({
-        "operation": "mission.create",
-        "caller": {
-            "issuer": caller.issuer,
-            "subject": caller.subject,
-            "role": caller.role,
-            "scope": caller.scope,
-        },
-        "body": body,
-    }))
+fn control_request_fingerprint(request: &MissionControlRequest) -> Result<String, String> {
+    let value = serde_json::to_value(request).map_err(|err| err.to_string())?;
+    lanyte_mission::control_content_hash(&value)
+        .ok_or_else(|| "control request fingerprint is not computable".to_owned())
+}
+
+fn create_replay_authorized(mission: &MissionRecord, caller: &VerifiedSession) -> bool {
+    visible_to(mission, caller) && mission.initiator.subject == caller.subject
 }
 
 fn visible_to(mission: &MissionRecord, caller: &VerifiedSession) -> bool {
@@ -678,7 +782,8 @@ mod tests {
             }
             MissionControlResult::List { .. }
             | MissionControlResult::Observe { .. }
-            | MissionControlResult::Close { .. } => panic!("expected record result"),
+            | MissionControlResult::Close { .. }
+            | MissionControlResult::Cancel { .. } => panic!("expected record result"),
         }
     }
 
@@ -744,15 +849,52 @@ mod tests {
         assert_eq!(created.operating_role.role, "operator");
         assert_eq!(created.supervisor.kind, PrincipalKind::Service);
 
-        let replayed = created_record(
-            service
-                .handle(
-                    create_request(Uuid::new_v4(), "create:persistent"),
-                    Some("renewed-session-secret"),
-                )
-                .expect("idempotent replay after attestation renewal"),
+        let replay_request = create_request(Uuid::new_v4(), "create:persistent");
+        let replayed_result = service
+            .handle(replay_request.clone(), Some("renewed-session-secret"))
+            .expect("idempotent replay after attestation renewal");
+        let expected_fp = lanyte_mission::control_content_hash(
+            &serde_json::to_value(&replay_request).expect("encode request"),
+        )
+        .expect("canonical fingerprint");
+        let encoded = serde_json::to_value(&replayed_result).expect("encode result");
+        assert_eq!(
+            encoded["request_fingerprint"].as_str(),
+            Some(expected_fp.as_str())
         );
+        let replayed = created_record(replayed_result);
         assert_eq!(replayed.mission_id, created.mission_id);
+
+        let denied_match = service
+            .handle(
+                create_request(Uuid::new_v4(), "create:persistent"),
+                Some("other-session-secret"),
+            )
+            .expect_err("different principal must not replay");
+        let denied_mismatch = service
+            .handle(
+                MissionControlRequest::create(
+                    Uuid::new_v4(),
+                    "create:persistent".to_owned(),
+                    MissionCreateBody {
+                        goal: "A different goal that must not leak equality".to_owned(),
+                        policy_id: "policy.local".to_owned(),
+                        deadline_at: None,
+                        recovery_policy: RecoveryPolicy::AskOperator,
+                    },
+                )
+                .expect("valid create request"),
+                Some("other-session-secret"),
+            )
+            .expect_err("different principal must not learn body equality");
+        assert_eq!(denied_match.code, MissionCommandErrorCode::PermissionDenied);
+        assert_eq!(
+            denied_mismatch.code,
+            MissionCommandErrorCode::PermissionDenied
+        );
+        assert_eq!(denied_match.message, denied_mismatch.message);
+        assert!(!denied_match.message.contains("conflicts"));
+        assert!(!denied_mismatch.message.contains("conflicts"));
 
         let list = service
             .handle(
@@ -775,7 +917,8 @@ mod tests {
             }
             MissionControlResult::Record { .. }
             | MissionControlResult::Observe { .. }
-            | MissionControlResult::Close { .. } => panic!("expected list result"),
+            | MissionControlResult::Close { .. }
+            | MissionControlResult::Cancel { .. } => panic!("expected list result"),
         }
 
         let hidden = service
@@ -809,7 +952,8 @@ mod tests {
             }
             MissionControlResult::List { .. }
             | MissionControlResult::Observe { .. }
-            | MissionControlResult::Close { .. } => panic!("expected record result"),
+            | MissionControlResult::Close { .. }
+            | MissionControlResult::Cancel { .. } => panic!("expected record result"),
         }
 
         let database = std::fs::read(paths.hot_db_path()).expect("read hot database");

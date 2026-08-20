@@ -3,11 +3,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const MISSION_RECORD_SCHEMA: &str =
+    "https://schemas.3leaps.dev/agentic/mission/v0.1/mission-record.schema.json";
+pub const MISSION_RECORD_SCHEMA_V0: &str =
     "https://schemas.3leaps.dev/agentic/mission/v0/mission-record.schema.json";
 pub const DRIVER_CAPABILITIES_SCHEMA: &str =
-    "https://schemas.3leaps.dev/agentic/mission/v0/driver-capabilities.schema.json";
+    "https://schemas.3leaps.dev/agentic/mission/v0.1/driver-capabilities.schema.json";
 pub const LIFECYCLE_EVENT_SCHEMA: &str =
-    "https://schemas.3leaps.dev/agentic/mission/v0/lifecycle-event.schema.json";
+    "https://schemas.3leaps.dev/agentic/mission/v0.1/lifecycle-event.schema.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +197,48 @@ pub struct AttemptRecord {
     pub ended_at: Option<DateTime<Utc>>,
     pub terminal_reason: Option<AttemptTerminalReason>,
     pub evidence_ref: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub deadman_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_observed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_observation_source: Option<ObservationSource>,
+    #[serde(default)]
+    pub lease_generation: Option<u64>,
+    #[serde(default)]
+    pub process_tree_ref: Option<String>,
+    #[serde(default)]
+    pub ownership_established_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub harness_thread_id: Option<String>,
+    #[serde(default)]
+    pub harness_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationSource {
+    DriverEvent,
+    HarnessEvent,
+    ProcessProbe,
+    KernelClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStateCause {
+    OperatorCancel,
+    ProtocolInterrupt,
+    ProcessExit,
+    ProcessSignal,
+    DeadmanSilence,
+    LeaseExpired,
+    ConnectivityLost,
+    SuccessorReplace,
+    HarnessCompleted,
+    Policy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +461,7 @@ pub enum LifecyclePayload {
     },
     AuthorizationBound {
         authorizer: PrincipalRef,
+        authorization_ref: String,
     },
     MissionPhaseChanged {
         from: MissionPhase,
@@ -436,6 +481,8 @@ pub enum LifecyclePayload {
         from: AttemptState,
         to: AttemptState,
         reason: Option<String>,
+        #[serde(default)]
+        cause: Option<AttemptStateCause>,
     },
     DriverCapabilityEvaluated {
         attempt_id: Uuid,
@@ -458,6 +505,63 @@ pub enum LifecyclePayload {
         reason: MissionTerminalReason,
         terminal_entry_hash: String,
     },
+    CancelRequested {
+        attempt_id: Option<Uuid>,
+        generation: Option<u64>,
+        lease_generation: Option<u64>,
+        authorizer: PrincipalRef,
+        authorization_ref: Option<String>,
+    },
+    ProtocolCancelAttempted {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        outcome: crate::ProtocolCancelOutcome,
+    },
+    ProcessTerminationAttempted {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        outcome: crate::FallbackCancelOutcome,
+    },
+    LeaseStarted {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        lease_expires_at: DateTime<Utc>,
+        deadman_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        observation_source: ObservationSource,
+    },
+    LeaseTick {
+        attempt_id: Uuid,
+        generation: u64,
+        kind: LeaseTickKind,
+        prior_lease_generation: u64,
+        result_lease_generation: u64,
+        prior_lease_expires_at: DateTime<Utc>,
+        prior_deadman_at: DateTime<Utc>,
+        result_lease_expires_at: DateTime<Utc>,
+        result_deadman_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        observation_source: ObservationSource,
+    },
+    RestartReconciled {
+        attempt_id: Uuid,
+        generation: u64,
+        lease_generation: u64,
+        overdue: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseTickKind {
+    Renewed,
+    DeadmanFired,
+    Expired,
 }
 
 impl LifecyclePayload {
@@ -473,6 +577,12 @@ impl LifecyclePayload {
             Self::RecoveryRequested { .. } => "recovery_requested",
             Self::RecoveryPointRecorded { .. } => "recovery_point_recorded",
             Self::MissionTerminal { .. } => "mission_terminal",
+            Self::CancelRequested { .. } => "cancel_requested",
+            Self::ProtocolCancelAttempted { .. } => "protocol_cancel_attempted",
+            Self::ProcessTerminationAttempted { .. } => "process_termination_attempted",
+            Self::LeaseStarted { .. } => "lease_started",
+            Self::LeaseTick { .. } => "lease_tick",
+            Self::RestartReconciled { .. } => "restart_reconciled",
         }
     }
 }
@@ -482,5 +592,32 @@ impl LifecyclePayload {
 pub struct PrincipalRef {
     pub kind: PrincipalKind,
     pub subject: String,
+    pub role: String,
+    pub scope: String,
     pub attestation_ref: String,
+}
+
+impl PrincipalRef {
+    #[must_use]
+    pub fn try_from_principal(principal: &Principal) -> Option<Self> {
+        Some(Self {
+            kind: principal.kind,
+            subject: principal.subject.clone(),
+            role: principal.role.clone()?,
+            scope: principal.scope.clone()?,
+            attestation_ref: principal.attestation.as_ref()?.trust_ref.clone(),
+        })
+    }
+
+    #[must_use]
+    pub fn matches_principal(&self, principal: &Principal) -> bool {
+        self.kind == principal.kind
+            && self.subject == principal.subject
+            && principal.role.as_deref() == Some(self.role.as_str())
+            && principal.scope.as_deref() == Some(self.scope.as_str())
+            && principal
+                .attestation
+                .as_ref()
+                .is_some_and(|attestation| attestation.trust_ref == self.attestation_ref)
+    }
 }

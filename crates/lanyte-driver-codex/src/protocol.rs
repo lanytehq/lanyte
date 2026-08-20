@@ -53,6 +53,27 @@ pub fn map_notification(attempt_id: Uuid, line: &str) -> Option<NormalizedHarnes
                 detail: Some(method.to_owned()),
             })
         }
+        "turn/started" => {
+            let turn_id = extract_turn(&parsed.params)?;
+            Some(NormalizedHarnessEvent::TurnProgress {
+                occurred_at: now,
+                attempt_id,
+                thread_id: extract_id(&parsed.params),
+                turn_id,
+                status: "started".to_owned(),
+            })
+        }
+        "turn/completed" => {
+            let turn_id = extract_turn(&parsed.params)?;
+            Some(NormalizedHarnessEvent::TurnProgress {
+                occurred_at: now,
+                attempt_id,
+                thread_id: extract_id(&parsed.params),
+                turn_id,
+                status: extract_turn_status(&parsed.params)
+                    .unwrap_or_else(|| "completed".to_owned()),
+            })
+        }
         "thread/exited" | "session/completed" => {
             let failed = parsed
                 .params
@@ -76,6 +97,25 @@ fn extract_id(params: &Option<Value>) -> Option<String> {
         .get("threadId")
         .or_else(|| params.get("id"))
         .or_else(|| params.pointer("/thread/id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn extract_turn(params: &Option<Value>) -> Option<String> {
+    let params = params.as_ref()?;
+    params
+        .get("turnId")
+        .or_else(|| params.pointer("/turn/id"))
+        .or_else(|| params.pointer("/item/id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn extract_turn_status(params: &Option<Value>) -> Option<String> {
+    let params = params.as_ref()?;
+    params
+        .get("status")
+        .or_else(|| params.pointer("/turn/status"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }

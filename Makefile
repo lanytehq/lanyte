@@ -23,7 +23,11 @@ check:
 fmt:
 	cargo fmt
 	@if command -v goneat >/dev/null 2>&1; then \
-		goneat format --types yaml,json,markdown --folders . --finalize-eof --quiet; \
+		if goneat format --types yaml,json,markdown --folders . --finalize-eof --check >/dev/null 2>&1; then \
+			echo "[ok] goneat already formatted"; \
+		else \
+			goneat format --types yaml,json,markdown --folders . --finalize-eof --quiet; \
+		fi; \
 	else \
 		echo "goneat not found; skipping non-Rust formatting"; \
 	fi
@@ -51,22 +55,23 @@ msrv:
 		echo "Installing toolchain $(MSRV)..."; \
 		rustup toolchain install $(MSRV) --profile minimal; \
 	fi
-	cargo +$(MSRV) check --workspace --locked
+	rustup component add rustfmt clippy --toolchain $(MSRV)
+	cargo +$(MSRV) check --workspace --locked --ignore-rust-version
 	@echo "[ok] MSRV $(MSRV) verified"
 
 # PR-final gate: mirrors CI exactly (.github/workflows/check.yml).
 # Use this before marking a PR ready for review. See docs/PR_CHECKLIST.md.
 pr-final:
-	cargo fmt --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace --all-targets
-	cargo deny check
-	@echo "Checking MSRV $(MSRV)..."
 	@if ! rustup toolchain list | grep -q "$(MSRV)"; then \
 		echo "Installing toolchain $(MSRV)..."; \
 		rustup toolchain install $(MSRV) --profile minimal; \
 	fi
-	cargo +$(MSRV) check --workspace --locked
+	rustup component add rustfmt clippy --toolchain $(MSRV)
+	cargo +$(MSRV) fmt --check
+	cargo +$(MSRV) clippy --workspace --all-targets --ignore-rust-version -- -D warnings
+	cargo +$(MSRV) test --workspace --all-targets --ignore-rust-version
+	cargo deny check
+	cargo +$(MSRV) check --workspace --locked --ignore-rust-version
 	@echo "[ok] pr-final gate passed"
 
 live-llm:

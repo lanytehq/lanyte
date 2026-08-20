@@ -13,8 +13,8 @@ use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
 use lanyte_common::env as common_env;
 use lanyte_mission::{
-    validate_history, EventSourceKind, LifecycleEvent, LifecyclePayload, MissionPhase,
-    MissionRecord, Validate,
+    validate_history, validate_history_with_control, ControlBinding, EventSourceKind,
+    LifecycleEvent, LifecyclePayload, MissionPhase, MissionRecord, Validate,
 };
 use lanyte_telemetry::{
     genesis_prev_hash, AuditEnvelopeRef, AuditRecord, AuditRecordKind, AuditSeverity,
@@ -53,6 +53,10 @@ const MIGRATION_006: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/006_mission_mutations.sql"
 ));
+const MIGRATION_007: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/007_mission_control_bindings.sql"
+));
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_001),
     (2, MIGRATION_002),
@@ -60,6 +64,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, MIGRATION_004),
     (5, MIGRATION_005),
     (6, MIGRATION_006),
+    (7, MIGRATION_007),
 ];
 
 const HOT_TIER_DIR: &str = "hot";
@@ -237,6 +242,7 @@ pub struct NewMissionProjectionReceipt {
     pub event: LifecycleEvent,
     pub envelope: AuditEnvelopeRef,
     pub verification: Option<serde_json::Value>,
+    pub control_binding: Option<ControlBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -385,7 +391,9 @@ impl StateStore {
             .optional()?;
         match existing {
             None => Ok(None),
-            Some((stored, result)) if stored == fingerprint && !result.is_empty() => {
+            Some((stored, result))
+                if stored == fingerprint && mutation_result_is_complete(&result) =>
+            {
                 Ok(Some(result))
             }
             Some((stored, _)) if stored != fingerprint => {
@@ -400,7 +408,7 @@ impl StateStore {
     pub fn renew_mutation(&mut self, key: &str, owner_token: &str) -> Result<()> {
         let now = Utc::now();
         let updated = self.connection.execute(
-            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2 AND owner_token = ?3 AND result_json = ''",
+            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2 AND owner_token = ?3 AND (result_json = '' OR json_extract(result_json, '$.kind') = 'pending_cancel')",
             params![
                 now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 key,
@@ -439,7 +447,7 @@ impl StateStore {
                     key: idempotency.key.clone(),
                 });
             }
-            if !result.is_empty() {
+            if mutation_result_is_complete(&result) {
                 tx.commit()?;
                 return Ok(MutationReserve::Replay(result));
             }
@@ -489,6 +497,59 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn incomplete_mutation(
+        &self,
+        mission_id: &str,
+        operation: &str,
+    ) -> Result<Option<MissionMutationIdempotency>> {
+        self.connection
+            .query_row(
+                "SELECT idempotency_key, request_fingerprint, operation, result_json, owner_token \
+                 FROM mission_mutations WHERE mission_id = ?1 AND operation = ?2 \
+                 AND json_extract(result_json, '$.kind') = 'pending_cancel' LIMIT 1",
+                [mission_id, operation],
+                |row| {
+                    Ok(MissionMutationIdempotency {
+                        key: row.get(0)?,
+                        request_fingerprint: row.get(1)?,
+                        operation: row.get(2)?,
+                        result_json: row.get(3)?,
+                        owner_token: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn control_bindings(&self, mission_id: &str) -> Result<Vec<ControlBinding>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT evidence_ref, operation, idempotency_key, request_fingerprint, \
+             original_result_hash, request_json, result_json \
+             FROM mission_control_bindings WHERE mission_id = ?1",
+        )?;
+        let rows = stmt.query_map([mission_id], control_binding_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    pub fn age_mutation_reservation(&mut self, key: &str) -> Result<()> {
+        let aged = Utc::now() - chrono::Duration::seconds(61);
+        let updated = self.connection.execute(
+            "UPDATE mission_mutations SET reserved_at = ?1 WHERE idempotency_key = ?2",
+            params![aged.to_rfc3339_opts(SecondsFormat::Millis, true), key],
+        )?;
+        if updated != 1 {
+            return Err(StateError::InvalidMissionProjection(
+                "mutation reservation could not be aged".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn replay_mutation(&self, key: &str, fingerprint: &str) -> Result<Option<String>> {
         validate_mission_create_idempotency(key, fingerprint)?;
@@ -516,6 +577,20 @@ impl StateStore {
             |row| row.get(0),
         )?;
         Ok(version)
+    }
+
+    pub fn existing_create_request(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT request_fingerprint, mission_id FROM mission_requests WHERE idempotency_key = ?1 LIMIT 1",
+                [idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn create_mission(
@@ -622,7 +697,7 @@ impl StateStore {
                         key: idempotency.key.clone(),
                     });
                 }
-                if !stored_result.is_empty() {
+                if mutation_result_is_complete(&stored_result) {
                     let projection =
                         load_mission_projection_tx(&tx, &mission_id)?.ok_or_else(|| {
                             StateError::InvalidMissionProjection(
@@ -657,7 +732,13 @@ impl StateStore {
 
         let mut history = load_lifecycle_history_tx(&tx, &mission_id)?;
         history.extend(receipts.iter().map(|receipt| receipt.event.clone()));
-        validate_history(&mission, &history)
+        let mut records = load_control_bindings_tx(&tx, &mission_id)?;
+        records.extend(
+            receipts
+                .iter()
+                .filter_map(|receipt| receipt.control_binding.clone()),
+        );
+        validate_history_with_control(&mission, &history, &records)
             .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
 
         let updated = tx.execute(
@@ -693,6 +774,9 @@ impl StateStore {
 
         let mut last_audit = None;
         for receipt in receipts {
+            if let Some(binding) = &receipt.control_binding {
+                persist_control_binding_tx(&tx, &mission_id, binding)?;
+            }
             let event_json = serde_json::to_value(&receipt.event)
                 .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
             let audit_input = NewAuditRecord {
@@ -1021,6 +1105,52 @@ impl StateStore {
             projections: missions,
             next_cursor: None,
         })
+    }
+
+    /// Kernel-only scan of non-terminal missions. Not caller-scoped.
+    pub fn list_supervised_missions(&self) -> Result<Vec<StoredMissionProjection>> {
+        let mut statement = self.connection.prepare(
+            "SELECT mission_id, revision, phase, operating_role, operating_scope, record_json, receipt_entry_id, receipt_entry_hash \
+             FROM missions WHERE phase IN ('active', 'waiting', 'recovery_pending', 'suspended') \
+             ORDER BY created_at ASC, mission_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(
+                |(
+                    mission_id,
+                    revision,
+                    phase,
+                    operating_role,
+                    operating_scope,
+                    projection_json,
+                    audit_entry_id,
+                    audit_entry_hash,
+                )| {
+                    stored_mission_projection_from_row(
+                        &mission_id,
+                        revision,
+                        &phase,
+                        &projection_json,
+                        audit_entry_id,
+                        audit_entry_hash,
+                        Some((&operating_role, &operating_scope)),
+                    )
+                },
+            )
+            .collect()
     }
 
     pub fn append_audit_record(&mut self, record: NewAuditRecord) -> Result<AuditRecord> {
@@ -1421,6 +1551,68 @@ fn validate_projection_receipt_binding(
     Ok(())
 }
 
+fn load_control_bindings_tx(tx: &Transaction<'_>, mission_id: &str) -> Result<Vec<ControlBinding>> {
+    let mut stmt = tx.prepare(
+        "SELECT evidence_ref, operation, idempotency_key, request_fingerprint, \
+         original_result_hash, request_json, result_json \
+         FROM mission_control_bindings WHERE mission_id = ?1",
+    )?;
+    let rows = stmt.query_map([mission_id], control_binding_from_row)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
+fn persist_control_binding_tx(
+    tx: &Transaction<'_>,
+    mission_id: &str,
+    binding: &ControlBinding,
+) -> Result<()> {
+    let request_json = serde_json::to_string(&binding.request)
+        .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+    let result_json = serde_json::to_string(&binding.result)
+        .map_err(|err| StateError::InvalidMissionProjection(err.to_string()))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO mission_control_bindings(\
+             evidence_ref, mission_id, operation, idempotency_key, request_fingerprint, \
+             original_result_hash, request_json, result_json\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &binding.evidence_ref,
+            mission_id,
+            &binding.operation,
+            &binding.idempotency_key,
+            &binding.request_fingerprint,
+            &binding.original_result_hash,
+            request_json,
+            result_json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn control_binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlBinding> {
+    let request_json: String = row.get(5)?;
+    let result_json: String = row.get(6)?;
+    let request = serde_json::from_str(&request_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let result = serde_json::from_str(&result_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(ControlBinding {
+        evidence_ref: row.get(0)?,
+        operation: row.get(1)?,
+        idempotency_key: row.get(2)?,
+        request_fingerprint: row.get(3)?,
+        original_result_hash: row.get(4)?,
+        request,
+        result,
+    })
+}
+
 fn load_lifecycle_history_tx(
     tx: &Transaction<'_>,
     mission_id: &str,
@@ -1583,6 +1775,19 @@ fn parse_mission_list_cursor(
         ));
     }
     Ok(cursor)
+}
+
+pub(crate) fn mutation_result_is_complete(result: &str) -> bool {
+    if result.is_empty() {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(result) {
+        Ok(value) => value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|kind| kind != "pending_cancel"),
+        Err(_) => true,
+    }
 }
 
 fn is_canonical_mission_cursor_position(created_at: &str, mission_id: &str) -> bool {
@@ -2094,6 +2299,7 @@ mod tests {
                 ..AuditEnvelopeRef::default()
             },
             verification: None,
+            control_binding: None,
         }
     }
 
@@ -2132,6 +2338,7 @@ mod tests {
                 ..AuditEnvelopeRef::default()
             },
             verification: None,
+            control_binding: None,
         }
     }
 
@@ -2187,7 +2394,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store should open");
 
         assert!(paths.hot_db_path().exists());
-        assert_eq!(store.schema_version().expect("schema version query"), 6);
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
     }
 
     #[test]
@@ -2196,10 +2403,10 @@ mod tests {
         let paths = StatePaths::new(&root);
 
         let store_a = StateStore::open(paths.clone()).expect("state store should open");
-        assert_eq!(store_a.schema_version().expect("schema version query"), 6);
+        assert_eq!(store_a.schema_version().expect("schema version query"), 7);
 
         let store_b = StateStore::open(paths).expect("state store should open again");
-        assert_eq!(store_b.schema_version().expect("schema version query"), 6);
+        assert_eq!(store_b.schema_version().expect("schema version query"), 7);
     }
 
     #[test]
@@ -2219,7 +2426,7 @@ mod tests {
         drop(connection);
 
         let mut store = StateStore::open(paths).expect("version-three store should upgrade");
-        assert_eq!(store.schema_version().expect("schema version query"), 6);
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
         store
             .create_mission(created_mission(), created_mission_receipt(TEST_ENTRY_ID_A))
             .expect("upgraded store should persist missions");
@@ -2242,7 +2449,7 @@ mod tests {
         drop(connection);
 
         let mut store = StateStore::open(paths).expect("version-four store should upgrade");
-        assert_eq!(store.schema_version().expect("schema version query"), 6);
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
         store
             .create_mission_idempotent(
                 created_mission(),
@@ -2253,6 +2460,30 @@ mod tests {
                 },
             )
             .expect("upgraded store should persist idempotent missions");
+    }
+
+    #[test]
+    fn version_six_store_upgrades_to_control_binding_schema() {
+        let root = temp_state_root();
+        let paths = StatePaths::new(&root);
+        drop(StateStore::open(paths.clone()).expect("state store should open"));
+
+        let connection =
+            Connection::open(paths.hot_db_path()).expect("database should reopen directly");
+        connection
+            .execute_batch(
+                "DROP TABLE mission_control_bindings; \
+                 UPDATE state_metadata SET value = 6 WHERE key = 'schema_version';",
+            )
+            .expect("version-six fixture should prepare");
+        drop(connection);
+
+        let store = StateStore::open(paths).expect("version-six store should upgrade");
+        assert_eq!(store.schema_version().expect("schema version query"), 7);
+        assert!(store
+            .control_bindings(TEST_SESSION_ID)
+            .expect("control bindings query")
+            .is_empty());
     }
 
     #[test]

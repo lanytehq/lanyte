@@ -36,6 +36,13 @@ pub enum NormalizedHarnessEvent {
         success: bool,
         detail: Option<String>,
     },
+    TurnProgress {
+        occurred_at: DateTime<Utc>,
+        attempt_id: Uuid,
+        thread_id: Option<String>,
+        turn_id: String,
+        status: String,
+    },
 }
 
 /// Domain boundary shared by future harness integrations.

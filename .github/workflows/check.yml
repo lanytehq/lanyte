@@ -12,8 +12,8 @@ jobs:
           toolchain: "1.85.0"
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --ignore-rust-version -- -D warnings
+      - run: cargo test --workspace --all-targets --ignore-rust-version
       - uses: EmbarkStudios/cargo-deny-action@v2
   msrv:
     name: msrv
@@ -23,4 +23,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"  # must match workspace Cargo.toml rust-version
-      - run: cargo check --workspace --locked
+      - run: cargo check --workspace --locked --ignore-rust-version

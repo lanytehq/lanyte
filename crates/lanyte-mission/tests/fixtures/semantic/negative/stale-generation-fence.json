@@ -1,0 +1,78 @@
+{
+  "kind": "mission-history",
+  "mission": {
+    "mission_id": "11111111-1111-4111-8111-111111111111",
+    "evidence_chain_id": "11111111-1111-4111-8111-111111111111",
+    "phase": "active",
+    "authorizer": null,
+    "attempts": [
+      {
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "ordinal": 1,
+        "generation": 2,
+        "fencing_token_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "recovery_relation": "initial",
+        "predecessor_attempt_id": null,
+        "state": "running",
+        "driver_id": "driver.local-process",
+        "harness_session_id": "harness-current",
+        "started_at": "2026-08-17T14:00:00Z",
+        "ended_at": null,
+        "terminal_reason": null,
+        "evidence_ref": "evidence/attempt-current",
+        "lease_expires_at": null,
+        "deadman_at": null,
+        "last_observed_at": null,
+        "last_observation_source": null,
+        "lease_generation": null,
+        "process_tree_ref": null,
+        "ownership_established_at": null,
+        "harness_thread_id": null,
+        "harness_turn_id": null
+      }
+    ],
+    "current_attempt_id": "88888888-8888-4888-8888-888888888888"
+  },
+  "events": [
+    {
+      "event_type": "attempt_created",
+      "event_id": "77777777-7777-4777-8777-777777777777",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 1,
+      "previous_entry_hash": null,
+      "entry_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payload": {
+        "type": "attempt_created",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "ordinal": 1,
+        "generation": 2,
+        "recovery_relation": "initial",
+        "predecessor_attempt_id": null
+      }
+    },
+    {
+      "event_type": "attempt_state_changed",
+      "event_id": "99999999-9999-4999-8999-999999999999",
+      "mission_id": "11111111-1111-4111-8111-111111111111",
+      "sequence": 2,
+      "previous_entry_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "entry_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "attempt_id": "88888888-8888-4888-8888-888888888888",
+      "generation": 1,
+      "fencing_token_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "fence": "stale-fence",
+      "payload": {
+        "type": "attempt_state_changed",
+        "attempt_id": "88888888-8888-4888-8888-888888888888",
+        "generation": 1,
+        "from": "running",
+        "to": "waiting",
+        "reason": "late observation",
+        "fencing_token_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "fence": "stale-fence",
+        "cause": "policy"
+      }
+    }
+  ],
+  "driver_capabilities": []
+}

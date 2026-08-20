@@ -26,14 +26,36 @@ def main() -> None:
             sys.stdout.write(
                 json.dumps(
                     {
+                        "method": "turn/started",
+                        "params": {"threadId": "thr_test", "turnId": "turn_test"},
+                    }
+                )
+                + "\n"
+            )
+            sys.stdout.write(
+                json.dumps(
+                    {
                         "method": "item/started",
                         "params": {"item": {"type": "command_execution"}, "name": "shell"},
                     }
                 )
                 + "\n"
             )
+            sys.stdout.flush()
+        elif method == "turn/interrupt":
+            params = message.get("params") or {}
+            sys.stdout.write(json.dumps({"id": message["id"], "result": {}}) + "\n")
             sys.stdout.write(
-                json.dumps({"method": "thread/exited", "params": {"threadId": "thr_test"}})
+                json.dumps(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": params.get("threadId"),
+                            "turnId": params.get("turnId"),
+                            "status": "interrupted",
+                        },
+                    }
+                )
                 + "\n"
             )
             sys.stdout.flush()

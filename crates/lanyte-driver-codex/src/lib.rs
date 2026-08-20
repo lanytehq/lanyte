@@ -1,9 +1,15 @@
 //! Codex App Server driver. Owns a child `codex app-server` process and maps
 //! JSON-RPC observations to [`lanyte_mission::NormalizedHarnessEvent`].
 
+mod process;
 mod protocol;
 mod spawn;
 
+pub use process::{
+    capture_process_tree_handle, format_process_tree_handle, format_process_tree_ref,
+    parse_process_tree_handle, parse_process_tree_ref, probe_process_tree, terminate_process_tree,
+    ProcessTreeHandle,
+};
 pub use protocol::{map_notification, CodexProtocolError, JsonRpcLine};
 pub use spawn::{confine_workspace, scrub_child_env, CodexBinary, CodexLaunchSpec, SpawnError};
 
@@ -22,7 +28,7 @@ impl CloseOutcome {
     }
 }
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,6 +51,9 @@ use uuid::Uuid;
 const DRIVER_ID: &str = "driver.codex.app_server";
 const DRIVER_VERSION: &str = "0.1.0";
 const HARNESS_KIND: &str = "codex";
+
+type PendingResponses =
+    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, CodexDriverError>>>>>;
 
 #[derive(Debug, Error)]
 pub enum CodexDriverError {
@@ -76,6 +85,27 @@ pub struct CodexSession {
     overflowed: Arc<std::sync::atomic::AtomicBool>,
     next_id: AtomicU64,
     last_close: Option<CloseOutcome>,
+    pub process_tree_ref: Option<String>,
+    active_turn_id: Arc<Mutex<Option<String>>>,
+    pending: PendingResponses,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptAttempt {
+    Unavailable,
+    RequestAccepted { thread_id: String, turn_id: String },
+    Interrupted { thread_id: String, turn_id: String },
+    Timeout { thread_id: String, turn_id: String },
+    UnrelatedCompletion { thread_id: String, turn_id: String },
+    Failed { detail: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTreeKill {
+    KillDispatched,
+    Cleared,
+    Survivors,
+    Unknown,
 }
 
 impl CodexSession {
@@ -98,6 +128,8 @@ impl CodexSession {
         };
         let events = Arc::clone(&self.events);
         let overflowed = Arc::clone(&self.overflowed);
+        let active_turn_id = Arc::clone(&self.active_turn_id);
+        let pending = Arc::clone(&self.pending);
         let attempt_id = self.attempt_id;
         tokio::spawn(async move {
             let mut stdout = stdout.lock().await;
@@ -106,7 +138,32 @@ impl CodexSession {
                 match stdout.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        if let Some(event) = map_notification(attempt_id, line.trim_end()) {
+                        let trimmed = line.trim_end();
+                        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                            if let Some(id) = parsed.get("id").and_then(Value::as_u64) {
+                                if let Some(tx) = pending.lock().await.remove(&id) {
+                                    let result = if let Some(error) = parsed.get("error") {
+                                        Err(CodexProtocolError::Remote(error.to_string()).into())
+                                    } else {
+                                        Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
+                                    };
+                                    let _ = tx.send(result);
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(event) = map_notification(attempt_id, trimmed) {
+                            if let NormalizedHarnessEvent::TurnProgress {
+                                turn_id, status, ..
+                            } = &event
+                            {
+                                let mut turn = active_turn_id.lock().await;
+                                if status == "started" {
+                                    *turn = Some(turn_id.clone());
+                                } else if status == "interrupted" || status == "completed" {
+                                    *turn = None;
+                                }
+                            }
                             let mut queue = events.lock().await;
                             if queue.len() >= 256 {
                                 queue.pop_front();
@@ -156,6 +213,91 @@ impl CodexSession {
         Ok(outcome)
     }
 
+    pub async fn active_turn_id(&self) -> Option<String> {
+        self.active_turn_id.lock().await.clone()
+    }
+
+    pub async fn interrupt_turn(
+        &mut self,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> InterruptAttempt {
+        let turn_id = match self
+            .active_turn_id()
+            .await
+            .or_else(|| turn_id.map(str::to_owned))
+        {
+            Some(turn_id) if !turn_id.is_empty() => turn_id,
+            _ => return InterruptAttempt::Unavailable,
+        };
+        let thread_id = thread_id
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                if self.harness_session_id.is_empty() {
+                    None
+                } else {
+                    Some(self.harness_session_id.clone())
+                }
+            });
+        let Some(thread_id) = thread_id else {
+            return InterruptAttempt::Unavailable;
+        };
+        let cursor = self.events.lock().await.len();
+        if let Err(err) = self
+            .request(
+                "turn/interrupt",
+                json!({ "threadId": thread_id, "turnId": turn_id }),
+            )
+            .await
+        {
+            return match err {
+                CodexDriverError::Timeout => InterruptAttempt::Timeout { thread_id, turn_id },
+                other => InterruptAttempt::Failed {
+                    detail: other.to_string(),
+                },
+            };
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let outcome = matching_interrupt_outcome(
+                self.events.lock().await.iter().skip(cursor),
+                &thread_id,
+                &turn_id,
+            );
+            if let Some(outcome) = outcome {
+                return outcome;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return InterruptAttempt::RequestAccepted { thread_id, turn_id };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    pub async fn interrupt_active_turn(&mut self) -> InterruptAttempt {
+        self.interrupt_turn(None, None).await
+    }
+
+    pub fn kill_process_tree(&mut self) -> ProcessTreeKill {
+        if let Some(tree_ref) = &self.process_tree_ref {
+            return terminate_process_tree(tree_ref);
+        }
+        match self.child.id() {
+            Some(pid) => capture_process_tree_handle(pid)
+                .map(|handle| terminate_process_tree(&format_process_tree_handle(&handle)))
+                .unwrap_or(ProcessTreeKill::Unknown),
+            None => ProcessTreeKill::Unknown,
+        }
+    }
+
+    pub fn probe_process_tree(&self) -> ProcessTreeKill {
+        self.process_tree_ref
+            .as_deref()
+            .map(probe_process_tree)
+            .unwrap_or(ProcessTreeKill::Unknown)
+    }
+
     async fn notify(&self, method: &str, params: Value) -> Result<(), CodexDriverError> {
         let mut encoded = serde_json::to_string(&json!({"method": method, "params": params}))?;
         encoded.push('\n');
@@ -170,6 +312,19 @@ impl CodexSession {
         let message = json!({"id": id, "method": method, "params": params});
         let mut encoded = serde_json::to_string(&message)?;
         encoded.push('\n');
+        if self.stdout.is_none() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id, tx);
+            {
+                let mut stdin = self.stdin.lock().await;
+                stdin.write_all(encoded.as_bytes()).await?;
+                stdin.flush().await?;
+            }
+            return tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+                .await
+                .map_err(|_| CodexDriverError::Timeout)?
+                .map_err(|_| CodexDriverError::StdoutClosed)?;
+        }
         {
             let mut stdin = self.stdin.lock().await;
             stdin.write_all(encoded.as_bytes()).await?;
@@ -204,6 +359,45 @@ impl CodexSession {
     }
 }
 
+fn matching_interrupt_outcome<'a>(
+    mut events: impl Iterator<Item = &'a NormalizedHarnessEvent>,
+    thread_id: &str,
+    turn_id: &str,
+) -> Option<InterruptAttempt> {
+    events.find_map(|event| {
+        if let NormalizedHarnessEvent::TurnProgress {
+            turn_id: event_turn,
+            thread_id: event_thread,
+            status,
+            ..
+        } = event
+        {
+            if event_turn != turn_id {
+                return None;
+            }
+            if event_thread.as_deref() != Some(thread_id) {
+                return Some(InterruptAttempt::UnrelatedCompletion {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
+            if status == "interrupted" {
+                return Some(InterruptAttempt::Interrupted {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
+            if status == "completed" {
+                return Some(InterruptAttempt::UnrelatedCompletion {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
+        }
+        None
+    })
+}
+
 pub struct CodexAppServerDriver {
     spec: CodexLaunchSpec,
 }
@@ -228,7 +422,21 @@ impl CodexAppServerDriver {
             .kill_on_drop(true)
             .env_clear()
             .envs(scrub_child_env(&workspace));
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
         let mut child = command.spawn()?;
+        let process_tree_ref = child
+            .id()
+            .and_then(capture_process_tree_handle)
+            .map(|handle| format_process_tree_handle(&handle));
+        if process_tree_ref.is_none() {
+            let _ = child.start_kill();
+            return Err(CodexDriverError::Io(std::io::Error::other(
+                "could not capture authoritative process-group birth identity",
+            )));
+        }
         let stdin = child.stdin.take().ok_or(CodexDriverError::StdinClosed)?;
         let stdout = child.stdout.take().ok_or(CodexDriverError::StdoutClosed)?;
         if let Some(stderr) = child.stderr.take() {
@@ -251,6 +459,9 @@ impl CodexAppServerDriver {
             overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
             last_close: None,
+            process_tree_ref,
+            active_turn_id: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         };
         if let Err(err) = session
             .request(
@@ -350,17 +561,43 @@ impl HarnessDriver for CodexAppServerDriver {
                 DriverAvailability::TemporarilyUnavailable
             },
             capabilities: [
-                CapabilityName::Create,
-                CapabilityName::Identify,
-                CapabilityName::Observe,
-                CapabilityName::Close,
+                (
+                    CapabilityName::Create,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Identify,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Observe,
+                    ObservationLevel::DriverObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Close,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::Cancel,
+                    ObservationLevel::DriverObserved,
+                    EnforcementLevel::ProtocolConfirmed,
+                ),
+                (
+                    CapabilityName::LocalProcessTermination,
+                    ObservationLevel::KernelObserved,
+                    EnforcementLevel::LocalProcessControl,
+                ),
             ]
             .into_iter()
-            .map(|name| DriverCapability {
+            .map(|(name, observation, enforcement)| DriverCapability {
                 name,
                 fidelity: CapabilityFidelity::Native,
-                observation: ObservationLevel::KernelObserved,
-                enforcement: EnforcementLevel::ProtocolConfirmed,
+                observation,
+                enforcement,
                 replay: ReplaySupport::None,
                 limitation: Some(format!("codex-cli:{version}")),
                 evidence_ref: Some("probes/codex-app-server".to_owned()),
@@ -391,4 +628,55 @@ fn path_bytes(path: &std::path::Path) -> &[u8] {
 #[cfg(not(unix))]
 fn path_bytes(path: &std::path::Path) -> &[u8] {
     path.to_string_lossy().as_bytes()
+}
+
+#[cfg(test)]
+mod interrupt_proof_tests {
+    use super::*;
+
+    fn turn(thread: Option<&str>, turn: &str, status: &str) -> NormalizedHarnessEvent {
+        NormalizedHarnessEvent::TurnProgress {
+            occurred_at: Utc::now(),
+            attempt_id: Uuid::nil(),
+            thread_id: thread.map(str::to_owned),
+            turn_id: turn.to_owned(),
+            status: status.to_owned(),
+        }
+    }
+
+    #[test]
+    fn missing_thread_is_not_protocol_confirmed() {
+        let events = [turn(None, "turn_1", "interrupted")];
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter(), "thr", "turn_1"),
+            Some(InterruptAttempt::UnrelatedCompletion { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_events_before_cursor_are_ignored() {
+        let events = [
+            turn(Some("thr"), "turn_1", "interrupted"),
+            turn(Some("thr"), "turn_1", "completed"),
+        ];
+        assert!(matching_interrupt_outcome(events.iter().skip(1), "thr", "turn_1").is_some());
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter().skip(1), "thr", "turn_1"),
+            Some(InterruptAttempt::UnrelatedCompletion { .. })
+        ));
+        assert!(matching_interrupt_outcome(events.iter().skip(2), "thr", "turn_1").is_none());
+    }
+
+    #[test]
+    fn matching_interrupted_requires_exact_thread_and_turn() {
+        let events = [turn(Some("thr"), "turn_1", "interrupted")];
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter(), "thr", "turn_1"),
+            Some(InterruptAttempt::Interrupted { .. })
+        ));
+        assert!(matches!(
+            matching_interrupt_outcome(events.iter(), "other", "turn_1"),
+            Some(InterruptAttempt::UnrelatedCompletion { .. })
+        ));
+    }
 }

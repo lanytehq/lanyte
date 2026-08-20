@@ -11,9 +11,15 @@ lanyte-mission = { path = "../lanyte-mission", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+sysprims-core = { workspace = true }
+sysprims-proc = { workspace = true }
+sysprims-signal = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "process", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

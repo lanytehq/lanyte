@@ -37,6 +37,11 @@ futures-util = "0.3.32"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "process", "io-util"] }
 tokio-util = "0.7"
 tokio-stream = "0.1.17"
+# Process identity / group kill. Lockfile pins `time` to 0.3.45 so the
+# workspace still builds on rustc 1.85.0 (`time` 0.3.55 needs 1.88).
+sysprims-core = { git = "https://github.com/3leaps/sysprims", tag = "v0.1.16", version = "0.1.16" }
+sysprims-proc = { git = "https://github.com/3leaps/sysprims", tag = "v0.1.16", version = "0.1.16" }
+sysprims-signal = { git = "https://github.com/3leaps/sysprims", tag = "v0.1.16", version = "0.1.16" }
 
 [dependencies]
 bytes = { workspace = true }

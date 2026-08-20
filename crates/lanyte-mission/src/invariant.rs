@@ -7,8 +7,8 @@ use uuid::{Uuid, Version};
 use crate::{
     AttemptRecord, AttemptState, CapabilityFidelity, DriverCapabilityReport, DriverDescriptor,
     EventSourceKind, LifecycleEvent, LifecyclePayload, Mission, MissionPhase, MissionRecord,
-    MissionTerminalReason, Principal, PrincipalKind, RecoveryRelation, DRIVER_CAPABILITIES_SCHEMA,
-    LIFECYCLE_EVENT_SCHEMA, MISSION_RECORD_SCHEMA,
+    MissionTerminalReason, ObservationLevel, Principal, PrincipalKind, RecoveryRelation,
+    DRIVER_CAPABILITIES_SCHEMA, LIFECYCLE_EVENT_SCHEMA, MISSION_RECORD_SCHEMA,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -172,7 +172,9 @@ impl Validate for AttemptRecord {
 
 impl Validate for MissionRecord {
     fn validate(&self) -> Result<(), InvariantError> {
-        if self.mission_schema != MISSION_RECORD_SCHEMA {
+        if self.mission_schema != MISSION_RECORD_SCHEMA
+            && self.mission_schema != crate::MISSION_RECORD_SCHEMA_V0
+        {
             return Err(InvariantError::new(
                 "mission_schema",
                 "unsupported schema identifier",
@@ -613,12 +615,54 @@ impl Validate for LifecycleEvent {
                 "authoritative source requires evidence",
             ));
         }
+        if !source_assurance_allowed(self.source.kind, self.source.assurance) {
+            return Err(InvariantError::new(
+                "source.assurance",
+                "source kind and assurance must follow the Wave 3 provenance map",
+            ));
+        }
         validate_lifecycle_payload(&self.payload)?;
         Ok(())
     }
 }
 
+fn source_assurance_allowed(kind: EventSourceKind, assurance: ObservationLevel) -> bool {
+    matches!(
+        (kind, assurance),
+        (
+            EventSourceKind::KernelObserved,
+            ObservationLevel::KernelObserved | ObservationLevel::ResourceAttested
+        ) | (
+            EventSourceKind::DriverReported | EventSourceKind::HarnessReported,
+            ObservationLevel::Claim | ObservationLevel::DriverObserved
+        ) | (
+            EventSourceKind::OperatorCommand | EventSourceKind::VerifiedAttestation,
+            ObservationLevel::ResourceAttested
+        )
+    )
+}
+
 pub fn validate_history(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+) -> Result<(), InvariantError> {
+    validate_history_with_control(mission, events, &[])
+}
+
+pub fn validate_history_with_control(
+    mission: &MissionRecord,
+    events: &[LifecycleEvent],
+    records: &[crate::ControlBinding],
+) -> Result<(), InvariantError> {
+    let semantic = crate::wave3::validate_wave3_semantics_with_control(mission, events, records);
+    let structural = validate_history_chain(mission, events);
+    match semantic {
+        Err(sem) => Err(sem),
+        Ok(()) => structural,
+    }
+}
+
+fn validate_history_chain(
     mission: &MissionRecord,
     events: &[LifecycleEvent],
 ) -> Result<(), InvariantError> {
@@ -671,7 +715,7 @@ pub fn validate_history(
                 ));
             }
             LifecyclePayload::MissionCreated { .. } => {}
-            LifecyclePayload::AuthorizationBound { authorizer } => {
+            LifecyclePayload::AuthorizationBound { authorizer, .. } => {
                 if !matches!(
                     event.source.kind,
                     EventSourceKind::VerifiedAttestation | EventSourceKind::OperatorCommand
@@ -727,6 +771,12 @@ pub fn validate_history(
                         "attempt state event requires a prior attempt creation",
                     ));
                 };
+                if *state == AttemptState::Starting
+                    && *from != AttemptState::Starting
+                    && from.is_live()
+                {
+                    *state = *from;
+                }
                 if *attempt_generation != *generation
                     || *state != *from
                     || latest_generation.is_some_and(|value| *generation < value)
@@ -760,21 +810,35 @@ pub fn validate_history(
             LifecyclePayload::MissionTerminal {
                 phase: terminal_phase,
                 ..
-            } if *terminal_phase != phase => {
-                return Err(InvariantError::new(
-                    "payload.phase",
-                    "terminal event must match the folded mission phase",
-                ));
+            } => {
+                if !terminal_phase.is_terminal() {
+                    return Err(InvariantError::new(
+                        "payload.phase",
+                        "terminal event must record a terminal phase",
+                    ));
+                }
+                phase = *terminal_phase;
             }
             LifecyclePayload::RecoveryRequested { .. }
             | LifecyclePayload::RecoveryPointRecorded { .. }
-            | LifecyclePayload::MissionTerminal { .. } => {}
+            | LifecyclePayload::CancelRequested { .. }
+            | LifecyclePayload::ProtocolCancelAttempted { .. }
+            | LifecyclePayload::ProcessTerminationAttempted { .. }
+            | LifecyclePayload::LeaseStarted { .. }
+            | LifecyclePayload::LeaseTick { .. }
+            | LifecyclePayload::RestartReconciled { .. } => {}
         }
         previous_hash = Some(event.entry_hash.clone());
         previous_occurred_at = Some(event.occurred_at);
         previous_recorded_at = Some(event.recorded_at);
     }
-    if phase != mission.phase
+    let saw_phase_event = events.iter().any(|event| {
+        matches!(
+            event.payload,
+            LifecyclePayload::MissionPhaseChanged { .. } | LifecyclePayload::MissionTerminal { .. }
+        )
+    });
+    if saw_phase_event && phase != mission.phase
         || authorizer_subject
             != mission
                 .authorizer
@@ -835,10 +899,16 @@ fn validate_lifecycle_payload(payload: &LifecyclePayload) -> Result<(), Invarian
         LifecyclePayload::MissionCreated { revision } if *revision != 0 => Err(
             InvariantError::new("payload.revision", "created revision must be zero"),
         ),
-        LifecyclePayload::AuthorizationBound { authorizer } => {
+        LifecyclePayload::AuthorizationBound {
+            authorizer,
+            authorization_ref,
+        } => {
             if authorizer.kind != PrincipalKind::AttestedSession
                 || !nonempty(&authorizer.subject)
+                || !nonempty(&authorizer.role)
+                || !nonempty(&authorizer.scope)
                 || !nonempty(&authorizer.attestation_ref)
+                || !nonempty(authorization_ref)
             {
                 Err(InvariantError::new(
                     "payload.authorizer",
@@ -898,6 +968,7 @@ fn validate_lifecycle_payload(payload: &LifecyclePayload) -> Result<(), Invarian
             from,
             to,
             reason,
+            cause: _,
         } => {
             if !is_uuid_v4(*attempt_id) || *generation == 0 {
                 return Err(InvariantError::new(
@@ -975,7 +1046,80 @@ fn validate_lifecycle_payload(payload: &LifecyclePayload) -> Result<(), Invarian
             }
             Ok(())
         }
-        LifecyclePayload::MissionCreated { .. } => Ok(()),
+        LifecyclePayload::MissionCreated { .. } | LifecyclePayload::CancelRequested { .. } => {
+            Ok(())
+        }
+        LifecyclePayload::ProtocolCancelAttempted {
+            outcome,
+            thread_id,
+            turn_id,
+            generation,
+            lease_generation,
+            ..
+        } => {
+            if *generation == 0 || *lease_generation == 0 {
+                return Err(InvariantError::new(
+                    "payload.protocol_cancel_attempted",
+                    "attempt and lease generations start at one",
+                ));
+            }
+            if *outcome == crate::ProtocolCancelOutcome::Interrupted
+                && (thread_id.as_deref().is_none_or(|value| !nonempty(value))
+                    || turn_id.as_deref().is_none_or(|value| !nonempty(value)))
+            {
+                return Err(InvariantError::new(
+                    "payload.protocol_cancel_attempted",
+                    "interrupted proof requires thread and turn ids",
+                ));
+            }
+            Ok(())
+        }
+        LifecyclePayload::ProcessTerminationAttempted {
+            generation,
+            lease_generation,
+            ..
+        }
+        | LifecyclePayload::LeaseStarted {
+            generation,
+            lease_generation,
+            ..
+        } => {
+            if *generation == 0 || *lease_generation == 0 {
+                return Err(InvariantError::new(
+                    "payload.generation",
+                    "attempt and lease generations start at one",
+                ));
+            }
+            Ok(())
+        }
+        LifecyclePayload::LeaseTick {
+            generation,
+            prior_lease_generation,
+            result_lease_generation,
+            ..
+        } => {
+            if *generation == 0 || *prior_lease_generation == 0 || *result_lease_generation == 0 {
+                return Err(InvariantError::new(
+                    "payload.lease_tick",
+                    "lease generations start at one",
+                ));
+            }
+            Ok(())
+        }
+        LifecyclePayload::RestartReconciled {
+            generation,
+            lease_generation,
+            overdue,
+            ..
+        } => {
+            if *generation == 0 || *lease_generation == 0 || !*overdue {
+                return Err(InvariantError::new(
+                    "payload.restart_reconciled",
+                    "overdue restart receipts require generations and overdue=true",
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1070,6 +1214,15 @@ pub(crate) mod fixtures {
             ended_at: None,
             terminal_reason: None,
             evidence_ref: None,
+            lease_expires_at: None,
+            deadman_at: None,
+            last_observed_at: None,
+            last_observation_source: None,
+            lease_generation: None,
+            process_tree_ref: None,
+            ownership_established_at: None,
+            harness_thread_id: None,
+            harness_turn_id: None,
         }
     }
 }
@@ -1320,7 +1473,7 @@ mod tests {
     #[test]
     fn lifecycle_history_requires_contiguous_hash_links() {
         let mission = created_mission();
-        let created = LifecycleEvent {
+        let mut created = LifecycleEvent {
             event_schema: LIFECYCLE_EVENT_SCHEMA.to_owned(),
             event_id: fixtures::uuid(20),
             mission_id: mission.mission_id,
@@ -1339,23 +1492,10 @@ mod tests {
             },
             payload: LifecyclePayload::MissionCreated { revision: 0 },
         };
-        let mut authorization = created.clone();
-        authorization.event_id = fixtures::uuid(21);
-        authorization.sequence = 2;
-        authorization.previous_entry_hash = Some("9".repeat(64));
-        authorization.entry_hash = "2".repeat(64);
-        authorization.event_type = "authorization_bound".to_owned();
-        authorization.payload = LifecyclePayload::AuthorizationBound {
-            authorizer: PrincipalRef {
-                kind: PrincipalKind::AttestedSession,
-                subject: "operator-1".to_owned(),
-                attestation_ref: "attestations/1".to_owned(),
-            },
-        };
+        created.sequence = 2;
+        created.previous_entry_hash = Some("9".repeat(64));
         assert_eq!(
-            validate_history(&mission, &[created, authorization])
-                .unwrap_err()
-                .field,
+            validate_history(&mission, &[created]).unwrap_err().field,
             "event.sequence"
         );
     }
@@ -1367,6 +1507,7 @@ mod tests {
         mission.phase = MissionPhase::Suspended;
         mission.authorizer = Some(mission.initiator.clone());
         mission.authorization_ref = Some("authorizations/1".to_owned());
+        mission.updated_at = Utc.with_ymd_and_hms(2026, 8, 17, 14, 2, 1).unwrap();
 
         let mut created = event(
             30,
@@ -1379,7 +1520,7 @@ mod tests {
         created.source.kind = EventSourceKind::VerifiedAttestation;
         created.source.assurance = ObservationLevel::ResourceAttested;
         created.source.evidence_ref = Some("attestations/created".to_owned());
-        let authorization = event(
+        let mut authorization = event(
             31,
             mission.mission_id,
             2,
@@ -1389,10 +1530,14 @@ mod tests {
                 authorizer: PrincipalRef {
                     kind: PrincipalKind::AttestedSession,
                     subject: mission.initiator.subject.clone(),
-                    attestation_ref: "attestations/1".to_owned(),
+                    role: "entarch".to_owned(),
+                    scope: "lanytehq".to_owned(),
+                    attestation_ref: "attestations/3".to_owned(),
                 },
+                authorization_ref: "authorizations/1".to_owned(),
             },
         );
+        authorization.source.evidence_ref = Some("attestations/3".to_owned());
         assert_eq!(
             validate_history(&mission, &[created, authorization])
                 .unwrap_err()
@@ -1446,7 +1591,7 @@ mod tests {
             validate_history(&mission, &[created, attempt_created, capability])
                 .unwrap_err()
                 .field,
-            "payload.generation"
+            "SEM-T09"
         );
     }
 }
